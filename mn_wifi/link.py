@@ -1644,6 +1644,7 @@ class ITSLink(LinkAttrs):
         self.mode = 'a'
         self.mac = intf.mac
         self.associatedTo = 'ITS'
+        self.ifb = None
 
         # It takes default values if keys are not set
         kwargs = {'channel': '181', 'band': 10, 'proto': None, 'txpower': 17}
@@ -1653,11 +1654,11 @@ class ITSLink(LinkAttrs):
 
         self.freq = Getfreq(self.mode, self.channel).freq
 
-        if isinstance(intf, master):
-            self.name = '{}-ocb'.format(node.name)
-            self.add_ocb_mode()
-        else:
-            self.set_ocb_mode()
+        #if isinstance(intf, master):
+        #    self.name = '{}-ocb'.format(node.name)
+        #    self.add_ocb_mode()
+        #else:
+        self.set_ocb_mode()
 
         intf1 = WirelessLink(name=node.params['wlan'][wlan], node=node,
                              link=self, port=wlan)
