@@ -26,9 +26,11 @@ class TransactionStatus(Enum):
     """Status of a transaction."""
     
     PENDING = "pending"
+    BUFFERED = "buffered"  # Awaiting quorum, will retry
     CONFIRMED = "confirmed"
     REJECTED = "rejected"
     FINALIZED = "finalized"
+
 
 
 @dataclass
@@ -230,3 +232,38 @@ class GatewayState:
     name: str
     address: Address
 
+
+@dataclass
+class BufferedTransaction:
+    """Transaction buffered on client awaiting quorum.
+    
+    When a client broadcasts a transfer and doesn't receive enough
+    signatures to form a quorum, the transaction is buffered and
+    retried periodically until quorum is reached.
+    """
+    
+    order: TransferOrder
+    signatures_received: Dict[str, str] = field(default_factory=dict)  # auth_name -> signature
+    signatures_required: int = 0
+    created_at: float = 0.0
+    last_retry: float = 0.0
+    retry_count: int = 0
+    status: TransactionStatus = TransactionStatus.BUFFERED
+    
+    def __post_init__(self) -> None:
+        """Initialize timestamps."""
+        if self.created_at == 0.0:
+            self.created_at = time.time()
+        if self.last_retry == 0.0:
+            self.last_retry = self.created_at
+    
+    @property
+    def has_quorum(self) -> bool:
+        """Check if enough signatures have been collected."""
+        return len(self.signatures_received) >= self.signatures_required
+    
+    def add_signature(self, authority_name: str, signature: str) -> bool:
+        """Add a signature from an authority. Returns True if quorum now reached."""
+        if authority_name not in self.signatures_received:
+            self.signatures_received[authority_name] = signature
+        return self.has_quorum

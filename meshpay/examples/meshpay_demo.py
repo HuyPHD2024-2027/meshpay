@@ -52,7 +52,7 @@ from mn_wifi.wmediumdConnector import interference
 from mn_wifi.net import Mininet_wifi
 from meshpay.nodes.authority import WiFiAuthority
 from meshpay.nodes.client import Client
-from meshpay.cli_fastpay import FastPayCLI
+from meshpay.cli_fastpay import MeshPayCLI
 from meshpay.transport import TransportKind
 from meshpay.types import KeyPair, AccountOffchainState, SignedTransferOrder
 from meshpay.api.bridge import Bridge
@@ -99,13 +99,13 @@ def create_mesh_network_with_internet(
         name = f"auth{i}"
         auth = net.addStation(
             name,
-            cls=WiFiAuthority,  
+            cls=WiFiAuthority,
             committee_members=committee - {name},
             ip=f"10.0.0.{10 + i}/8",
             port=8000 + i,
-            min_x=0, max_x=200, min_y=0, max_y=150, min_v=5, max_v=10,
+            position=f'{40 + (i * 15)},100,0',
             range=20,
-            txpower=20,
+            txpower=20
         )
         authorities.append(auth)
     
@@ -178,11 +178,10 @@ def create_mesh_network_with_internet(
         info("*** Setting up mesh mobility\n")
         net.setMobilityModel(
             time=0,
-            model='RandomDirection',
-            max_x=200,
-            max_y=150,
-            min_v=1,
-            max_v=3,
+            model='GaussMarkov',
+            velocity_mean=5,
+            alpha=0.5,
+            variance=0.1,
             seed=42
         )
     
@@ -348,7 +347,7 @@ def main() -> None:
         
         # Start interactive CLI using standard FastPay CLI
         info("*** Starting Enhanced FastPay CLI\n")
-        cli = FastPayCLI(net, authorities, clients, gateway)
+        cli = MeshPayCLI(net, authorities, clients, gateway)
         print("\n" + "=" * 70)
         print("🕸️  Enhanced FastPay IEEE 802.11s Mesh Network Ready!")
         if args.internet:

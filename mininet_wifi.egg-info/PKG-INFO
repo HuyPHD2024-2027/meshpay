@@ -1,19 +1,33 @@
-Metadata-Version: 2.1
+Metadata-Version: 2.4
 Name: mininet-wifi
 Version: 2.7
 Summary: Process-based SDN emulator
-Home-page: UNKNOWN
 Author: Bob Lantz; and Ramon Fontes
 Author-email: rlantz@cs.stanford.edu; ramon.fontes@ufrn.br
 License: BSD
 Keywords: networking emulator protocol Internet OpenFlow SDN
-Platform: UNKNOWN
 Classifier: License :: OSI Approved :: BSD License
 Classifier: Programming Language :: Python
 Classifier: Development Status :: 5 - Production/Stable
 Classifier: Intended Audience :: Developers
 Classifier: Topic :: System :: Emulators
 License-File: LICENSE
+Requires-Dist: setuptools
+Requires-Dist: matplotlib
+Requires-Dist: web3>=6.15.1
+Requires-Dist: eth-account==0.9.0
+Requires-Dist: eth-utils>=2.3.1
+Requires-Dist: python-dotenv>=1.0.0
+Requires-Dist: pydantic>=2.5.0
+Dynamic: author
+Dynamic: author-email
+Dynamic: classifier
+Dynamic: description
+Dynamic: keywords
+Dynamic: license
+Dynamic: license-file
+Dynamic: requires-dist
+Dynamic: summary
 
 
         Mininet-WiFi is a network emulator which uses lightweight
@@ -21,4 +35,3 @@ License-File: LICENSE
         prototyping of Software-Defined Wireless Network (SDWN) designs
         using OpenFlow.
         
-

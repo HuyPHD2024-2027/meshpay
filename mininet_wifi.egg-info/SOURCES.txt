@@ -16,6 +16,7 @@ meshpay/logger/clientLogger.py
 meshpay/nodes/__init__.py
 meshpay/nodes/authority.py
 meshpay/nodes/client.py
+meshpay/nodes/client1.py
 meshpay/transport/__init__.py
 meshpay/transport/tcp.py
 meshpay/transport/transport.py

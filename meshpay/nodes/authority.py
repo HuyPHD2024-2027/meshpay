@@ -111,6 +111,8 @@ class WiFiAuthority(Station):
             "txpower": 20,
             "antennaGain": 5,
         }
+        if position is not None:
+             default_params['position'] = position
         default_params.update(params)
 
         super().__init__(name, **default_params)

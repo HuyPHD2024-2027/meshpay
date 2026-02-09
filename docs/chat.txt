@@ -1,0 +1,418 @@
+DAG-based Consensus in Asynchronous Mesh Networks
+FastPay: FastPay is a side-chain payment system built atop a “Primary” ledger (e.g. an existing blockchain or settlement system) and a committee of 
+3
+f
++
+1
+3f+1 authorities. It eschews global consensus by using Byzantine Consistent Broadcast channels per account
+docs.sui.io
+. In practice, a FastPay transfer order is sent to all authorities, who run a signed echo broadcast: once 
+2
+f
++
+1
+2f+1 signatures (a quorum) are collected, the payment is certified and later settled via an atomic swap with the Primary. This per-account broadcast means no global state is shared across accounts until settlement, allowing sharding across accounts
+docs.sui.io
+. FastPay assumes an asynchronous network with eventual delivery, up to 
+f
+f malicious authorities
+docs.sui.io
+. Safety (no double-spend) follows from the 
+2
+f
++
+1
+2f+1 quorum certificates; liveness holds for correct users once messages propagate. Thus FastPay achieves BFT correctness (safety and liveness under Byzantine faults) without a full consensus protocol, relying on threshold signatures for durability
+docs.sui.io
+. In practice FastPay achieves very high throughput: experiments report up to 160,000 transactions/sec across 48 shards (≳7× Visa’s peak). Confirmation latencies are sub-second: clients in the US saw ~200 ms round-trip, ~50 ms from Europe. Because it treats the network as fully asynchronous, FastPay tolerates arbitrary delays and reordering
+docs.sui.io
+. In a mesh topology (general peer-to-peer connectivity), FastPay’s performance would depend on inter-authority delays; safety is preserved as long as quorums can form. Its lack of a leader makes it robust to any one node’s slowness, though throughput falls if authorities are partitioned. Narwhal + Tusk: Narwhal is a high-throughput mempool protocol that separates data dissemination from ordering. Each validator runs multiple workers (for storing transaction data) and a primary. Workers gossip transactions to corresponding workers on other nodes. Primaries periodically batch new transactions into blocks (containing transaction digests and references to previous certified blocks) and reliable-broadcast these blocks (via 
+2
+f
++
+1
+2f+1 signatures) to all validators. This forms a round-based DAG of certified blocks: in round 
+r
+r, each primary sends a message with that round’s block metadata (digests and 
+n
+−
+f
+n−f parent links)
+decentralizedthoughts.github.io
+. Upon receiving such a message, other nodes attest if they have the data and haven’t equivocated (one block per round). Once 
+n
+−
+f
+n−f attestations are returned, the sender forms a quorum certificate for its block and includes it in subsequent blocks. Thus every certified block ensures availability of its causal history (anyone with the quorum cert can fetch its data). Narwhal assumes full asynchrony and up to 
+f
+<
+n
+/
+3
+f<n/3 Byzantine faults. It guarantees reliable dissemination and integrity: honest validators eventually store all valid transactions, and no two conflicting blocks (same round by same validator) both get a certificate (non-equivocation). On top of Narwhal, Tusk is a fully asynchronous BFT consensus protocol that totals orders the DAG with zero extra messaging. Tusk uses the Narwhal DAG as input and runs a random leader election (via threshold coin from block signatures) in waves of rounds. In each wave (3 rounds), validators issue blocks as usual. They also include in-round votes for a wave leader. At the end of round 3, the shared randomness reveals a leader, and that block (and all blocks it references) are committed. Crucially, Tusk requires no additional network broadcasts beyond Narwhal’s DAG: each node locally “reads” its DAG and applies the commit rule. It thus provides asynchronous safety (FLP-style termination in expected time) and liveness under network asynchrony. In essence Tusk is an asynchronous extension of DAG-Rider consensus. Security: The Narwhal+Tusk stack is provably BFT. Narwhal’s RBC certificates ensure any certified block has 
+n
+−
+f
+n−f honest supporters (so at least 
+f
++
+1
+f+1 honest stores). Tusk’s randomized leader election over the certified DAG guarantees that eventually a single leader’s block is decided by all honest parties. Consensus safety holds unconditionally (no two honest nodes commit different transactions), and liveness holds in an asynchronous network (with probability 1 eventually some block will be committed). Performance: This separation yields extremely high throughput. In WAN experiments, Narwhal combined with HotStuff reached 130K TPS at under 2 s latency (scaling to 600K TPS with more workers); by contrast, classic HotStuff only reached ~1.8K TPS. Tusk further boosted throughput to ~160K TPS with ~3 s latency. Under failures or network delays, throughput remains high, though Narwhal+HotStuff’s latency rises (Tusk is more stable under asynchrony). Since Narwhal is fully asynchronous, it tolerates mesh networks well; block propagation may be slower across sparse links, but eventual consistency and data availability hold as long as the network is connected. Tusk, being asynchronous BFT, likewise remains correct in any mesh topology (though delays to the random coin or quorum assemblies may lengthen commit times). Mahi-Mahi: Mahi-Mahi is a new asynchronous DAG BFT protocol optimized for ultra-low latency and high throughput. Like Narwhal+Tusk, it uses a DAG of proposals, but with key innovations: it uses an uncertified DAG (avoiding per-block RBC overhead) and a novel commit rule that can commit multiple leader blocks per round. Each round all validators issue a block referencing a set of prior blocks; no initial reliable broadcast is performed. Instead, a threshold signature or randomness may still be used to break symmetry. Mahi-Mahi’s commit rule rapidly commits any block that is well-supported by its children in the DAG, allowing many blocks (even from different validators) to be finalized simultaneously. Security: Mahi-Mahi is fully asynchronous BFT (tolerating 
+f
+<
+n
+/
+3
+f<n/3), with safety proven by its DAG commit rule. It relies on randomness to ensure termination (similar to Tusk’s coin), but safety holds unconditionally: no two conflicting blocks can both satisfy the commit criteria. Performance: By eliminating broadcast overhead and committing multiple leaders, Mahi-Mahi achieves unprecedented speed for asynchronous consensus. In a 50-node geo-distributed test it processed 350,000 TPS with latency <2 s, and even 100,000 TPS at sub-second latency. This matches or exceeds state-of-the-art partially synchronous protocols. Thus Mahi-Mahi sets a new record for asynchronous BFT: extremely high throughput and near-sub-second commit times, while still tolerating unbounded delays. In a mesh network its asynchronous design means it tolerates arbitrary link delays; performance depends mainly on the DAG gossip rate, but the commit criteria still hold. Figure: Avalanche/Snow consensus flow. Each node repeatedly samples a small random set of peers and updates its vote on conflicting transactions until convergence.* Avalanche: Avalanche is a DAG-based consensus in the “Snow” family that uses repeated random sampling instead of a strict committee or leader. Here each transaction forms a vertex in a global DAG, and validators maintain preferences over conflicting transactions. The protocol proceeds in queries: a node picks 
+k
+k random peers (weighted by stake), asks for their preferred transaction (from each conflict set), and updates its own preference if a supermajority is reached. This sampling is repeated for 
+β
+β successful rounds (Snowball), at which point the transaction is accepted (finalized). Thus consensus emerges from a rapid feedback loop: conflicts self-reinforce until all honest nodes agree. Architecture and Assumptions: Avalanche assumes a permissioned set of validators with stakes, up to a certain adversarial fraction (often <50%). It does not use leader election or PKI thresholds; instead, each node randomly samples some peers each round, so connectivity is random and meshlike. In practice Avalanche is typically considered partially synchronous: it achieves probabilistic finality (i.e. safety with overwhelming probability rather than deterministic). However, safety has been shown to hold even if up to ~60% of validators are Byzantine (given appropriate parameters). Consensus Flow: When a new transaction arrives, nodes vote on it via the Snow* protocol: each round polls 
+k
+k peers for their current vote (value). If more than 
+α
+k
+αk peers agree on a value, a node adopts that value and increments its confidence counter. After 
+β
+β consecutive successful polls, the transaction is “decided” and accepted. This is done independently for each conflict set. The net result is that the global transaction graph (a DAG because transactions may reference multiple past UTXOs) obtains a consistent coloring of accepted/rejected status by all honest nodes. Security/BFT: Avalanche provides probabilistic BFT guarantees. If a transaction is accepted by some honest node (confidence threshold 
+β
+β reached), then with high probability all honest nodes will eventually accept the same transaction. There is a non-zero (but tunably tiny) risk of a conflicting acceptance. Unlike traditional BFT which is deterministic, Avalanche’s safety is statistical: it assumes nodes’ random samples converge due to metastability of the Markov chain. Under normal conditions, if less than ~40% of validators (by stake) are adversarial, all conflicts will break in favor of the honest majority with overwhelming probability. Performance: Avalanche is extremely fast and scalable. The protocol is fully decentralized and parallelizable (every validator can propose transactions). In practice the mainnet achieves on the order of thousands of transactions per second per subnet, with confirmation times on the order of 0.5–2 seconds. The official Avalanche documentation emphasizes sub-second finality and “high throughput, low latency”, and independent sources report up to ~4500 TPS with <2 s finality. Because Avalanche relies on multi-hop peer gossip, its performance degrades gracefully in a mesh network: sparse or unreliable links slow down propagation of preferences, but as long as the network remains connected, consensus still eventually converges. Sui (Mysticeti): Sui employs a DAG-based consensus called Mysticeti (a hybrid of earlier DAG protocols), optimized for both throughput and low latency
+docs.sui.io
+docs.sui.io
+. Multiple validators propose blocks in parallel each round, forming a DAG of proposals. Unlike Narwhal, Sui’s DAG blocks are not certified via RBC before inclusion; instead, commit decisions happen after a fixed number of rounds. Mysticeti requires just three rounds of communication to commit a block from the DAG, matching the optimal theoretical latency for BFT consensus
+docs.sui.io
+. Essentially, in round 1 and 2 validators broadcast blocks and vote; in round 3 they certify leaders and commit the corresponding blocks. This “fast commit” path is built into the DAG structure, so no extra signature rounds are needed. Assumptions/Security: Mysticeti assumes partial synchrony and up to 
+f
+<
+n
+/
+3
+f<n/3 Byzantine validators. By committing after three rounds of aggregating votes (often via threshold signatures on vote certificates), it achieves strong finality: once a block is committed by an honest quorum, it is irreversible. The protocol admits leader rotations and handles unavailable leaders by default, ensuring censorship resistance. Performance: Mysticeti is extremely high-performance. In benchmarks, a 10-node setup sustained ~300,000 TPS before latency exceeded 1 s, and 50-node setups reached ~400,000 TPS before 1 s
+docs.sui.io
+. Even under load, average commit latency is about 0.5 s at 200,000 TPS
+docs.sui.io
+. These figures far exceed older consensus protocols. In a mesh network, Mysticeti behaves like any leader-based BFT: as long as messages propagate within the three-round window, performance is similar. If some links are slow, blocks may wait an extra round to get certificates, slightly increasing latency but not breaking safety (fast-path commit may be delayed but a fallback round still finalizes).
+Asynchronous Performance, Latency, and Throughput
+Across all these DAG protocols, asynchrony is a central design consideration. FastPay and Narwhal explicitly assume a fully asynchronous network
+docs.sui.io
+, meaning they tolerate arbitrary delays and reorderings (so long as messages eventually arrive). Avalanche’s gossip sampling likewise does not require lockstep timing, though its probabilistic guarantees assume sufficiently mixing connectivity. Mysticeti is partially synchronous but tolerates transient asynchrony by falling back on its third-round commit. In terms of throughput, all these DAG protocols target very high rates. FastPay achieves ~
+10
+5
+10 
+5
+  TPS by sharding and eliminating consensus overhead. Narwhal+Tusk similarly achieves on the order of 
+10
+5
+10 
+5
+  TPS (e.g. 130K–160K TPS in experiments), and Mahi-Mahi pushes this even higher (~350K TPS). Avalanche’s throughput is somewhat lower in practice (thousands to low tens of thousands TPS per subnet) but is scalable by adding validators and subnets. Mysticeti (Sui) reports hundreds of thousands of TPS (300K–400K) in controlled tests
+docs.sui.io
+. For latency, FastPay and Narwhal/Tusk typically commit within 0.2–3 s depending on configuration. FastPay’s confirmations occur in under a second (roughly one network round-trip plus signature). Narwhal/Tusk complete a commit (the quorum ordering decision) in a few seconds in WAN tests (2–3 s). Mahi-Mahi achieves sub-2 s commit even under full asynchrony. Avalanche’s expected finality is sub-second to a few seconds (e.g. ~1–2 s in practice) depending on parameter tuning. Mysticeti’s new commit rule achieves ~0.5 s in tests
+docs.sui.io
+. Consistency guarantees vary: FastPay and Narwhal/Tusk/Mahi-Mahi have strong BFT finality (once committed, blocks are permanent). Avalanche offers probabilistic finality: if honest nodes accept a transaction, others will almost surely follow. Sui/Mysticeti has strong finality per round.
+Mesh Topology Considerations
+In a mesh network (decentralized peer-to-peer connectivity), these protocols behave similarly to general asynchronous networks. Because they all assume eventual message delivery, no single topology is required. In practice, protocols that rely on global quorums (FastPay, Narwhal) require that at least 
+n
+−
+f
+n−f authorities remain connected. A highly partitioned mesh could delay quorum formation (and thus delays finality), but safety is preserved so long as no branch achieves a quorum without others. Avalanche and Gossip-based designs are naturally suited to mesh networks: nodes only need a subset of peers to exchange votes, so even sparse connectivity can suffice to spread transactions. However, very irregular meshes (where some nodes have poor connectivity) will slow down information propagation and thus increase latency for all protocols. For example, FastPay’s 200 ms latency over a continental network might become several seconds if links are multi-hop wireless; similarly, Avalanche’s sampling convergence may take longer. In sum, asynchronous BFT (Narwhal/Tusk, Mahi-Mahi) offer the most resilience in arbitrary meshes (they make no timing assumptions and require only eventual connectivity), whereas partial-sync protocols (Avalanche, Mysticeti) may incur extra rounds during bad network conditions but still maintain safety.
+Proposed Innovations for Asynchronous Mesh Networks
+To further improve DAG-based BFT in low-latency mesh environments, we suggest several possible enhancements:
+Hybrid Erasure Coding: Introduce erasure coding for block data dissemination. Instead of each block’s raw transactions being sent to all nodes (as in Narwhal), encode each block’s payload into redundant pieces. Mesh nodes exchange coded fragments. Once any node collects enough fragments to reconstruct the block, it can certify it. This reduces worst-case cost on any single link and can improve reliability on unreliable connections. The DAG would then reference content hashes, and quorums would certify availability via fragments rather than full data.
+Clustered DAG and Commit: Organize validators into dynamic clusters (e.g. by geographic proximity). Each cluster runs its own local DAG and lightweight consensus, then periodically merges its commits into a global DAG. For example, cluster leaders could exchange summarized block certificates. This trades a bit of immediacy (intra-cluster commits are fast) for improved scalability: local connectivity is exploited, and global commits proceed asynchronously. Such a hierarchical DAG could reduce latency on local transactions while still ensuring global BFT safety when clusters sync.
+Adaptive Committee Overlays: Build adaptive overlay networks to expedite consensus. For instance, identify well-connected “hub” nodes in the mesh and temporarily elevate them as validators for a fast-path consensus, while others wait in the background. If hubs reach consensus on a leader quickly, their decision is gossiped to the rest of the mesh. If some hubs fail or network conditions worsen, fall back to the full DAG commit (as in Bullshark or Mysticeti). This hybrid scheme uses partial synchrony opportunistically: it can achieve near-0 round-commit when mesh latency is low, but still have a full-asynchrony fallback under adverse conditions.
+Weighted Voting Based on Connectivity: Extend the Snow* sampling or Tusk leader selection by weighting votes by network reliability. Validators with many high-speed links could be given more influence in the random sampling or elected leader role. For example, in each round, nodes could estimate link latencies and dynamically adjust their sampling probabilities (higher weight to better-connected peers). This biases the DAG so that well-propagated blocks (from central nodes) are more likely to be committed first, reducing overall latency in a heterogeneous mesh. Safety can be preserved by capping such weights to prevent a small set of hubs dominating consensus.
+Each of these ideas aims to exploit mesh structure or reduce communication to lower latency without sacrificing full BFT. For instance, erasure coding and clustering reduce bandwidth bottlenecks; adaptive overlays speed up common-case consensus; weighted voting accelerates decisions when connectivity is uneven. Rigorous analysis and simulation would be needed to validate these schemes, but they illustrate how DAG consensus could be tuned for mesh-style networks. Conclusion: DAG-based protocols decouple data dissemination from ordering, yielding excellent throughput and partial ordering that can be finalized via BFT mechanisms. FastPay, Narwhal+Tusk, Mahi-Mahi, Avalanche, and Sui’s Mysticeti all achieve Byzantine fault tolerance under asynchronous assumptions, but with different trade-offs. FastPay and Narwhal emphasize high throughput via per-account or per-block broadcast, Tusk/Mahi-Mahi/ Mysticeti achieve fast commit via specialized DAG commit rules, and Avalanche uses randomized sampling for lightweight consensus. In practical mesh networks, all these approaches remain safe (due to their asynchronous or probabilistic models), though throughput and latency depend on connectivity. The proposed innovations above suggest how one might further tailor DAG consensus—through coding, clustering, adaptive protocols, and weighting—to push latency even lower while maintaining full BFT guarantees. Sources: Descriptions and performance data are drawn from the protocols’ original papers and documentation
+docs.sui.io
+docs.sui.io
+. Detailed proofs are beyond our scope, but each protocol’s safety and liveness claims are proven under Byzantine assumptions as cited.
+Citations
+
+Sui-Related Research Papers | Sui Documentation
+
+https://docs.sui.io/concepts/research-papers
+
+DAG Meets BFT - The Next Generation of BFT Consensus
+
+https://decentralizedthoughts.github.io/2022-06-28-DAG-meets-BFT/
+
+Consensus | Sui Documentation
+
+https://docs.sui.io/concepts/sui-architecture/consensus
+
+Consensus | Sui Documentation
+
+https://docs.sui.io/concepts/sui-architecture/consensus
+All Sources
+
+docs.sui
+
+decentra...ts.github
+
+Nice—this is a crisp, practical engineering plan you can run in Mininet-WiFi to implement a DAG consensus prototype and the clustered-DAG variant, plus a fast, repeatable evaluation strategy that minimizes long emulation runs while still giving credible throughput/latency answers.
+
+I’ll split this into four parts so it’s easy to follow and execute:
+
+1. engineering plan (what to build, module layout, APIs)
+2. clustered-DAG extension design (how clusters interact, merge rules)
+3. test & evaluation plan (experiments, metrics, logging)
+4. practical speedups and shortcuts (how to get results fast without losing validity)
+
+Where useful I reference protocol papers and Mininet-WiFi docs so you can follow the originals. ([arXiv][1])
+
+---
+
+# 1) Engineering plan — implement a DAG stack in Mininet-WiFi
+
+Goal: split the implementation into **data dissemination (mempool / DAG gossip)** and **ordering/commit (commit rules / leader election / finalize)** so you can test the DAG and commit rules separately (this is what Narwhal/Tusk do). ([arXiv][1])
+
+Core components (each is a separate process/daemon you’ll run inside a Mininet host — implement in Python for speed of iteration):
+
+* **Node daemon (`dagd`)**
+
+  * Responsibilities: create proposals (blocks/transactions), attach parent pointers (DAG edges), gossip proposals to peers (via UDP/TCP), respond to fetch requests.
+  * API/IPC: simple REST or local socket for a “client submit tx” and for test harness to query local DAG state.
+  * Implementation notes: send only *digests* in routine gossip; fetch payloads on demand to reduce bandwidth in emulation.
+
+* **Reliable-mempool / fragmenter**
+
+  * Implement lightweight version of Narwhal worker: separate data plane (transaction fragments) from meta-DAG. To reduce emulation bandwidth, you can use short payloads or simulate payloads with hashes; later add erasure coding simulation. ([arXiv][1])
+
+* **Committer (`commitr`)**
+
+  * Implements commit rules (Tusk / Mahi-Mahi / Mysticeti style). Reads local DAG and applies commit rule using only certified/meta information (quorum certificates or vote counts).
+  * Implement at least two commit rules you want to compare:
+
+    * Certified-block commit (Narwhal+Tusk style)
+    * DAG-support commit (Mahi-Mahi style)
+    * Snow* sampling fallback if you want Avalanche style.
+
+* **Network layer glue**
+
+  * Use Mininet-WiFi host.cmd() or run daemons inside containers launched from each host (both workable). Mininet-WiFi docs explain host process model and mobility control. ([opendl.ifip-tc6.org][2])
+
+* **Test harness / orchestrator**
+
+  * Responsible for: starting nodes, injecting transactions at controlled rates, collecting metrics and logs, stopping/starting clusters and partitions, and producing plots.
+  * Make it scriptable (Python). Use parallel SSH or Mininet API to run commands on nodes.
+
+Implementation roadmap (short milestones)
+
+1. Minimal DAG gossip: local daemon that gossips digests and fetches payloads. Verify delivery (single node set). (1–3 days)
+2. Add parent pointers and DAG persistence (store in lightweight DB like LMDB or even in-memory dict with WAL). (2–4 days)
+3. Implement simple commit rule: wait for n−f attestations on a block then mark committed (Narwhal style). Test on 4–7 nodes. (2–4 days). ([arXiv][1])
+4. Add Tusk-style local read/commit wave (random coin simulation) or Mahi-Mahi commit rule; compare. (3–7 days). ([arXiv][3])
+5. Instrument metrics & logging and basic failure injections (node crash, slow link, partition). (2–3 days)
+
+Files you’ll want in repo:
+
+* `dag_node.py` — node daemon + gossip
+* `committer.py` — commit rules module (pluggable)
+* `mempool.py` — data plane
+* `test_orchestrator.py` — experiment runner + result aggregator
+* `mininet_topos.py` — scripts to create topologies and launch daemons using Mininet-WiFi API
+
+Hints for accuracy and development speed:
+
+* Keep DAG metadata small (digest + parents + timestamp) in gossip; fetch payloads lazily.
+* Separate “availability” from “ordering” in code (this lets you run fast logic-only experiments without re-sending big payloads).
+* Use deterministic random seeds for replayable experiments.
+
+References: Narwhal/Tusk paper and Mahi-Mahi describe this separation and commit rules. ([arXiv][1])
+
+---
+
+# 2) Clustered-DAG feature (design + implementation approach)
+
+Objective: exploit locality to speed commits in mesh networks by forming dynamic clusters that run local DAGs and periodically merge summaries into a global DAG.
+
+High-level design:
+
+* **Cluster formation**
+
+  * Each node maintains an *overlay* set of neighbors and a small cluster membership (e.g., nodes within X hops or top-k neighbors by link quality).
+  * Use periodic beacons to measure RTT/packet loss; form clusters by geographic/proximity heuristics or link quality ranking.
+
+* **Intra-cluster DAG**
+
+  * Nodes in a cluster run a full DAG mempool and commit locally using a fast local commit rule (e.g., local quorum n_c − f_c).
+  * Cluster commit yields **cluster certificates** (a short quorum certificate or aggregated signature) summarizing the local DAG head(s) or committed set.
+
+* **Inter-cluster merging**
+
+  * Cluster leaders or a rotating set of supernodes exchange **cluster certificates** (not full payloads) and include them as DAG parents in their own global proposals.
+  * When a proposal references cluster certificates from different clusters, it implicitly commits the referenced local commits globally (merge rule).
+  * Periodic background reconciliation: nodes can fetch missing data referenced by a certificate on demand.
+
+* **Safety & Liveness**
+
+  * Safety: ensure merging only uses certificates that needed quorum within cluster (so cluster local commit ≡ durable for cluster members). Global safety holds because a global commit references only cluster certificates that cannot be forged.
+  * Liveness: if cluster leaders are partitioned, global merge is slower but local commits still happen.
+
+Implementation notes (practical):
+
+* Start with **static clusters** in Mininet (map nodes to clusters by position). Later implement dynamic cluster discovery.
+* Represent cluster certificate as compact signed summary: `{cluster_id, seq_no, head_digest, quorum_sig}`.
+* Merge by creating synthetic meta-blocks referencing cluster certificates (very small) — that keeps emulation cheap.
+
+Why this helps in mesh: local commits happen over low-latency links; global merges happen occasionally, so common transactions finalize quickly within cluster then finalize globally later. This trades immediate global finality for faster local finality while preserving eventual global BFT safety if merging requires appropriate quorums.
+
+---
+
+# 3) Test & evaluation plan — what to measure & experiment matrix
+
+## Metrics (obvious and important)
+
+* **Throughput (TPS)** — transactions committed per second (local cluster and global).
+* **End-to-end commit latency** — time from client submit to commit (local commit vs final global commit).
+* **Commit variance** — distribution (median, p95, p99).
+* **Message overhead** — bytes exchanged per committed tx (estimates both meta and payload).
+* **CPU / memory per node** — to identify scaling bottlenecks.
+* **Data availability latency** — time for payload to be fetchable after digest appears.
+* **Resilience metrics** — % of commits under partitions, time to recover after rejoin.
+
+## Baseline protocols to compare
+
+* Plain Narwhal + Tusk style (certified DAG commit). ([arXiv][1])
+* Mahi-Mahi commit rule. ([arXiv][3])
+* Clustered-DAG variant (your design) — measure local vs global commit times.
+* Optional: Avalanche/Snow sampling (probabilistic) if you want to compare a gossip sampling approach. ([docs.sui.io][4])
+
+## Experiment matrix (recommended minimal set)
+
+Vary the following axes to get meaningful curves:
+
+A. **Network topology / connectivity**
+
+* Well connected mesh (high degree)
+* Sparse mesh (random graph with average degree 3)
+* Partitioned mesh (simulate partial partition for T seconds)
+
+B. **Node count & cluster sizes**
+
+* Small: n=7 (f=2) — sanity checks
+* Medium: n=25 (clusters of 5)
+* Large-ish: n=50 (clusters of 5–10) — consider using a simulator for scale (see speedups)
+
+C. **Transaction load**
+
+* Low: 100 TPS total
+* Medium: 10k TPS total (scaled appropriately)
+* High: stress test up to the protocol’s expected limits (but perform scaled experiments to save time)
+
+D. **Fault injections**
+
+* Crash f nodes (Byzantine equivocation simulated)
+* Slow links (increase RTT on some links)
+* Network partitions/merges
+
+For each (A,B,C,D) combination run N repeated trials (N≥5) to get confidence intervals.
+
+## Data collection & reproducibility
+
+* Add deterministic seeds to client and node daemons so runs are repeatable.
+* Log events with monotonic timestamps in UTC and node id (submit, recv-digest, fetch-start, fetch-done, certificate-created, commit-local, commit-global).
+* Export logs to the orchestrator and compute metrics offline (Python/pandas).
+* Store raw logs and a summary CSV per trial.
+
+## Statistical analysis
+
+* Report median & p95/p99 latencies; compute throughput vs offered load; plot message cost per tx.
+* Use paired comparisons between protocol settings to claim improvements (e.g., cluster vs non-cluster under same topology/load).
+
+---
+
+# 4) Speedups — how to get results fast while still credible
+
+Running many full Mininet-WiFi emulations is slow. do this instead: **progressive fidelity testing** — quick correctness/unit tests → medium logic-only emulation → final high-fidelity runs.
+
+Concrete steps:
+
+1. **Logic-only simulation for ordering rules**
+
+   * Implement a fast, event-driven simulator of the DAG/commit rules (no real network). Use simulated network delays drawn from distributions. This lets you exercise the commit rules and parameters quickly for many runs. Narwhal/Tusk and Mahi-Mahi papers used similar logic separation. ([arXiv][1])
+   * Benefit: thousands of runs in minutes; find promising parameter ranges.
+
+2. **Trace-driven emulation**
+
+   * Record a few realistic wireless traces (RTT/loss patterns) or use literature traces. Replay those traces in Mininet-WiFi for repeatability. Trace-driven emulation gives realistic behavior and is repeatable; it also lets you iterate on protocol logic without running many distinct wireless scenarios. ([arXiv][5])
+
+3. **Reduce payload size / use digests**
+
+   * In most experiments send only digests in gossip; simulate payload availability. Payload transfer can be validated in a few runs. This drastically lowers bandwidth and CPU cost in emulation.
+
+4. **Scale by sampling**
+
+   * Instead of running full 50–200 node emulation for all scenarios, run smaller emulations (e.g., clusters of size 5–10) and extrapolate. Use logic simulator to validate extrapolation.
+
+5. **Parallelize experiments**
+
+   * Run multiple Mininet instances in parallel on separate VMs/containers or on a machine with enough cores. Use Docker or LXC to isolate. Mininet+Docker orchestration is common (many posts & guides). ([blog.systerel.fr][6])
+
+6. **Use faster network I/O frameworks (option)**
+
+   * If you hit kernel bottlenecks, explore packet I/O frameworks (Netmap, DPDK). There are research reports about speeding Mininet with Netmap; consider this only if you must push realistic payload volumes. ([ResearchGate][7])
+
+7. **Profile and optimize hotspots**
+
+   * Use CPU / network profiling to find bottlenecks (serialization, signature verification). Replace expensive crypto with simulated signatures in early experiments; re-enable real crypto only for final validation.
+
+8. **Deterministic small-scale runs for debugging**
+
+   * Use n=7 or n=10 deterministic runs (fast) whenever you change commit rule code; only then move to larger scenarios.
+
+---
+
+# Example minimal experiment script (conceptual)
+
+* Start Mininet-WiFi topology with N nodes (script using Mininet Python API). Launch `dag_node.py` on each host:
+
+```
+sudo mn --wifi --topo=my_mesh_topo --controller=none -x
+# inside test_orchestrator: for each host h:
+h.cmd('python3 /home/user/dag_node.py --id {} --peers "{}" &'.format(h.name, peer_list))
+```
+
+* Start client injector on node0 to send transactions at X TPS.
+* Collect logs from `/tmp/dag_logs/nodeX.log`.
+* After T seconds, stop and aggregate csv.
+
+(Replace with your orchestrator code; Mininet-WiFi docs show host.cmd and mobility controls.) ([opendl.ifip-tc6.org][2])
+
+---
+
+# Quick prioritized checklist you can act on now
+
+1. Implement a minimal `dag_node` that gossips digests + parent pointers (keep payloads fake). Verify DAG grows and fetch works. (fast)
+2. Implement `committer` with a simple quorum rule (n−f attestations => committed). Run on n=7. (fast)
+3. Implement logic-only simulator of commit rules; sweep parameters (quorum sizes, sampling k, β). (very fast)
+4. Build cluster certificate type and static cluster experiment in Mininet (map nodes → clusters) and measure local vs global latency. (medium)
+5. Run trace-driven Mininet experiments for the few most realistic traces you care about; only then run final large experiments. (slow, last)
+
+---
+
+# References (read these first)
+
+* Narwhal & Tusk (paper + Github). Good for separation of data/ordering and certified DAG idea. ([arXiv][1])
+* FastPay (side-chain per-account broadcasts and safety from quorum certs). Useful for the per-account broadcast idea. ([arXiv][8])
+* Mahi-Mahi (asynchronous DAG commit rule and high throughput design). Helpful for multi-leader commit rule. ([arXiv][3])
+* Mininet-WiFi docs and papers (how to run daemons, mobility, limitations). Use these while writing launch scripts. ([opendl.ifip-tc6.org][2])
+* Trace-driven Wi-Fi emulation & emulation speedup literature (how to record and replay traces, and tradeoffs). ([arXiv][5])
+
+---
+
+If you want, I can:
+
+* produce skeleton code for `dag_node.py` + `committer.py` (Mininet-WiFi friendly) and a small orchestrator to launch and collect logs, or
+* produce a compact experiment configuration (CSV) and plotting notebook to ingest logs and produce the TPS/latency curves.
+
+Which one do you want first? (I recommend starting with the skeleton code — it gets you running quickly.)
+
+[1]: https://arxiv.org/pdf/2105.11827?utm_source=chatgpt.com "Narwhal and Tusk: A DAG-based Mempool and Efficient ..."
+[2]: https://opendl.ifip-tc6.org/db/conf/cnsm/cnsm2015sdn/1570196959.pdf?utm_source=chatgpt.com "Mininet-WiFi: Emulating Software-Defined Wireless Networks"
+[3]: https://arxiv.org/abs/2410.08670?utm_source=chatgpt.com "Mahi-Mahi: Low-Latency Asynchronous BFT DAG-Based Consensus"
+[4]: https://docs.sui.io/concepts/research-papers?utm_source=chatgpt.com "Sui-Related Research Papers"
+[5]: https://arxiv.org/html/2002.03905v2?utm_source=chatgpt.com "The Challenges of Trace-Driven Wi-Fi Emulation"
+[6]: https://blog.systerel.fr/posts/2020-01/mininet/?utm_source=chatgpt.com "Mininet and Performance Evaluation | The Blog - Systerel"
+[7]: https://www.researchgate.net/publication/327293707_Investigating_the_possibility_of_speeding_up_Mininet_by_using_Netmap_an_alternative_Linux_packet_IO_framework?utm_source=chatgpt.com "(PDF) Investigating the possibility of speeding up Mininet ..."
+[8]: https://arxiv.org/abs/2003.11506?utm_source=chatgpt.com "[2003.11506] FastPay: High-Performance Byzantine Fault ..."

@@ -49,7 +49,7 @@ class Settings():
     wtz_contract_address: Optional[str] = os.getenv("WTZ_CONTRACT_ADDRESS", None)
     
     # Blockchain Configuration
-    rpc_url: str = os.getenv("RPC_URL", "https://node.ghostnet.etherlink.com")
+    rpc_url: str = os.getenv("RPC_URL", "https://node.shadownet.etherlink.com")
     chain_id: int = int(os.getenv("CHAIN_ID", "128123"))
     chain_name: str = os.getenv("CHAIN_NAME", "Etherlink Testnet")
     backend_private_key: Optional[str] = os.getenv("BACKEND_PRIVATE_KEY", None)

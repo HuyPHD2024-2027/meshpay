@@ -1,0 +1,268 @@
+\begin{abstract}
+
+Mobile payment systems have become an essential part of modern digital services, supporting applications such as money transfer, mobile banking, and digital wallets. Despite their widespread adoption, these systems rely heavily on stable Internet connectivity, which remains unavailable or unreliable in many parts of the world. To address these challenges, we propose MeshPay, a decentralized offline payment framework that integrates wireless mesh networking with a blockchain-based settlement layer, enabling secure, real-time transaction settlement without Internet access. Blockchain technology provides a transparent and tamper-resistant ledger, reduces transaction costs and long process of validity by eliminating intermediaries. The proposed system is implemented and evaluated using Mininet-WiFi, demonstrating its ability to achieve up to 5000 transactions per second and keep latencies below 800 milliseconds with 20 authority nodes under ideal conditions. These results highlight the feasibility of mesh-based offline payment systems as a robust alternative for connectivity-constrained environments.
+
+\end{abstract}
+\section{Introduction}
+\label{sec:intro}
+
+According to \cite{regragui2022african}, the global mobile payment market is projected to reach 7.58 trillion USD by 2027, at a Compound Annual Growth Rate of 29.0\% during the forecast period. However, internet infrastructure is one the main reasons that challenges mobile payment for wide adoption. The internet infrastructure deployment in developing countries—particularly across Africa—remains severely constrained. Less than one-third (27\%) of adults in Africa can have access mobile Internet services \cite{mothobi2024impact}. In bustling open-air markets, traders and shoppers often have internet capable phones in their pockets yet still pay with cash because the network is down or too slow to authorize transactions in real time. Additionally, internet shutdowns occured 21 times in 2024 in African countries, the highest number in a single year \cite{digWatch2025shutdown}. During shutdowns, mobile money agents and end users lose access to their wallets, resulting in the suspension of peer-to-peer transfers and merchant transactions.
+
+Traditional mobile money systems further worsens these limitations, as they depend on centralized banking infrastructure for transaction settlement. These systems become inaccessible during network disruptions, with studies showing that internet shutdowns could have an estimated GDP impact of approximately \$3 million per day of disruption, amounting to 0.4\% of daily GDP \cite{patnam2020real}. Additionally, the complex security validation processes require extensive Know Your Customer (KYC) procedures that systematically exclude populations, particularly affecting the 850 million adults globally who do not have a form of ID, while mobile money providers typically charge significant fees ranging from 4.64\% to 4.80\% for cross border remittances \cite{gsma2024}. In contrast, a blockchain based settlement layer enables peer-to-peer value transfer without relying on any single institution. When deployed over resilient or opportunistic communication channels such as mesh networks, it can maintain transaction functionality even amid Internet outages, while reducing costs and offering a transparent, tamper-resistant record system \cite{momo2021blockchain}.
+
+Thus, in this paper, we propose an off-chain method that leverages wireless mesh networking and blockchain technology to enable devices to form decentralized, peer-to-peer communication networks that support payments even under unreliable Internet connectivity. At a high level, the on-chain smart contract\cite{mohanta2018overview} governs the overall trust structure of the system: it registers a set of authority nodes (such as mobile money agents, merchants, or trusted community members) and manages the deposit funds that users lock before transacting offline. Once collateral is deposited, users can exchange tokens directly through the mesh network, where nearby authority nodes verify and collectively approve each transfer through a weighted voting protocol. And once the required quorum is collected, the resulting transaction is finalized locally and later reconciled on the blockchain. Our approach dynamically adjusts each authority’s voting influence based on its historical performance within the mesh. As a result, quorum formation becomes both adaptive and locally verifiable, enabling the system to maintain secure and efficient transaction validation even under frequent network partitions.
+
+\noindent\textbf{Contributions.} We make the following contributions:
+\begin{itemize}
+    \item Propose a novel mobile payment architecture that uses wireless mesh networking to enable resilient, peer-to-peer transactions in environments with unreliable or limited internet connectivity.
+    \item Introduce a decentralized weighted voting to ensure secure transaction validation within mesh networks where network partitions happen frequently, mitigating risks of fraud and double spending.
+    \item Evaluate the proposed system under realistic connectivity constraints and user mobility scenarios.
+\end{itemize}
+
+\noindent\textbf{Outline.} The remainder of this paper is structured as follows. Section \ref{sec:relwork} provides background and related work.
+Section \ref{sec:system} shows the overview of the whole proposed system. Section \ref{sec:methodology} details the proposed offline payment methodology. Section \ref{sec:security} discusses safety. Section \ref{sec:eval} presents the experimental results and analysis. Finally, Section \ref{sec:conclusion} concludes the paper with a discussion of key findings and future research directions.
+\section{Related Work}
+\label{sec:relwork}
+
+The work BRICK\cite{avarikioti2019brick} introduces a novel off-chain payment channel design that remains secure under network asynchrony by employing a committee of external wardens to validate state closings, and making a call to on-chain contract only for settlements. This architecture demonstrates that  by moving updates off-chain, transaction throughput and latency can be improved, while maintaining safety via on-chain anchoring. However, BRICK assumes connectivity sufficient for the committee to communicate and reach agreement—conditions that may not hold in a mobile mesh network where partitions, mobility and unreliable links are present. 
+
+\cite{bazzi2024fractional} formalizes an off-chain execution model in which payments can proceed in parallel with fewer than f + 1 validations, by partitioning account balances among subsets of validators. This approach demonstrates that strong safety guarantees can be achieved even without full consensus, provided that final reconciliation is anchored on-chain. Our work builds on this principle but adapts it to decentralized wireless mesh environments, where validators (authority nodes) may experience intermittent connectivity. We introduce a weighted membership mechanism that dynamically adjusts validator influence based on performance, enabling consistent transaction validation.
+
+% In fact, there are already several solutions that reuses commodity WiFi and Bluetooth radios to enable a peer-to-peer mesh networking. Among existing mesh based solutions, LNMesh \cite{kurt2023lnmesh} demonstrates that Bitcoin Lightning Network channels can be relayed over WiFi/BLE mesh network, achieving sub-second confirmations and onchain interoperability. While the work looks promising, it requires conditions that may limit its practical deployment in real world scenarios. For instance, LNMesh requires an active internet connection to establish and settle Lightning channels before and after a payment session. This requirement cannot be promised in environments prone to sudden or prolonged internet outages, where users may not have the opportunity to open a channel in advance and close them after finalizing the transfer. In contrast, the protocol proposed in our work requires only a one time token deposit prior to offline usage, eliminates the need for an active internet connection during the transaction process.
+
+
+It is also worth mentioning FastPay \cite{baudet2020fastpay}, which guided our design choice. FastPay employs a committee of authorities that pre-sign account certificates, enabling clients to gather a quorum of signatures within a single network round. This architecture achieves remarkable performance, delivering sub-100 ms settlement latency and throughput exceeding 80,000 transactions per second (TPS), while preserving strong Byzantine fault tolerance guarantees. We extend FastPay by replacing its static weighted quorum with a dynamic, decentralized weighted voting scheme inspired by Cabinet\cite{zhang2025cabinet}. Specifically, nodes must lock a minimum stake to get admitted into the authority set. Once joined, each authority’s voting power is updated according to an audit score that reflects performance (total number of validated transaction). Moreover, we remove infrastructure dependencies, we embed this enhanced FastPay atop a mesh network formed directly among mobile nodes. By employing decentralized weighted voting with a mesh overlay, our system sustains secure payments across multi hop paths during prolonged internet or cellular outages, overcoming the deployment barriers faced by prior offline payment solutions.
+
+
+
+
+
+
+
+
+
+
+% \paragraph{Threat model.}
+% Often this section you will discuss the threat-model, but there is no strict consensus on that. 
+
+
+% Here is how you cite papers. For example, we read papers in the
+% class~\cite{rahul2016pwtypos,dodisetal:2004}.  And here is some random citation~\cite{Bojinov:2010:KLP,schechter:2010:pen,everspaugh2015pythia,bellare2009format,Juels:2014}
+
+
+% \subsection{Overview of the design}
+% \label{sec:overview}
+
+% And then just to showoff some \LaTeX skills, here is a Tikz plot.
+% \input{images/mainflow.tex}
+
+% You refer to a figure in the following way. In~\figref{fig:mainflow} we show
+% some thing that is relevant for the Multisketch paper by Chatterjee et
+% al.~\cite{chatterjee2019multisketches}. Add your bibliography to the
+% \textsf{bib.bib} file. You can copy the Bibtex format citation from Google
+% Scholar.
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{System Overview} \label{sec:system}
+Our solution is an \emph{off-chain} payment system: payments are executed and validated locally over a wireless mesh, while a smart contract on the layer-1 blockchain provides immutable settlement and governance. The smart contract (i) registers and enforces authority membership, including epoched voting powers, and (ii) holds user deposits that back off-chain balances 1:1. Authorities maintain the off-chain ledger, fetch epoch snapshots from the contract, validate transfer orders over the mesh, and produce signed, epoch-tagged certificates. We introduce a weighted-membership mechanism: authority voting power is computed from performance counters and applied per epoch to make quorum formation adaptive and fair (later shown in Sec.~\ref{sec:weighted-voting}).
+
+
+\subsection{Participants}
+MeshPay involves three types of participants: (i) users, (ii) Authorities and (iii) Smart Contract.
+
+\noindent\textbf{Users} are ordinary nodes that hold cryptographic key pairs and initiate payments. Users deposit funds into the smart contract and generate off-chain transfer requests. Users hold following information:
+\begin{itemize}
+  \item Key pair \((sk_u, pk_u)\).
+  \item Committee configuration \(\mathcal{C}\) (authority's public keys and weighted voting power).
+  \item Local sequence counter \(seq_u \in \mathbb{N}\) for off-chain orders.
+  \item Weighted certificates \(\textsf{WCerts}_u = \{\langle \textit{name}_i,\sigma_i, e, \hat w_i^e\rangle\}\) collected from authorities where:
+\begin{itemize}
+    \item $\textit{name}_i$ denotes the \textbf{identifier (name)} of the $i$-th authority,
+    \item $\sigma_i$ represents the \textbf{signature} generated by that authority, and
+    \item \(e\) is epoch identifier 
+    \item $\hat{w}_i^e$ indicates its \textbf{weighted voting power} in epoch \(e\).
+\end{itemize}
+  
+\end{itemize}
+
+\noindent\textbf{Authorities} is a fixed committee of validator nodes that maintains the off-chain ledger. To become authority, node must deposit a pre-defined fixed amount of token on-chain via a smart contract. Each authority has a key pair and holds the committee configuration. Honest authorities strictly follow the protocol; faulty ones may behave arbitrarily. The state of an authority consists of the following information:
+\begin{itemize}
+  \item Key pair \((sk_a, pk_a)\)
+  \item Committee configuration \(\mathcal{C}\) (authority's public keys and current epoch weighted voting power).
+  \item Off-chain account table \(\textsf{Ledger}[u] = (\textsf{bal}_u, \textsf{next}_u)\) with current balance and next valid sequence of all Users.
+  \item Pending orders \(\textsf{Pending}[u, s]\): validated user orders (sender \(u\), sequence \(s\)) and local signature of all Users.
+  \item Weighted certificates \(\textsf{WCerts}_u\): quorum-certified transfers of all Users.
+  \item Redeem log \(\textsf{Redeemed}[u]\): set or prefix of sequences already settled on-chain.
+  \item Performance counters \(\textsf{tx\_count}_a\) (successful validation).
+  \item Current normalized voting power \(\hat w_a \in [0,1]\), derived from performance (see Sec.~\ref{sec:weighted-voting}).
+\end{itemize}
+
+\noindent\textbf{Smart Contract} the smart contract serves as the immutable settlement point. Users deposit and later redeem their balances via this contract. Each Authority updates his voting power at the end of each epoch and fetch voting power from other authorities from the smart contract. The storage of the smart contract contains following information:
+\begin{itemize}
+  \item Authority set \(\mathcal{C}\) (public keys, locked funds, normalized voting power for each epoch) and weighted quorum threshold \(q\) for each epoch.
+  \item Locked funds mapping \(\textsf{Locked}[u] \in \mathbb{N}\) for user deposits.
+  \item Redeem log \(\textsf{Redeemed}[u]\) (e.g., highest redeemed sequence or a membership set) to prevent double-withdrawals.
+\end{itemize}
+
+\subsection{Protocol Messages}
+The protocol distinguishes between on-chain transactions and off-chain orders exchanged over the mesh. Key message types include:
+
+\begin{enumerate}
+    \item \textbf{Funding Transaction:} A user funds the system by sending an on-chain deposit transaction to the smart contract, locking a specified amount in \(\textsf{Locked}[u]\). Each authority periodically fetches the balances from smart contract, credits the user’s balance in the local ledger \(\textsf{Ledger}[u]\).
+
+    \item \textbf{Transfer Order:} When a sender wishes to pay a recipient, they create a transfer order $O$ with:
+    \begin{itemize}
+        \item $sender(O)$: Sender’s account
+        \item $recipient(O)$: Recipient’s account
+        \item $amount(O)$: Transfer amount
+        \item $sequence(O)$: Monotonically increasing sequence number
+        \item Optional memo or metadata
+        \item $\sigma_{sender}$: Sender’s signature over the fields
+    \end{itemize}
+    The order $O$ is broadcasted to all authorities by mesh network routing protocol, which validate balances and sequence numbers.
+
+    \item \textbf{Authority Response:} Each honest authority $\alpha$ that accepts $O$ adds its weighted signature $\sigma_{\alpha}$ and replies. These signatures form the basis of a certificate.
+
+    \item \textbf{Transfer Certificate:} Once the sender collects at least two-thirds weighted voting power on $O$, he assembles them into a transfer certificate $C$. This certificate is proof that the payment is valid. The sender delivers $C$ to the recipient.
+
+    \item \textbf{Confirmation Broadcast:} Either sender or recipient broadcasts $C$ to all authorities. Upon receiving $C$, each authority debits the sender and credits the recipient. At this point, the transfer is final.
+
+    \item \textbf{Settlement Transaction:} Periodically, or when a user withdraws, a settlement transaction is sent on-chain including the relevant certificates. The smart contract verifies these certificates and updates the on-chain balances accordingly.
+\end{enumerate}
+
+\subsection{Wireless Mesh Network}
+The off-chain protocol operates atop a wireless mesh network, where each node, a user or authority, communicates with neighboring peers over wireless links such as Wifi or Bluetooth. The mesh network is self-organizing and infrastructure-independent, allowing devices to form a multi-hop topology that persists even when Internet access is unavailable. Each node functions both as a host and as a router, relaying packets for other participants. Established routing protocols such as OLSR \cite{clausen2003optimized} are employed to dynamically determine optimal paths to the destination, ensuring efficient data dissemination despite network variability.
+
+The wireless mesh network also inherently introduces asynchronous communication characteristics, including variable delays, packet loss, and temporary disconnections. To tolerate these uncertainties, the protocol assumes eventual delivery for honest nodes. As long as a quorum of two-thirds weighted signatures reached for a transfer order, the system can make progress without requiring synchronized connectivity. This quorum-based mechanism forms the backbone of trust in the network, enabling payment finalization even when the Internet is intermittently unavailable.
+
+\subsection{Weighted Voting}
+\label{sec:weighted-voting}
+We adopt a performance-based weighted voting scheme where each authority's raw weight is derived from its recent validation performance, e.g. 
+\[
+  w_i = \max\big(\textsf{tx}_i,\,0\big),
+\]
+with \(\textsf{tx}_i\) the authority's transfer-success counter. To ensure off-chain certificates are verifiable under asynchronous mesh conditions, all weight vectors are published on-chain. We introduce a base parameter $\epsilon > 0$ (representing a minimum stake). Formally, for epoch \(e\) the contract holds 
+\[
+\mathbf{w}^e=(w_1^e,\dots,w_n^e)
+\]
+and normalized voting powers
+\[
+  \hat{w}_i^e = \frac{w_i^e + \epsilon}{\sum_{j \in C} (w_j^e + \epsilon)}, \quad \text{such that} \quad \sum_{i \in C} \hat{w}_i^e = 1.
+\]
+and any change to weights becomes effective only at a deterministic activation point (epoch boundary). Authorities include the epoch identifier \(e\) and their epoch weight \(\hat w_i^e\) inside each signature over a transfer order, and clients only aggregate signatures that reference the same epoch. A set of authorities \(S\) is said to reach quorum for epoch \(e\) if
+\[
+  \sum_{i\in S} \hat w_i^e \; \ge \; q^e .
+\]
+Authorities include the epoch identifier \(e\) and their epoch weight \(\hat w_i^e\) inside each signature over a transfer order. Clients accumulate weighted responses from authorities that reference the same epoch \(e\) and detect quorum reach \( q^e\) at which point the transaction can be said to be finalized.
+
+At the end of each epoch, authorities may request an on-chain voting power update by submitting a transaction that carries the proposed raw scores (performance counters \(\textsf{tx\_count}_i\)) together with a signed attestation set from authorities; the smart contract validates the attestation signatures and records the proposed vector \(\mathbf{w}^{\mathrm{next}}\). The contract does not apply \(\mathbf{w}^{\mathrm{next}}\) immediately: instead it schedules the vector to become active at a deterministic activation block or timestamp (the next epoch boundary), and until that activation point the contract continues to expose the current snapshot \(\mathbf{w}^e\).
+
+\section{Methodology}
+\label{sec:methodology}
+
+\subsection{Depositing Funds}
+\label{para:deposit}
+As illustrated in Figure \ref{fig:overall}, User wants to use MeshPay and become authorities can initiate a deposit by invoking the on chain smart contract on the main blockchain. This transaction is called a funding transaction, and includes the recipient address for the funds and the amount of value to transfer. The contract locks the specified amount and returns a signed deposit receipt that binds the value to the user’s public key and the current mesh-committee epoch. The User forwards this receipt to a nearby authority, which verifies the on chain signature and records the corresponding balance in the local mesh ledger. Once at least a quorum of Authorities attest to the receipt, the funds become immediately spendable inside the offline mesh, guaranteeing that every token circulating off chain is fully collateralized on the main chain smart contract.
+
+\begin{figure}[ht]
+    \centering
+    \includegraphics[width=0.86\linewidth]{images/Architecture-Overall Architecture.pdf}
+    \caption{Transfer of funds between Blockchain and Protocol}
+    \label{fig:overall}
+\end{figure}
+
+\subsection{Transferring Funds}
+\label{para:transfer}
+Figure \ref{fig:transferring} depicts an offline payment between two Users. The Sender creates a transfer order $O$, sign and broadcasts it to the neighbor nodes. The Sender also stores the transfer order $O$ to the $Pending_{sender}$ list. The sender periodically broadcasts the orders to all other neighbor nodes if there is still pending orders inside $Pending_{sender}$. When Authority receives the order, it independently checks (i) the signature is valid, (ii) no previous transfer is pending, (iii) the amount is positive, (iv) the sequence number matches the expected next one, and (iv) the balance is sufficient. And if valid, authorities adds its weighted signature to the order, mark it as pending order, send back a signed transfer order. The algorithm to handle transfer order is presented in Algorithm \ref{alg:authority-transfer}. 
+
+\begin{figure}[ht]
+    \centering
+    \includegraphics[width=0.86\linewidth]{images/Architecture.pdf}
+    \caption{Transfer of funds between Users}
+    \label{fig:transferring}
+\end{figure}
+
+After collecting greater or equal two-thirds weighted signatures from Authorities, the Sender can form a transfer certificate. With the certificate, the Sender can forward it to the Receiver as proof of payment. To conclude the order, the Sender or Recipient broadcast the transfer certificate (called confirmation order) to all authorities. Upon reception of a confirmation order for the current sequence number, each authority (i) checks that a quorum of signatures was reached, (ii) decreases the balance of the sender, (iii) increments the sequence number to ensure ‘deliver once’ semantics, and (iv) sets the pending order to None. Each authority also (v) adds the certificate to the list confirmed, (vi) increases the balance of the recipient account asynchronously and finally (vii) adds one to the performance counters tx\_count. The authority algorithm to handle confirmation orders is presented in Algorithm \ref{alg:authority-confirmation}. 
+
+
+
+\begin{algorithm}[htbp]
+\caption{Authority: Handle Transfer Order}
+\label{alg:authority-transfer}
+\scriptsize
+\begin{algorithmic}[1]
+\Function{handle\_transfer\_order}{$\alpha, O$}
+  \State \textbf{ensure} $O.\textsf{has\_valid\_signature}()$
+  \State $account \gets \textsf{Ledger}[O.\textsf{sender}]$
+  \If{$account$ is None}
+    \State \Return \textsf{REJECT}(``acct-not-found'')
+  \EndIf
+  \State $p \gets \textsf{Pending}[O.\textsf{sender},\ \textsf{next}_u]$
+  \If{$p$ exists}
+    \If{$p.\textsf{transfer} == O$}
+      \State \Return \textsf{ACCEPT}
+    \Else
+      \State \Return \textsf{REJECT}(``conflict'')
+    \EndIf
+  \EndIf
+  \State \textbf{ensure} $\textsf{next}_u == O.\textsf{sequence}$
+  \State \textbf{ensure} $account.\textsf{balance} \ge O.\textsf{amount}$
+  \State \textbf{ensure} $O.\textsf{amount} > 0$
+  \State $\sigma_\alpha \gets \textsf{Sign}(sk_\alpha, O)$
+  \State $\textsf{Pending}[O.\textsf{sender}, O.\textsf{sequence}] \gets (O,\ \sigma_\alpha)$
+  \State \Return \textsf{ACCEPT}$(O,\ \sigma_\alpha)$
+\EndFunction
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[htbp]
+\caption{Authority: Handle Confirmation Order}
+\label{alg:authority-confirmation}
+\scriptsize
+\begin{algorithmic}[1]
+\Function{handle\_confirmation\_order}{$\alpha, C$}
+  \State \textbf{ensure} $C.\textsf{is\_valid}(\mathcal{C}, q)$
+  \State $O \gets \textsf{value}(C)$
+  \State $sender\_account \gets \textsf{Ledger}[O.\textsf{sender}]$
+  \If{$sender\_account$ is None}
+    \State $sender\_account \gets (\textsf{bal}=0,\ \textsf{next}=0)$
+  \EndIf
+  \If{$sender\_account.\textsf{next} > O.\textsf{sequence}$}
+    \State \Return \textsf{ACCEPT}(``already-confirmed'')
+  \EndIf
+  \State \textbf{ensure} $sender\_account.\textsf{next} == O.\textsf{sequence}$
+  \State \textbf{ensure} $sender\_account.\textsf{bal} \ge O.\textsf{amount}$
+  \State $sender\_account.\textsf{bal} \gets sender\_acct.\textsf{bal} - O.\textsf{amount}$
+  \State $sender\_account.\textsf{next} \gets sender\_acct.\textsf{next} + 1$
+  \State $\textsf{Pending}[O.\textsf{sender}, O.\textsf{sequence}] \gets \textsf{None}$
+  \State $\textsf{WCerts}[O.\textsf{sender}, O.\textsf{sequence}] \gets C$
+  \State $recipient\_account \gets \textsf{Ledger}[O.\textsf{recipient}]$
+  \If{$recipient\_account$ is None}
+    \State $recipient\_account \gets (\textsf{bal}=0,\ \textsf{next}=0)$
+  \EndIf
+  \State $recipient\_account.\textsf{bal} \gets recipient\_account.\textsf{bal} + O.\textsf{amount}$
+  \State $\textsf{tx\_count} \gets \textsf{tx\_count} + 1$
+  \State \Return \textsf{ACCEPT}(``confirmed'')
+\EndFunction
+\end{algorithmic}
+\end{algorithm}
+
+
+
+
+\subsection{Withdraw Funds}
+\label{para:withdraw}
+When Internet connectivity resumes, any authorities can aggregate their off-chain ledger view and submit a quorum-certified update to the smart contract. The contract verifies the weighted committee signatures and updates its state, ensuring that every off-chain balance remains 1:1 backed by locked funds on the primary chain.
+
+As illustrated in Figure \ref{fig:overall}, an user withdraws by issuing a direct on-chain request to the contract, specifying a destination and amount. The contract checks admissibility against its reconciled state: \(0 \le \textit{amount} \le \textsf{Locked}[u] - \textsf{Redeemed}[u]\), updates the redeem log to prevent double-withdrawals, and transfers the requested value to the user’s address. 
+
+Post-withdrawal, authorities continuously fetch the smart contract to update per-account state and detect divergence. In detail, each authority periodically fetches the on-chain balance and the authoritative per-account sequence counter \(seq_{\mathrm{chain}}[u]\) and cross-checks it against its local next-sequence \(seq_{\mathrm{off}}[u]\). Authorities enforce \(bal_{\mathrm{off}}[u] = bal_{\mathrm{chain}}[u]\) and that the locally available balance matches the on-chain collateral. 
+
+\section{Security Discussion}
+\label{sec:security}
+We analyze the security of MeshPay against three primary attack vectors: double-spending, Sybil attacks, and authority collusion.
+
+\textbf{Double-Spending Prevention.} The system prevents double-spending through a combination of strictly monotonically increasing sequence numbers and Byzantine Fault Tolerant quorums. A user must include a sequence counter \(seq\) in every transfer order. Honest authorities only sign an order if \(seq = seq_{expected}\) and the account balance is sufficient. Since a valid certificate requires a weighted quorum \(q > 2/3\) of the total voting power, and two quorums must intersect by at least one honest authority (assuming \(f < 1/3\)), it is mathematically impossible to generate two valid certificates for the same sequence counter \cite{castro1999practical}.
+
+\textbf{Sybil Resistance.} In a permissionless decentralized network, an adversary might attempt to flood the authority set with fake identities (Sybil attack) to gain control of the consensus. MeshPay mitigates this via the on-chain smart contract, which requires a financial stake (locked tokens) for authority registration. This makes Sybil attacks  expensive, as the adversary must lock significant tokens proportional to the number of fake nodes they want to create, imposing a verifiable resource cost on authority registration \cite{douceur2002sybil}.
+
+\textbf{Collusion and Dynamic Weights.} While a subset of authorities could attempt to collude to censor transactions, MeshPay mitigates this via a dynamic reputation mechanism analogous to the EigenTrust algorithm\cite{kamvar2003eigentrust}. By strictly coupling voting power to verifiable participation (normalized \(\textsf{tx\_count}\)), the protocol forces a strategic trade-off: to maintain consensus influence, an authority must actively validate transactions. If an authority does not particpate actively, their accumulated performance metrics effectively decay relative to honest, active nodes. Consequently, the protocol mathematically marginalizes non-cooperative peers over successive epochs, ensuring that voting dominance shifts toward authorities who contribute to network liveness.

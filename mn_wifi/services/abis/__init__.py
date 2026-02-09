@@ -15,7 +15,7 @@ def _get_abi_dir() -> Path:
     try:
         abi_dir = current_file.resolve().parent
         if abi_dir.exists() and abi_dir.is_dir():
-            return abi_dir/"mn_wifi"/"services"/"abis"
+            return abi_dir
     except (OSError, RuntimeError):
         pass
     
@@ -23,7 +23,7 @@ def _get_abi_dir() -> Path:
     try:
         abi_dir = Path(__file__).parent
         if abi_dir.exists() and abi_dir.is_dir():
-            return abi_dir/"mn_wifi"/"services"/"abis"
+            return abi_dir
     except (OSError, RuntimeError):
         pass
     
@@ -31,7 +31,7 @@ def _get_abi_dir() -> Path:
     try:
         abi_dir = Path(os.path.dirname(os.path.abspath(__file__)))
         if abi_dir.exists() and abi_dir.is_dir():
-            return abi_dir/"mn_wifi"/"services"/"abis"
+            return abi_dir
     except (OSError, RuntimeError):
         pass
     

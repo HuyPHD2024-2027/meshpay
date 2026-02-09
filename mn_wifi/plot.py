@@ -7,7 +7,11 @@ import warnings
 import numpy as np
 import matplotlib.patches as patches
 import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
+try:
+    from mpl_toolkits.mplot3d import Axes3D
+except (ImportError, AttributeError):
+    Axes3D = None
+
 from mininet.log import debug
 
 
@@ -22,7 +26,8 @@ class Plot3D (object):
         plt.ion()
         plt.figure(1)
         plt.title("Mininet-WiFi Graph")
-        Plot3D.ax = plt.subplot(111, projection=Axes3D.name)
+        projection = Axes3D.name if Axes3D else '3d'
+        Plot3D.ax = plt.subplot(111, projection=projection)
         self.ax.set_xlabel('meters (x)')
         self.ax.set_ylabel('meters (y)')
         self.ax.set_zlabel('meters (z)')
@@ -136,7 +141,7 @@ class Plot2D (object):
         for node in nodes:
             x, y, z = node.getxyz()
             self.instantiate_attrs(node)
-            node.plt_node.set_data(x, y)
+            node.plt_node.set_data([x], [y])
             node.set_text_pos(x, y)
             node.circle.center = x, y
             self.create_line(links)
@@ -263,4 +268,3 @@ class PlotGraph(object):
             plt.pause(0.001)
         except:
             pass
-
