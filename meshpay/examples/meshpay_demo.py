@@ -51,17 +51,20 @@ from mn_wifi.link import wmediumd, mesh
 from mn_wifi.wmediumdConnector import interference
 from mn_wifi.net import Mininet_wifi
 from meshpay.nodes.authority import WiFiAuthority
-from meshpay.nodes.client import Client
+from meshpay.nodes.client1 import Client
 from meshpay.cli_fastpay import MeshPayCLI
 from meshpay.transport import TransportKind
 from meshpay.types import KeyPair, AccountOffchainState, SignedTransferOrder
 from meshpay.api.bridge import Bridge
 from meshpay.api.gateway import Gateway
+from meshpay.controller import QoSManager, LinkStatsCollector, FallbackProfile
 from mn_wifi.examples.demoCommon import (
     open_xterms as _open_xterms,
     close_xterms as _close_xterms,
     parse_mesh_internet_args,
 )
+
+
 def create_mesh_network_with_internet(
     num_authorities: int = 5,
     num_clients: int = 3,
@@ -149,8 +152,18 @@ def create_mesh_network_with_internet(
     info("*** Configuring IEEE 802.11s mesh\n")
     
     # Set propagation model for realistic mesh behavior
-    net.setPropagationModel(model="logDistance", exp=3.5)
     
+    # Takes the logDistance model and adds a "shadowing" factor—a random variable 
+    # that represents signal fluctuations caused by obstacles. This means that two nodes 
+    # at the exact same distance might have different signal strengths, 
+    # which is how real physics works.
+    # net.setPropagationModel(model="logNormalShadowing", exp=3.5, sL=6.0)
+
+    # From 3.5 to 5.0 or 5.5. This causes the signal to drop significantly faster. 
+    # A node just 1 meter outside the range will suddenly have such a weak signal 
+    # that packets will drop 100%
+    net.setPropagationModel(model="logDistance", exp=5.0)
+
     # Configure nodes
     net.configureNodes()
     
@@ -179,7 +192,7 @@ def create_mesh_network_with_internet(
         net.setMobilityModel(
             time=0,
             model='GaussMarkov',
-            velocity_mean=5,
+            velocity_mean=1,
             alpha=0.5,
             variance=0.1,
             seed=42
@@ -204,6 +217,11 @@ def setup_test_accounts(authorities: List[WiFiAuthority], clients: List[Client])
     """
 
     info("*** Setting up test accounts\n")
+    
+    # Initialize committee for each client so they know which authorities to talk to
+    for client in clients:
+        client.state.committee = authorities
+        info(f"   ✅ {client.name}: Committee configured ({len(authorities)} members)\n")
 
     from mn_wifi.services.core.config import SUPPORTED_TOKENS
     from mn_wifi.services.blockchain_client import TokenBalance
@@ -296,6 +314,9 @@ def main() -> None:
     
     net = None
     bridge = None
+    qos_mgr = None
+    link_stats = None
+    fallback = None
     try:
         # Create enhanced mesh network with internet gateway
         net, authorities, clients, gateway, bridge = create_mesh_network_with_internet(
@@ -340,6 +361,23 @@ def main() -> None:
         # Wait for mesh to stabilize
         info("*** Waiting for mesh network to stabilize\n")
         time.sleep(5)
+
+        # Flash-Mesh D-SDN controller (optional)
+        if args.flashmesh:
+            info("*** Enabling Flash-Mesh D-SDN controller\n")
+            qos_mgr = QoSManager()
+            all_nodes = list(authorities) + list(clients)
+            for node in all_nodes:
+                qos_mgr.install_priority(node)
+            info(f"   ✅ QoS installed on {len(all_nodes)} nodes\n")
+
+            link_stats = LinkStatsCollector(all_nodes, interval_ms=500)
+            link_stats.start()
+            info("   ✅ Link stats collector started (500ms interval)\n")
+
+            fallback = FallbackProfile()
+            fallback.set_managed_nodes(all_nodes)
+            info("   ✅ Fallback profile configured\n")
         
         # Open xterms if requested
         if args.logs:
@@ -347,7 +385,10 @@ def main() -> None:
         
         # Start interactive CLI using standard FastPay CLI
         info("*** Starting Enhanced FastPay CLI\n")
-        cli = MeshPayCLI(net, authorities, clients, gateway)
+        cli = MeshPayCLI(
+            net, authorities, clients, gateway,
+            link_stats=link_stats, qos_mgr=qos_mgr,
+        )
         print("\n" + "=" * 70)
         print("🕸️  Enhanced FastPay IEEE 802.11s Mesh Network Ready!")
         if args.internet:
@@ -373,6 +414,8 @@ def main() -> None:
         import traceback
         traceback.print_exc()
     finally:
+        if link_stats:
+            link_stats.stop()
         if bridge:
             bridge.stop_bridge_server()
         if net is not None:

@@ -1,7 +1,14 @@
 import time
 import queue
 import subprocess
-from typing import Optional
+from typing import Optional, Any
+
+from meshpay.logger.utils import (
+    format_message,
+    format_transfer_message,
+    format_network_message,
+    format_balance_info,
+)
 
 class AuthorityLogger:
     """Logger for authority message processing with terminal output."""
@@ -108,9 +115,10 @@ class AuthorityLogger:
         """Log a warning message."""
         self.log(f"⚠️  WARNING: {message}")
     
-    def debug(self, message: str) -> None:
-        """Log a debug message."""
-        self.log(f"🐛 DEBUG: {message}")
+    def debug(self, message: Any) -> None:
+        """Log a debug message with intelligent formatting."""
+        formatted = format_message(message, max_length=150)
+        self.log(f"🐛 DEBUG: {formatted}")
     
     def success(self, message: str) -> None:
         """Log a success message."""

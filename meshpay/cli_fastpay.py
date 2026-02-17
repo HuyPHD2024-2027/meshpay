@@ -29,9 +29,11 @@ MeshPay-specific commands.
 
 from dataclasses import asdict
 import json
+import os
 import sys
 import time
 import uuid
+from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
 from meshpay.types import (
@@ -63,6 +65,8 @@ class MeshPayCLI(CLI):  # pylint: disable=too-many-instance-attributes
         clients: List[Client],
         gateway: Optional[Node_wifi] = None,
         *,
+        link_stats=None,
+        qos_mgr=None,
         quorum_ratio: float = 2 / 3,
         stdin=sys.stdin,
         script=None,
@@ -99,6 +103,10 @@ class MeshPayCLI(CLI):  # pylint: disable=too-many-instance-attributes
             if hasattr(client.transport, "connect"):
                 client.transport.connect()  # type: ignore[attr-defined]
 
+        # Flash-Mesh D-SDN controller references (optional)
+        self._link_stats = link_stats
+        self._qos_mgr = qos_mgr
+
         super().__init__(mn_wifi, stdin=stdin, script=script, cmd=cmd)
 
     def _find_node(self, name: str) -> Optional[Station]:
@@ -111,56 +119,84 @@ class MeshPayCLI(CLI):  # pylint: disable=too-many-instance-attributes
 
     # 1. Improved Balance Display -----------------------------------------
     def do_balance(self, line: str) -> None:
-        """Print user balance in a formatted table."""
+        """Print user balance in a formatted table.
+
+        Usage: balance <user>
+        """
         args = line.split()
         if len(args) != 1:
             print("Usage: balance <user>")
             return
-            
-        user = args[0]
-        print(f"\nListing balances for: {user}")
-        print(f"{'Token':<6} | {'MeshPay Bal':<12} | {'Total':<12}")
-        print("-" * 50)
 
+        user = args[0]
+
+        # Collect balances from the first authority that holds this account
+        account = None
+        source_auth = None
         for auth in self.authorities:
             if hasattr(auth, "state") and hasattr(auth.state, "accounts"):
-                account = auth.state.accounts.get(user)
-                if account:
-                    for addr, bal in account.balances.items():
-                        # Format: auth | symbol | mesh_balance | total_balance
-                        print(f"{bal.token_symbol:<6} | {bal.meshpay_balance:<12.3f} | {bal.total_balance:<12.3f}")
-                else:
-                    print(f"(No account found)")
-        print("")
+                acct = auth.state.accounts.get(user)
+                if acct:
+                    account = acct
+                    source_auth = auth.name
+                    break
+
+        if account is None:
+            print(f"\n  ⚠️  No account found for '{user}' on any authority")
+            return
+
+        print(f"\n╔══════════════════════════════════════════════════════╗")
+        print(f"║  💰 Balances for {user:<37}║")
+        print(f"╠══════════════════════════════════════════════════════╣")
+        print(f"║  Source: {source_auth:<43}║")
+        print(f"║  Seq#:   {account.sequence_number:<43}║")
+        print(f"╠════════╦═══════════════╦═══════════════╦═════════════╣")
+        print(f"║ Token  ║  MeshPay Bal  ║  Wallet Bal   ║  Total Bal  ║")
+        print(f"╠════════╬═══════════════╬═══════════════╬═════════════╣")
+        for _addr, bal in account.balances.items():
+            sym = getattr(bal, 'token_symbol', '???')
+            mp = getattr(bal, 'meshpay_balance', 0.0)
+            wb = getattr(bal, 'wallet_balance', 0.0)
+            tb = getattr(bal, 'total_balance', 0.0)
+            print(f"║ {sym:<6} ║ {mp:>11.3f}   ║ {wb:>11.3f}   ║ {tb:>9.3f}   ║")
+        print(f"╚════════╩═══════════════╩═══════════════╩═════════════╝")
+        print()
 
     # 2. ------------------------------------------------------------------
     def do_balances(self, line: str) -> None:
         """Show balances for all clients from all authorities.
-        
+
         Usage: balances
         """
-        print("\n" + "=" * 60)
-        print("ACCOUNT BALANCES")
-        print("=" * 60)
-        
+        print(f"\n╔══════════════════════════════════════════════════════════════════╗")
+        print(f"║                     💰 ALL USER BALANCES                        ║")
+        print(f"╚══════════════════════════════════════════════════════════════════╝")
+
         for client in self.clients:
-            print(f"\n{client.name}:")
-            
+            # Use first authority that has the account
+            account = None
+            source = None
             for auth in self.authorities:
                 if hasattr(auth, "state") and hasattr(auth.state, "accounts"):
-                    account = auth.state.accounts.get(client.name)
-                    if account:
-                        # Show summary of balances per token
-                        balance_info = []
-                        for token_addr, token_bal in account.balances.items():
-                            if hasattr(token_bal, 'token_symbol') and hasattr(token_bal, 'meshpay_balance'):
-                                balance_info.append(f"{token_bal.token_symbol}={token_bal.meshpay_balance:.2f}")
-                        balance_str = ", ".join(balance_info) if balance_info else "N/A"
-                        print(f"  {auth.name}: {balance_str}, seq={account.sequence_number}")
-                    else:
-                        print(f"  {auth.name}: Not registered")
-                else:
-                    print(f"  {auth.name}: No state")
+                    acct = auth.state.accounts.get(client.name)
+                    if acct:
+                        account = acct
+                        source = auth.name
+                        break
+
+            print(f"\n  👤 {client.name}  (from {source or 'N/A'}, seq={account.sequence_number if account else '?'})")
+            if account is None:
+                print(f"     ⚠️  Not registered on any authority")
+                continue
+
+            print(f"     {'Token':<6}  {'MeshPay':>10}  {'Wallet':>10}  {'Total':>10}")
+            print(f"     {'─'*6}  {'─'*10}  {'─'*10}  {'─'*10}")
+            for _addr, bal in account.balances.items():
+                sym = getattr(bal, 'token_symbol', '???')
+                mp = getattr(bal, 'meshpay_balance', 0.0)
+                wb = getattr(bal, 'wallet_balance', 0.0)
+                tb = getattr(bal, 'total_balance', 0.0)
+                print(f"     {sym:<6}  {mp:>10.3f}  {wb:>10.3f}  {tb:>10.3f}")
 
     # 3. ------------------------------------------------------------------
     def do_sync(self, line: str) -> None:
@@ -369,18 +405,36 @@ class MeshPayCLI(CLI):  # pylint: disable=too-many-instance-attributes
 
     # 7. ------------------------------------------------------------------
     def do_infor(self, line: str) -> None:
-        """Show formatted station information and committee status."""
+        """Show formatted station information.
+
+        Displays different information depending on the node role:
+        - Authority: full AuthorityState (accounts, committee, shards, stake …)
+        - User/Client: full ClientState  (balance, certs, pending, committee …)
+
+        Usage: infor <station|all|authorities|users>
+        """
         args = line.split()
         if len(args) != 1:
-            print("Usage: infor <station|all>")
+            print("Usage: infor <station|all|authorities|users>")
             return
-            
+
         station_name = args[0]
 
-        if station_name.lower() in {"all", "authorities", "*"}:
+        if station_name.lower() in {"all", "*"}:
             for auth in self.authorities:
-                print(f"\n{'='*10} {auth.name} {'='*10}")
                 self.do_infor(auth.name)
+            for client in self.clients:
+                self.do_infor(client.name)
+            return
+
+        if station_name.lower() == "authorities":
+            for auth in self.authorities:
+                self.do_infor(auth.name)
+            return
+
+        if station_name.lower() in {"users", "clients"}:
+            for client in self.clients:
+                self.do_infor(client.name)
             return
 
         node = self._find_node(station_name)
@@ -393,39 +447,276 @@ class MeshPayCLI(CLI):  # pylint: disable=too-many-instance-attributes
             return
 
         state = node.state
-        
-        # --- Header Section ---
-        print(f"\nInformation for: {station_name}")
-        print(f"{'Field':<20} | {'Value'}")
-        print("-" * 50)
-        
-        # Displaying basic attributes from ClientState
-        # Using getattr to safely handle different node types (Client vs Authority)
-        addr = getattr(state, 'address', 'N/A')
-        print(f"{'Node ID':<20} | {getattr(addr, 'node_id', station_name)}")
-        print(f"{'IP Address':<20} | {getattr(addr, 'ip_address', 'N/A')}:{getattr(addr, 'port', 'N/A')}")
-        print(f"{'Sequence Number':<20} | {getattr(state, 'sequence_number', 'N/A')}")
-        print(f"{'Balance':<20} | {getattr(state, 'balance', 0)}")
-        print(f"{'Stake':<20} | {getattr(state, 'stake', 0)}")
-        
-        # --- Committee Section ---
-        committee = getattr(state, 'committee', [])
-        if committee:
-            print(f"\nCommittee Authorities ({len(committee)}):")
-            for auth in committee:
-                # Extracts "auth1" and "10.0.0.11" from the WiFiAuthority string
-                print(f"  • {auth}")
+        addr = getattr(state, 'address', None)
+        is_authority = hasattr(state, 'accounts')  # AuthorityState has accounts dict
 
-        # --- Certificate/Transfer Status ---
+        W = 62  # inner width between ║ characters
+
+        def row(text: str) -> None:
+            print(f"║  {text:<{W-2}}║")
+
+        def sep() -> None:
+            print(f"╠{'═' * W}╣")
+
+        role_icon = "🏛️" if is_authority else "👤"
+        role_label = "AUTHORITY" if is_authority else "USER"
+
+        print(f"\n╔{'═' * W}╗")
+        row(f"{role_icon}  {station_name:<10}  [{role_label}]")
+        sep()
+
+        # --- Common network info ---
+        node_id = getattr(addr, 'node_id', station_name) if addr else station_name
+        ip_str = f"{getattr(addr, 'ip_address', '?')}:{getattr(addr, 'port', '?')}" if addr else 'N/A'
+        running = "🟢 Running" if getattr(node, '_running', False) else "⚪ Stopped"
+
+        row(f"Node ID:       {node_id}")
+        row(f"IP Address:    {ip_str}")
+        row(f"Status:        {running}")
+
+        if is_authority:
+            self._print_authority_state(state, row, sep)
+        else:
+            self._print_client_state(state, station_name, row, sep)
+
+        print(f"╚{'═' * W}╝")
+        print()
+
+    # ── Authority state helper ─────────────────────────────────────────
+    def _print_authority_state(self, state, row, sep) -> None:
+        """Display all AuthorityState fields."""
+        sep()
+        row("📋 AUTHORITY STATE")
+        sep()
+
+        # Stake & Balance
+        row(f"Stake:         {getattr(state, 'stake', 0)}")
+        row(f"Balance:       {getattr(state, 'balance', 0)}")
+
+        # Signature
+        sig = getattr(state, 'authority_signature', None)
+        sig_str = sig[:16] + '…' if sig and len(sig) > 16 else (sig or 'None')
+        row(f"Signature:     {sig_str}")
+
+        # Last sync time
+        sync_t = getattr(state, 'last_sync_time', 0)
+        sync_str = datetime.fromtimestamp(sync_t).strftime('%Y-%m-%d %H:%M:%S') if sync_t else 'N/A'
+        row(f"Last Sync:     {sync_str}")
+
+        # Shard assignments
+        shards = getattr(state, 'shard_assignments', set())
+        row(f"Shards:        {len(shards)} assigned")
+        if shards:
+            for s in sorted(shards):
+                s_short = s[:20] + '…' if len(s) > 20 else s
+                row(f"  └─ {s_short}")
+
+        # Committee members
+        committee = getattr(state, 'committee_members', set())
+        row(f"Committee:     {len(committee)} peers")
+        if committee:
+            for m in sorted(committee):
+                row(f"  └─ {m}")
+
+        sep()
+
+        # ── Accounts ──
+        accounts = getattr(state, 'accounts', {})
+        row(f"📂 Held User Accounts: {len(accounts)}")
+        sep()
+
+        if not accounts:
+            row("(no accounts registered)")
+        else:
+            for acct_name, acct in accounts.items():
+                seq = getattr(acct, 'sequence_number', 0)
+                last_upd = getattr(acct, 'last_update', 0)
+                upd_str = datetime.fromtimestamp(last_upd).strftime('%H:%M:%S') if last_upd else 'N/A'
+
+                row("")
+                row(f"👤 {acct_name}  (seq={seq}, updated={upd_str})")
+                row(f"   {'Token':<6}  {'MeshPay':>10}  {'Wallet':>10}  {'Total':>10}")
+                row(f"   {'─'*6}  {'─'*10}  {'─'*10}  {'─'*10}")
+                for _tok_addr, bal in acct.balances.items():
+                    sym = getattr(bal, 'token_symbol', '???')
+                    mp = getattr(bal, 'meshpay_balance', 0.0)
+                    wb = getattr(bal, 'wallet_balance', 0.0)
+                    tb = getattr(bal, 'total_balance', 0.0)
+                    row(f"   {sym:<6}  {mp:>10.3f}  {wb:>10.3f}  {tb:>10.3f}")
+
+                # ── Pending confirmation ──
+                pending = getattr(acct, 'pending_confirmation', None)
+                if pending:
+                    txo = getattr(pending, 'transfer_order', None)
+                    if txo:
+                        oid = str(getattr(pending, 'order_id', '?'))[:8]
+                        frm = getattr(txo, 'sender', '?')
+                        to = getattr(txo, 'recipient', '?')
+                        amt = getattr(txo, 'amount', 0)
+                        tok = self._resolve_token_symbol(getattr(txo, 'token_address', ''))
+                        sigs = len(getattr(pending, 'authority_signature', {}))
+                        row(f"   ⏳ Pending: [{oid}] {frm}→{to} {amt} {tok} ({sigs} sigs)")
+                    else:
+                        row(f"   ⏳ Pending: (malformed)")
+                else:
+                    row(f"   ⏳ Pending: None")
+
+                # ── Confirmed transfers ──
+                confirmed = getattr(acct, 'confirmed_transfers', {})
+                row(f"   ✅ Confirmed: {len(confirmed)} transfers")
+                for cid, conf in confirmed.items():
+                    txo = getattr(conf, 'transfer_order', None)
+                    if txo:
+                        oid = str(getattr(conf, 'order_id', '?'))[:8]
+                        frm = getattr(txo, 'sender', '?')
+                        to = getattr(txo, 'recipient', '?')
+                        amt = getattr(txo, 'amount', 0)
+                        tok = self._resolve_token_symbol(getattr(txo, 'token_address', ''))
+                        status = getattr(conf, 'status', '?')
+                        if hasattr(status, 'value'):
+                            status = status.value
+                        ts = getattr(conf, 'timestamp', 0)
+                        ts_str = datetime.fromtimestamp(ts).strftime('%H:%M:%S') if ts else '?'
+                        nsigs = len(getattr(conf, 'authority_signatures', []))
+                        row(f"      [{oid}] {frm}→{to} {amt} {tok}")
+                        row(f"              status={status} sigs={nsigs} at {ts_str}")
+
+        # Totals
+        total_confirmed = sum(
+            len(getattr(acct, 'confirmed_transfers', {})) for acct in accounts.values()
+        )
+        row("")
+        row(f"📊 Total confirmed transfers: {total_confirmed}")
+
+    # ── Client state helper ────────────────────────────────────────────
+    def _print_client_state(self, state, station_name: str, row, sep) -> None:
+        """Display all ClientState fields."""
+        sep()
+        row("📋 CLIENT STATE")
+        sep()
+
+        # Core fields
+        row(f"Seq#:          {getattr(state, 'sequence_number', 0)}")
+        row(f"Balance:       {getattr(state, 'balance', 0)}")
+        row(f"Stake:         {getattr(state, 'stake', 0)}")
+
+        # Secret (masked)
+        secret = getattr(state, 'secret', None)
+        if secret:
+            key = getattr(secret, 'private_key', '')
+            sec_str = key[:8] + '…' if key and len(key) > 8 else (key or 'N/A')
+        else:
+            sec_str = 'N/A'
+        row(f"Secret:        {sec_str}")
+
+        sep()
+
+        # ── Balances from authority ──
+        account = None
+        source_auth = None
+        for auth in self.authorities:
+            if hasattr(auth, "state") and hasattr(auth.state, "accounts"):
+                acct = auth.state.accounts.get(station_name)
+                if acct:
+                    account = acct
+                    source_auth = auth.name
+                    break
+
+        if account is None:
+            row("⚠️  No balance data on any authority")
+        else:
+            row(f"💰 Balances (source: {source_auth})")
+            row(f"   {'Token':<6}  {'MeshPay':>10}  {'Wallet':>10}  {'Total':>10}")
+            row(f"   {'─'*6}  {'─'*10}  {'─'*10}  {'─'*10}")
+            for _tok_addr, bal in account.balances.items():
+                sym = getattr(bal, 'token_symbol', '???')
+                mp = getattr(bal, 'meshpay_balance', 0.0)
+                wb = getattr(bal, 'wallet_balance', 0.0)
+                tb = getattr(bal, 'total_balance', 0.0)
+                row(f"   {sym:<6}  {mp:>10.3f}  {wb:>10.3f}  {tb:>10.3f}")
+
+        sep()
+
+        # ── Committee / connectivity ──
+        committee = getattr(state, 'committee', [])
+        row(f"🌐 Committee: {len(committee)} authorities")
+        for auth_state in committee:
+            a_name = getattr(auth_state, 'name', '?')
+            a_addr = getattr(auth_state, 'address', None)
+            a_ip = f"{getattr(a_addr, 'ip_address', '?')}:{getattr(a_addr, 'port', '?')}" if a_addr else 'N/A'
+            row(f"   └─ {a_name} ({a_ip})")
+
+        sep()
+
+        # ── Pending transfer (detailed) ──
+        row("📋 Transaction Status")
         pending = getattr(state, 'pending_transfer', None)
-        sent_certs = len(getattr(state, 'sent_certificates', []))
-        recv_certs = len(getattr(state, 'received_certificates', {}))
-        
-        print(f"\nTransaction Status:")
-        print(f"  Pending Transfer: {pending if pending else 'None'}")
-        print(f"  Sent Certs:       {sent_certs}")
-        print(f"  Received Certs:   {recv_certs}")
-        print("")
+        if pending:
+            oid = str(getattr(pending, 'order_id', '?'))[:8]
+            frm = getattr(pending, 'sender', '?')
+            to = getattr(pending, 'recipient', '?')
+            amt = getattr(pending, 'amount', 0)
+            tok = self._resolve_token_symbol(getattr(pending, 'token_address', ''))
+            seq = getattr(pending, 'sequence_number', '?')
+            ts = getattr(pending, 'timestamp', 0)
+            ts_str = datetime.fromtimestamp(ts).strftime('%H:%M:%S') if ts else '?'
+            row(f"   ⏳ Pending Transfer:")
+            row(f"      ID:     {oid}")
+            row(f"      From:   {frm}")
+            row(f"      To:     {to}")
+            row(f"      Amount: {amt} {tok}")
+            row(f"      Seq#:   {seq}   Time: {ts_str}")
+        else:
+            row(f"   ⏳ Pending Transfer: None")
+
+        sep()
+
+        # ── Sent certificates (detailed) ──
+        sent_certs = getattr(state, 'sent_certificates', [])
+        row(f"📤 Sent Certificates: {len(sent_certs)}")
+        for i, cert in enumerate(sent_certs):
+            txo = getattr(cert, 'transfer_order', None)
+            if txo:
+                oid = str(getattr(cert, 'order_id', '?'))[:8]
+                frm = getattr(txo, 'sender', '?')
+                to = getattr(txo, 'recipient', '?')
+                amt = getattr(txo, 'amount', 0)
+                tok = self._resolve_token_symbol(getattr(txo, 'token_address', ''))
+                nsigs = len(getattr(cert, 'authority_signature', {}))
+                ts = getattr(cert, 'timestamp', 0)
+                ts_str = datetime.fromtimestamp(ts).strftime('%H:%M:%S') if ts else '?'
+                row(f"   [{oid}] {frm}→{to} {amt} {tok} ({nsigs} sigs, {ts_str})")
+
+        sep()
+
+        # ── Received certificates (detailed) ──
+        recv_certs = getattr(state, 'received_certificates', {})
+        row(f"📨 Received Certificates: {len(recv_certs)}")
+        for (sender, seq_num), cert in recv_certs.items():
+            txo = getattr(cert, 'transfer_order', None)
+            if txo:
+                oid = str(getattr(cert, 'order_id', '?'))[:8]
+                frm = getattr(txo, 'sender', '?')
+                to = getattr(txo, 'recipient', '?')
+                amt = getattr(txo, 'amount', 0)
+                tok = self._resolve_token_symbol(getattr(txo, 'token_address', ''))
+                nsigs = len(getattr(cert, 'authority_signature', {}))
+                ts = getattr(cert, 'timestamp', 0)
+                ts_str = datetime.fromtimestamp(ts).strftime('%H:%M:%S') if ts else '?'
+                row(f"   [{oid}] {frm}→{to} {amt} {tok} ({nsigs} sigs, {ts_str})")
+
+    def _resolve_token_symbol(self, token_address: str) -> str:
+        """Resolve a token address to its symbol using SUPPORTED_TOKENS."""
+        try:
+            for symbol, info in SUPPORTED_TOKENS.items():
+                if info.get('address', '') == token_address:
+                    return symbol
+        except Exception:
+            pass
+        # Fallback: short address
+        if token_address:
+            return token_address[:10] + '…' if len(token_address) > 10 else token_address
+        return '???'
 
     # 8. ------------------------------------------------------------------
     def do_voting_power(self, line: str) -> None:
@@ -473,29 +764,43 @@ class MeshPayCLI(CLI):  # pylint: disable=too-many-instance-attributes
 
     # 9. ------------------------------------------------------------------
     def do_performance(self, line: str) -> None:  # noqa: D401 – imperative form
-        """Print *authority* performance metrics in JSON form.
+        """Print *authority* performance metrics.
 
-        Usage: performance <authority>
+        Usage: performance <authority|all>
         """
         args = line.split()
         if len(args) != 1:
-            print("Usage: performance <authority>")
+            print("Usage: performance <authority|all>")
             return
-            
-        authority = args[0]
 
-        # Locate authority --------------------------------------------------------
-        auth_node = next((a for a in self.authorities if a.name == authority), None)
+        target = args[0]
+
+        if target.lower() in {"all", "*"}:
+            for auth in self.authorities:
+                self.do_performance(auth.name)
+            return
+
+        auth_node = next((a for a in self.authorities if a.name == target), None)
         if auth_node is None:
-            print(f"❌ Unknown authority '{authority}' – try 'voting_power' to list names")
+            print(f"❌ Unknown authority '{target}' – try 'voting_power' to list names")
             return
 
         if not hasattr(auth_node, "get_performance_stats"):
-            print(f"⚠️  Authority '{authority}' does not expose performance metrics")
+            print(f"⚠️  Authority '{target}' does not expose performance metrics")
             return
 
         metrics = auth_node.get_performance_stats()  # type: ignore[attr-defined]
-        print(json.dumps(metrics, indent=2, default=str))
+
+        print(f"\n┌─────────────────────────────────────┐")
+        print(f"│  📊 Performance: {target:<19}│")
+        print(f"├─────────────────────┬───────────────┤")
+        print(f"│  Metric             │  Value        │")
+        print(f"├─────────────────────┼───────────────┤")
+        for key, value in metrics.items():
+            label = key.replace('_', ' ').title()
+            val_str = f"{value}"
+            print(f"│  {label:<19}│  {val_str:<13}│")
+        print(f"└─────────────────────┴───────────────┘")
 
     # 10. -----------------------------------------------------------------
     def do_broadcast_confirmation(self, line: str) -> None:
@@ -545,6 +850,150 @@ class MeshPayCLI(CLI):  # pylint: disable=too-many-instance-attributes
         except Exception as e:
             print(f"❌ Failed to update account balance: {e}")
 
+    # 12. -----------------------------------------------------------------
+    def do_log(self, line: str) -> None:
+        """Show log history for a specific node.
+
+        Usage: log <node> [lines]
+        Example: log auth1       (last 30 lines)
+                 log user2 50    (last 50 lines)
+        """
+        args = line.split()
+        if not args:
+            print("Usage: log <node> [lines]")
+            return
+
+        node_name = args[0]
+        num_lines = 30
+        if len(args) >= 2:
+            try:
+                num_lines = int(args[1])
+            except ValueError:
+                print("⚠️  Lines must be a number, using default 30")
+
+        node = self._find_node(node_name)
+        if node is None:
+            print(f"❌ Unknown node '{node_name}'")
+            return
+
+        # Determine log file path
+        if node_name.startswith('auth'):
+            log_path = f"/tmp/{node_name}_authority.log"
+        elif node_name.startswith('user'):
+            log_path = f"/tmp/{node_name}_client.log"
+        else:
+            log_path = f"/tmp/{node_name}.log"
+
+        if not os.path.exists(log_path):
+            print(f"⚠️  No log file found at {log_path}")
+            return
+
+        try:
+            with open(log_path, 'r') as f:
+                lines = f.readlines()
+        except IOError as e:
+            print(f"❌ Error reading log file: {e}")
+            return
+
+        total = len(lines)
+        shown = lines[-num_lines:] if total > num_lines else lines
+
+        print(f"\n╔══════════════════════════════════════════════════════════════╗")
+        print(f"║  📜 Log: {node_name:<15} ({total} total, showing last {len(shown)}){' ' * max(0, 18 - len(str(total)) - len(str(len(shown))))}║")
+        print(f"╠══════════════════════════════════════════════════════════════╣")
+        for entry in shown:
+            entry = entry.rstrip('\n')
+            # Truncate long lines for display
+            if len(entry) > 60:
+                entry = entry[:57] + '...'
+            print(f"║  {entry:<60}║")
+        print(f"╚══════════════════════════════════════════════════════════════╝")
+        print()
+
+    # 13. -----------------------------------------------------------------
+    def do_network_metrics(self, line: str) -> None:
+        """Display network metrics (latency, bandwidth, packet-loss, connectivity).
+
+        Usage: network_metrics <authority|all>
+        """
+        args = line.split()
+        if len(args) != 1:
+            print("Usage: network_metrics <authority|all>")
+            return
+
+        target = args[0]
+
+        if target.lower() in {"all", "*"}:
+            for auth in self.authorities:
+                self.do_network_metrics(auth.name)
+            return
+
+        auth_node = next((a for a in self.authorities if a.name == target), None)
+        if auth_node is None:
+            print(f"❌ Unknown authority '{target}'")
+            return
+
+        collector = getattr(auth_node, 'metrics_collector', None)
+        if collector is None:
+            print(f"⚠️  '{target}' has no metrics collector")
+            return
+
+        nm = getattr(collector, 'network_metrics', None)
+
+        W = 62
+        def row(text: str) -> None:
+            print(f"║  {text:<{W-2}}║")
+        def sep() -> None:
+            print(f"╠{'═' * W}╣")
+
+        print(f"\n╔{'═' * W}╗")
+        row(f"📡 Network Metrics: {target}")
+        sep()
+
+        if nm:
+            row(f"{'Metric':<22} {'Value':>12}  {'Unit':>10}")
+            row(f"{'─'*22} {'─'*12}  {'─'*10}")
+            row(f"{'Latency':<22} {getattr(nm, 'latency', 0):>12.3f}  {'ms':>10}")
+            row(f"{'Bandwidth':<22} {getattr(nm, 'bandwidth', 0):>12.3f}  {'Mbps':>10}")
+            row(f"{'Packet Loss':<22} {getattr(nm, 'packet_loss', 0):>12.3f}  {'%':>10}")
+            row(f"{'Connectivity Ratio':<22} {getattr(nm, 'connectivity_ratio', 0):>12.3f}  {'ratio':>10}")
+            upd = getattr(nm, 'last_update', 0)
+            upd_str = datetime.fromtimestamp(upd).strftime('%H:%M:%S') if upd else 'N/A'
+            row(f"{'Last Update':<22} {upd_str:>12}")
+        else:
+            row("No global network metrics available")
+
+        sep()
+
+        # ── Counters ──
+        row(f"Transactions:  {getattr(collector, 'transaction_count', 0)}")
+        row(f"Errors:        {getattr(collector, 'error_count', 0)}")
+        row(f"Syncs:         {getattr(collector, 'sync_count', 0)}")
+
+        # ── Per-peer metrics ──
+        peer_lat = getattr(collector, '_peer_latency', {})
+        peer_bw = getattr(collector, '_peer_bandwidth', {})
+        peer_conn = getattr(collector, '_peer_connectivity', {})
+        all_peers = sorted(set(list(peer_lat.keys()) + list(peer_bw.keys()) + list(peer_conn.keys())))
+
+        if all_peers:
+            sep()
+            row(f"🔗 Per-Peer Link Quality ({len(all_peers)} peers)")
+            sep()
+            row(f"{'Peer':<14} {'Latency(ms)':>11} {'BW(Mbps)':>10} {'Conn':>8}")
+            row(f"{'─'*14} {'─'*11} {'─'*10} {'─'*8}")
+            for peer in all_peers:
+                lat = peer_lat.get(peer)
+                bw = peer_bw.get(peer)
+                conn = peer_conn.get(peer)
+                lat_v = f"{lat.average:.2f}" if lat else '—'
+                bw_v = f"{bw.average:.2f}" if bw else '—'
+                conn_v = f"{conn.average:.2f}" if conn else '—'
+                row(f"{peer:<14} {lat_v:>11} {bw_v:>10} {conn_v:>8}")
+
+        print(f"╚{'═' * W}╝")
+        print()
+
     def do_help_meshpay(self, line: str) -> None:
         """Show help for MeshPay-specific commands."""
         print("")
@@ -552,34 +1001,98 @@ class MeshPayCLI(CLI):  # pylint: disable=too-many-instance-attributes
         print("║             MESHPAY CONSENSUS CLI COMMANDS                     ║")
         print("╠════════════════════════════════════════════════════════════════╣")
         print("║  ACCOUNT COMMANDS                                              ║")
-        print("║    balance <user>               - Show user balance            ║")
-        print("║    balances                     - Show all balances            ║")
+        print("║    balance <user>               - User balance (detailed)      ║")
+        print("║    balances                     - All users (summary table)    ║")
         print("║    sync <client>                - Sync client state            ║")
-        print("║    update_onchain_balance <user>- Update on-chain balance      ║")
+        print("║    update_onchain_balance <user> - Update on-chain balance     ║")
         print("╠════════════════════════════════════════════════════════════════╣")
         print("║  TRANSFER COMMANDS                                             ║")
-        print("║    transfer <from> <to> <token> <amt> - Execute a transfer     ║")
-        print("║    broadcast_confirmation <sender>    - Broadcast confirmation ║")
+        print("║    transfer <from> <to> <tkn> <amt> - Execute a transfer       ║")
+        print("║    broadcast_confirmation <sender>  - Broadcast confirmation   ║")
         print("╠════════════════════════════════════════════════════════════════╣")
-        print("║  STATUS COMMANDS                                               ║")
+        print("║  INFO & MONITORING                                             ║")
+        print("║    infor <node|all|users|authorities> - Node info (role-based) ║")
         print("║    status                       - Network status summary       ║")
         print("║    buffered [client]            - Buffered transactions        ║")
-        print("║    infor <station|all>          - Show station state (JSON)    ║")
         print("║    voting_power                 - Show voting power            ║")
-        print("║    performance <authority>      - Show performance metrics     ║")
+        print("║    performance <authority|all>  - Performance metrics           ║")
+        print("║    network_metrics <auth|all>   - Network metrics (per-peer)   ║")
+        print("║    log <node> [lines]           - Show node log history        ║")
         print("╠════════════════════════════════════════════════════════════════╣")
         print("║  DEMO COMMANDS                                                 ║")
         print("║    demo                         - Run automated demo           ║")
+        print("╠════════════════════════════════════════════════════════════════╣")
+        print("║  FLASH-MESH D-SDN COMMANDS                                     ║")
+        print("║    fm_status                    - Controller + QoS status       ║")
+        print("║    fm_telemetry [node]          - Link stats from collector     ║")
+        print("║    fm_certs [client]            - Collected BCB certificates    ║")
         print("╠════════════════════════════════════════════════════════════════╣")
         print("║  MININET-WIFI COMMANDS                                         ║")
         print("║    stop                         - Stop mobility simulation     ║")
         print("║    start                        - Start mobility simulation    ║")
         print("║    distance <sta1> <sta2>       - Distance between stations    ║")
-        print("║    nodes                        - List all nodes               ║")
-        print("║    net                          - Show network info            ║")
-        print("║    links                        - Show all links               ║")
+        print("║    nodes / net / links          - Show network topology        ║")
         print("║    <node> ping <node>           - Ping between nodes           ║")
         print("║    help                         - Show all available commands  ║")
         print("╚════════════════════════════════════════════════════════════════╝")
         print("")
 
+    # ── Flash-Mesh D-SDN commands ─────────────────────────────────────────
+
+    def do_fm_status(self, _line: str) -> None:
+        """Show Flash-Mesh D-SDN controller status."""
+        print("\n─── Flash-Mesh D-SDN Status ─────────────────────────")
+        if self._qos_mgr is None:
+            print("  ⚠  D-SDN controller not enabled (use --flashmesh)")
+            print()
+            return
+        installed = self._qos_mgr._installed_nodes
+        print(f"  QoS nodes : {len(installed)} ({', '.join(sorted(installed)) or 'none'})")
+        if self._link_stats:
+            stats = self._link_stats.get_all()
+            print(f"  Link stats: {len(stats)} samples")
+        else:
+            print("  Link stats: disabled")
+        print()
+
+    def do_fm_telemetry(self, line: str) -> None:
+        """Show link-stats telemetry.  Usage: fm_telemetry [node_name]"""
+        if self._link_stats is None:
+            print("  ⚠  Link stats collector not enabled (use --flashmesh)")
+            return
+        parts = line.strip().split()
+        if parts:
+            sample = self._link_stats.get(parts[0])
+            if sample:
+                print(f"\n─── Link Stats: {sample.node_name} ─────────────────────")
+                print(f"  RSSI             : {sample.rssi} dBm")
+                print(f"  TX/RX bytes      : {sample.tx_bytes} / {sample.rx_bytes}")
+                print(f"  Exp. throughput  : {sample.expected_throughput} Mbit/s")
+                print(f"  Sampled at       : {datetime.fromtimestamp(sample.timestamp).strftime('%H:%M:%S')}")
+            else:
+                print(f"  No data for '{parts[0]}'")
+        else:
+            all_samples = self._link_stats.get_all()
+            if not all_samples:
+                print("  No telemetry data yet")
+                return
+            print("\n─── Link Telemetry (all nodes) ──────────────────────")
+            print(f"  {'Node':<12} {'RSSI':>6} {'TX bytes':>12} {'RX bytes':>12} {'Tput (Mb)':>10}")
+            for name, s in sorted(all_samples.items()):
+                print(f"  {name:<12} {s.rssi:>5}  {s.tx_bytes:>12} {s.rx_bytes:>12} {s.expected_throughput:>9.1f}")
+        print()
+
+    def do_fm_certs(self, line: str) -> None:
+        """Show collected BCB certificates.  Usage: fm_certs [client_name]"""
+        targets = [c for c in self.clients if not line.strip() or c.name == line.strip()]
+        if not targets:
+            print(f"  Client '{line.strip()}' not found")
+            return
+        for client in targets:
+            certs = getattr(client.state, 'sent_certificates', [])
+            print(f"\n─── Certificates for {client.name} ({len(certs)} votes) ─────")
+            for i, cert in enumerate(certs, 1):
+                sig = getattr(cert, 'authority_signature', '?')[:20]
+                ok = getattr(cert, 'success', None)
+                print(f"  [{i}] sig={sig}…  success={ok}")
+        print()

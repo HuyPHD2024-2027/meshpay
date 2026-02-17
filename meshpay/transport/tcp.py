@@ -185,7 +185,7 @@ if __name__ == '__main__':
                 timestamp=message_data['timestamp'],
                 payload=message_data['payload']
             )
-            self.node.logger.debug(f"Received message: {message}")
+            self.node.logger.debug(f"Received message from {message.sender.ip_address}:{message.sender.port}: {message}")
             return message
         except Exception as e:
             self.node.logger.error(f"Failed to parse message: {e}")
@@ -267,13 +267,10 @@ if __name__ == '__main__':
             self.node.cmd(f"rm -f {script_path}")
 
             if "SUCCESS" in output:
-                self.node.logger.debug(
-                    f"Sent message via in-namespace script to {target.ip_address}:{target.port}"
-                )
                 return True
 
             self.node.logger.warning(
-                f"In-namespace send failed: {output or '<no output>'}")
+                f"Send failed to {target.ip_address}:{target.port}: {output or '<no output>'}")
             return False
         except Exception as exc:  # pragma: no cover
             self.node.logger.error(f"Failed to send message in namespace: {exc}")
@@ -293,7 +290,6 @@ if __name__ == '__main__':
         
         try:
             message = self.node.message_queue.get(timeout=timeout)
-            self.node.logger.debug(f"Received message from {message.sender.ip_address}:{message.sender.port}")
             return message
         except Empty:
             return None

@@ -143,6 +143,7 @@ class WiFiAuthority(Station):
         self.performance_metrics = MetricsCollector()
 
         self._running = False
+        self._epoch: int = 1  # committee epoch for Flash-Mesh BCB
         self._message_handler_thread: Optional[threading.Thread] = None
         self._blockchain_sync_thread: Optional[threading.Thread] = None
 
@@ -508,4 +509,41 @@ class WiFiAuthority(Station):
                 self.logger.error(f"Error in blockchain sync loop: {e}")
                 time.sleep(10)
 
+    # ── Flash-Mesh / D-SDN helpers ────────────────────────────────────
 
+    def get_link_stats(self) -> Dict[str, Any]:
+        """Expose iw-based link metrics for the SDN controller layer.
+
+        Runs ``iw dev <intf> station dump`` inside the node namespace and
+        parses signal strength, tx/rx bytes, and expected throughput.
+        """
+        try:
+            # Determine wireless interface name
+            intf = f"{self.name}-wlan0"
+            raw = self.cmd(f"iw dev {intf} station dump")
+            return self._parse_iw_station_dump(raw)
+        except Exception as e:
+            self.logger.error(f"get_link_stats failed: {e}")
+            return {}
+
+    @staticmethod
+    def _parse_iw_station_dump(raw: str) -> Dict[str, Any]:
+        """Parse output of ``iw dev ... station dump`` into a dict."""
+        stats: Dict[str, Any] = {}
+        for line in raw.splitlines():
+            line = line.strip()
+            if ":" not in line:
+                continue
+            key, _, val = line.partition(":")
+            key = key.strip().lower().replace(" ", "_")
+            val = val.strip()
+            # Try to convert numeric values
+            for suffix in (" dBm", " MBit/s", " bytes", " packets", " ms"):
+                if val.endswith(suffix):
+                    val = val[: -len(suffix)]
+                    break
+            try:
+                stats[key] = float(val) if "." in val else int(val)
+            except (ValueError, TypeError):
+                stats[key] = val
+        return stats

@@ -1,12 +1,29 @@
-"""API facades (HTTP bridge, gateway forwarding)."""
+"""Logger module for MeshPay nodes.
 
-from __future__ import annotations
+Provides specialized loggers for different node types (authority, client, bridge)
+and utility functions for formatting log messages.
+"""
 
-from .authorityLogger import AuthorityLogger  
-from .clientLogger import ClientLogger  
-from .bridgeLogger import BridgeLogger  
+from meshpay.logger.authorityLogger import AuthorityLogger
+from meshpay.logger.clientLogger import ClientLogger
+from meshpay.logger.bridgeLogger import BridgeLogger
+from meshpay.logger.utils import (
+    format_message,
+    format_transfer_message,
+    format_network_message,
+    format_balance_info,
+    format_dict,
+    format_object,
+)
 
-__all__ = ["AuthorityLogger", "ClientLogger", "BridgeLogger"]
-
-
-
+__all__ = [
+    'AuthorityLogger',
+    'ClientLogger',
+    'BridgeLogger',
+    'format_message',
+    'format_transfer_message',
+    'format_network_message',
+    'format_balance_info',
+    'format_dict',
+    'format_object',
+]

@@ -78,6 +78,7 @@ def parse_mesh_internet_args(description: str = "FastPay IEEE 802.11s Mesh Demo"
     full_parser.add_argument("--mesh-id", "-m", type=str, default="fastpay-mesh", help="mesh network identifier")
     full_parser.add_argument("--mobility", action="store_true", help="enable advanced mobility models")
     full_parser.add_argument("--no-security", action="store_true", help="disable mesh security (not recommended)")
+    full_parser.add_argument("--flashmesh", action="store_true", help="enable Flash-Mesh D-SDN controller (QoS + link stats)")
 
     return full_parser.parse_args()
 

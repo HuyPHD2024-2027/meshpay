@@ -32,6 +32,18 @@ class TransactionStatus(Enum):
     FINALIZED = "finalized"
 
 
+class BCBPriorityClass(Enum):
+    """Traffic priority classes for BCB settlement.
+
+    Used by the SDN controller / QoS manager to classify packets into
+    strict-priority queues.
+    """
+
+    FASTPAY_BCB = 0     # votes, certificates — highest priority
+    PAYMENT_DATA = 1    # transfer payloads, balance queries
+    BEST_EFFORT = 2     # logs, telemetry, model updates
+
+
 
 @dataclass
 class Address:
@@ -49,7 +61,13 @@ class Address:
 
 @dataclass
 class TransferOrder:
-    """Transfer order from client to authority."""
+    """Transfer order from client to authority.
+
+    In the Flash-Mesh BCB model this doubles as the *Lock* — the client's
+    signed spend intent.  Replay protection is provided by the monotonic
+    ``sequence_number``; ``epoch`` tracks the committee epoch and ``ttl``
+    limits how long the lock remains valid.
+    """
     
     order_id: UUID
     sender: str
@@ -59,6 +77,8 @@ class TransferOrder:
     sequence_number: int
     timestamp: float
     signature: Optional[str] = None
+    epoch: int = 0           # committee epoch
+    ttl: float = 30.0        # seconds until lock expires
     
     def __post_init__(self) -> None:
         """Initialize default values."""

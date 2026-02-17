@@ -294,7 +294,7 @@ class Client(Station):
             if not self._validate_confirmation_order(confirmation_order):
                 return False
             
-            self.state.balance -= transfer.amount
+            self.state.balance += transfer.amount
 
             self.logger.info(
                 f"Confirmation {transfer.order_id} applied – sender={transfer.sender}, amount={transfer.amount}"
@@ -309,12 +309,17 @@ class Client(Station):
 
     def broadcast_confirmation(self) -> None:
         """Create and broadcast a ConfirmationOrder (internal helper)."""
-        if len(self.state.sent_certificates) < 2/3 * len(self.state.committee) + 1:
-            self.logger.error("Not enough transfer certificates to confirm")
+        order = self.state.pending_transfer
+        
+        # Filter certificates to only include those for the current pending transfer
+        relevant_certs = [c for c in self.state.sent_certificates 
+                         if c.transfer_order.order_id == order.order_id]
+
+        if len(relevant_certs) < self._quorum_threshold:
+            self.logger.error(f"Insufficient certificates for {order.order_id} ({len(relevant_certs)}/{self._quorum_threshold})")
             return
         
-        transfer_signatures = [certificate.authority_signature for certificate in self.state.sent_certificates]
-        order = self.state.pending_transfer
+        transfer_signatures = [c.authority_signature for c in relevant_certs]
         confirmation = ConfirmationOrder(
             order_id=order.order_id,
             transfer_order=order,
@@ -338,7 +343,9 @@ class Client(Station):
 
         self.state.pending_transfer = None
         self.state.sequence_number += 1
-        self.state.sent_certificates = []
+        # Remove only certificates related to this specific order
+        self.state.sent_certificates = [c for c in self.state.sent_certificates 
+                                       if c.transfer_order.order_id != order.order_id]
         self.state.balance -= order.amount
 
     def _process_message(self, message: Message) -> None:
@@ -410,8 +417,10 @@ class Client(Station):
                     buffered_tx.order, message
                 )
                 
-                # Check if we now have quorum based on sent_certificates
-                if len(self.state.sent_certificates) >= self._quorum_threshold:
+                # Check quorum for this specific transaction
+                relevant_votes = [c for c in self.state.sent_certificates 
+                                if c.transfer_order.order_id == tx_id]
+                if len(relevant_votes) >= self._quorum_threshold:
                     self.logger.info(
                         f"Transaction {tx_id} reached quorum after retry!"
                     )

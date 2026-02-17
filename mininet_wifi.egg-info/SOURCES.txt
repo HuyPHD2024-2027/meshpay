@@ -9,10 +9,15 @@ meshpay/types.py
 meshpay/api/__init__.py
 meshpay/api/bridge.py
 meshpay/api/gateway.py
+meshpay/controller/__init__.py
+meshpay/controller/fallback.py
+meshpay/controller/link_stats.py
+meshpay/controller/qos.py
 meshpay/logger/__init__.py
 meshpay/logger/authorityLogger.py
 meshpay/logger/bridgeLogger.py
 meshpay/logger/clientLogger.py
+meshpay/logger/utils.py
 meshpay/nodes/__init__.py
 meshpay/nodes/authority.py
 meshpay/nodes/client.py
