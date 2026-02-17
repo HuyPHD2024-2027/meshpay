@@ -1,0 +1,31 @@
+[project]
+name = "goob-ai-synthetic-metrics"
+version = "0.1.0"
+description = "Synthetic throughput/latency vs number of authorities with plotting CLI"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Goob AI" }]
+license = { text = "MIT" }
+dependencies = [
+  "matplotlib>=3.8",
+  "numpy>=1.26",
+]
+
+[project.scripts]
+goob-ai-metrics = "goob_ai.cli:main"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+lint.select = ["E", "F", "I", "UP"]
+
+[tool.uv]
+# Development-time tools
+dev-dependencies = [
+  "ruff>=0.6",
+  "pytest>=8.0",
+]
