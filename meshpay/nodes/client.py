@@ -1,51 +1,56 @@
-from __future__ import annotations
+"""MeshPay client – opportunistic wireless mesh relay.
 
-"""MeshPay client implementation capable of using multiple network transports.
+Instead of broadcasting transfer orders directly to the committee of
+authorities, the client sends them to **any reachable neighbour node**.
+Each neighbour re-broadcasts the order to *its* neighbours (with TTL
+decrement and deduplication) until an authority processes the order and
+relays a signed response back through the mesh.
 
-This class mirrors the previous implementation under ``mn_wifi.client`` but is
-now housed under the MeshPay namespace. It communicates via a pluggable
-``NetworkTransport`` and operates in the Mininet-WiFi simulation environment.
+Inherits shared mesh networking behavior from :class:`MeshMixin`.
 """
+
+from __future__ import annotations
 
 import time
 import threading
-from queue import Queue
-from typing import Dict, Optional, List
-from uuid import UUID, uuid4
+from typing import Dict, List, Optional
+from uuid import uuid4
+
+from mn_wifi.node import Station
 
 from meshpay.types import (
     Address,
     ClientState,
-    NodeType,
-    TransferOrder,
-    KeyPair,
-    AuthorityName,
     ConfirmationOrder,
+    KeyPair,
+    NodeType,
     TransactionStatus,
+    TransferOrder,
 )
 from meshpay.messages import (
+    ConfirmationRequestMessage,
     Message,
     MessageType,
     TransferRequestMessage,
     TransferResponseMessage,
-    ConfirmationRequestMessage,
 )
-from mn_wifi.node import Station
 from meshpay.transport.transport import NetworkTransport, TransportKind
 from meshpay.transport.tcp import TCPTransport
 from meshpay.transport.udp import UDPTransport
 from meshpay.transport.wifiDirect import WiFiDirectTransport
 from meshpay.logger.clientLogger import ClientLogger
 
+from meshpay.nodes.mesh_utils import MeshMixin
 
-class Client(Station):
-    """Client node which can be added to a Mininet-WiFi topology using addStation.
 
-    The class embeds the FastPay client logic while extending Station so that it
-    participates in the wireless network simulation natively. Upon construction
-    the caller may choose one of the supported transport kinds or inject an
-    already configured NetworkTransport instance.
+class Client(MeshMixin, Station):
+    """Client node for opportunistic wireless mesh payment relay.
+
+    Inherits mesh networking (neighbor management, discovery, relay) from
+    :class:`MeshMixin`.  This is the simple (non-buffered) client variant.
     """
+
+    _service_capabilities = ["relay", "client"]
 
     def __init__(
         self,
@@ -82,9 +87,6 @@ class Client(Station):
             node_type=NodeType.CLIENT,
         )
 
-        self.p2p_connections: Dict[str, Address] = {}
-        self.message_queue: Queue[Message] = Queue()
-
         self.state = ClientState(
             name=name,
             address=self.address,
@@ -97,6 +99,7 @@ class Client(Station):
             received_certificates={},
         )
 
+        # Transport
         if transport is not None:
             self.transport = transport
         else:
@@ -113,6 +116,13 @@ class Client(Station):
         self._running = False
         self._message_handler_thread: Optional[threading.Thread] = None
 
+        # Init mesh mixin data structures
+        self._init_mesh()
+
+    # ------------------------------------------------------------------
+    # Service lifecycle
+    # ------------------------------------------------------------------
+
     def start_fastpay_services(self) -> bool:
         """Boot-strap background processing threads and ready the transport."""
         if hasattr(self.transport, "connect"):
@@ -120,7 +130,7 @@ class Client(Station):
                 if not self.transport.connect():  # type: ignore[attr-defined]
                     self.logger.error("Failed to connect transport")
                     return False
-            except Exception as exc:  # pragma: no cover
+            except Exception as exc:
                 self.logger.error(f"Transport connect error: {exc}")
                 return False
 
@@ -130,22 +140,26 @@ class Client(Station):
             daemon=True,
         )
         self._message_handler_thread.start()
+        self._start_discovery_service()
 
         self.logger.info(f"Client {self.name} started successfully")
         return True
-    
+
     def stop_fastpay_services(self) -> None:
         """Stop the FastPay client services."""
         self._running = False
         if hasattr(self.transport, "disconnect"):
             try:
                 self.transport.disconnect()  # type: ignore[attr-defined]
-            except Exception:  # pragma: no cover
+            except Exception:
                 pass
-        
         if self._message_handler_thread:
             self._message_handler_thread.join(timeout=5.0)
         self.logger.info(f"Client {self.name} stopped")
+
+    # ------------------------------------------------------------------
+    # Transfer – opportunistic mesh relay
+    # ------------------------------------------------------------------
 
     def transfer(
         self,
@@ -153,7 +167,7 @@ class Client(Station):
         token_address: str,
         amount: int,
     ) -> bool:
-        """Broadcast a transfer order to the committee."""
+        """Initiate a transfer by relaying the order through the mesh."""
         order = TransferOrder(
             order_id=uuid4(),
             sender=self.state.name,
@@ -166,106 +180,95 @@ class Client(Station):
         )
         request = TransferRequestMessage(transfer_order=order)
         self.state.pending_transfer = order
+        self.state.seen_order_ids.add(str(order.order_id))
 
-        message = Message(
-            message_id=uuid4(),
-            message_type=MessageType.TRANSFER_REQUEST,
-            sender=self.state.address,
-            recipient=None,
-            timestamp=time.time(),
-            payload=request.to_payload(),
+        relay_msg = self._build_relay_message(
+            inner_type=MessageType.TRANSFER_REQUEST.value,
+            inner_payload=request.to_payload(),
+            order_id=str(order.order_id),
         )
-        
-        return self._broadcast_transfer_request(message)
-    
-    def _broadcast_transfer_request(self, transfer_request: Message) -> bool:
-        """Broadcast a transfer request to all authorities."""
-        self.logger.info(
-            f"Broadcasting transfer request to {len(self.state.committee)} authorities"
-        )
+        return self._relay_to_neighbors(relay_msg) > 0
 
-        successes = 0
-        for auth in self.state.committee:
-            msg = Message(
-                message_id=uuid4(),
-                message_type=transfer_request.message_type,
-                sender=transfer_request.sender,
-                recipient=auth.address,
-                timestamp=time.time(),
-                payload=transfer_request.payload,
+    # ------------------------------------------------------------------
+    # Transfer response handling
+    # ------------------------------------------------------------------
+
+    def _validate_transfer_response(self, resp: TransferResponseMessage) -> bool:
+        """Validate a transfer response received from an authority."""
+        if resp.transfer_order.sender != self.state.name:
+            self.logger.error(f"Transfer {resp.transfer_order.order_id} failed: sender mismatch")
+            return False
+        if resp.transfer_order.sequence_number != self.state.sequence_number:
+            self.logger.error(f"Transfer {resp.transfer_order.order_id} failed: sequence mismatch")
+            return False
+        return True
+
+    def handle_transfer_response(self, resp: TransferResponseMessage) -> bool:
+        """Handle transfer response from authority (received via mesh relay)."""
+        try:
+            if not self._validate_transfer_response(resp):
+                return False
+
+            self.state.sent_certificates.append(resp)
+            self.logger.info(
+                f"Collected signature ({len(self.state.sent_certificates)} total) "
+                f"for order {resp.transfer_order.order_id}"
             )
 
-            if self.transport.send_message(msg, auth.address):
-                successes += 1
-            else:
-                self.logger.warning(f"Failed to send to authority {auth.name}")
+            committee_size = len(self.state.committee)
+            quorum = int(committee_size * 2 / 3) + 1 if committee_size > 0 else 1
+            if len(self.state.sent_certificates) >= quorum and self.state.pending_transfer:
+                self.logger.info("Quorum reached – broadcasting confirmation via mesh")
+                self.broadcast_confirmation()
 
-        if successes == 0:
-            self.logger.error("Failed to send transfer request to any authority")
-            return False
-
-        self.logger.info(f"Transfer request delivered to {successes} / {len(self.state.committee)} authorities")
-        return True
-    
-    def _validate_transfer_response(self, transfer_response: TransferResponseMessage) -> bool:
-        """Validate a transfer response received from an authority."""
-        if transfer_response.transfer_order.sender != self.state.name:
-            self.logger.error(f"Transfer {transfer_response.transfer_order.order_id} failed: sender mismatch")
-            return False
-        
-        if transfer_response.transfer_order.sequence_number != self.state.sequence_number:
-            self.logger.error(f"Transfer {transfer_response.transfer_order.order_id} failed: sequence number mismatch")
-            return False
-        return True
-    
-    def handle_transfer_response(self, transfer_response: TransferResponseMessage) -> bool:
-        """Handle transfer response from authority."""
-        try:
-            if not self._validate_transfer_response(transfer_response):
-                return False
-            
-            self.state.sent_certificates.append(transfer_response)
             return True
-            
         except Exception as e:
             self.logger.error(f"Error handling transfer response: {e}")
             return False
-        
+
+    # ------------------------------------------------------------------
+    # Confirmation handling
+    # ------------------------------------------------------------------
+
     def _validate_confirmation_order(self, confirmation_order: ConfirmationOrder) -> bool:
         """Validate a confirmation order (placeholder)."""
-        return True     
-        
+        return True
+
     def handle_confirmation_order(self, confirmation_order: ConfirmationOrder) -> bool:
-        """Handle confirmation order from committee."""
+        """Handle a confirmation order received for us as the recipient."""
         try:
             transfer = confirmation_order.transfer_order
-            
             if transfer.recipient != self.state.name:
                 return False
-            
             if not self._validate_confirmation_order(confirmation_order):
                 return False
-            
-            self.state.balance -= transfer.amount
+
+            self.state.balance += transfer.amount
+            self.state.seen_order_ids.discard(str(transfer.order_id))
 
             self.logger.info(
-                f"Confirmation {transfer.order_id} applied – sender={transfer.sender}, amount={transfer.amount}"
+                f"Confirmation {transfer.order_id} applied – "
+                f"sender={transfer.sender}, amount={transfer.amount}"
             )
-            self.logger.info(f"Confirmation order {confirmation_order.order_id} processed")
             return True
-            
         except Exception as e:
             self.logger.error(f"Error handling confirmation order: {e}")
-            # Note: client has no performance metrics collector yet
             return False
 
     def broadcast_confirmation(self) -> None:
-        """Create and broadcast a ConfirmationOrder (internal helper)."""
-        if len(self.state.sent_certificates) < 2/3 * len(self.state.committee) + 1:
+        """Create and relay a ConfirmationOrder through the mesh."""
+        if not self.state.pending_transfer:
+            self.logger.error("No pending transfer to confirm")
+            return
+
+        committee_size = len(self.state.committee)
+        quorum = int(committee_size * 2 / 3) + 1 if committee_size > 0 else 1
+
+        if len(self.state.sent_certificates) < quorum:
             self.logger.error("Not enough transfer certificates to confirm")
             return
-        
-        transfer_signatures = [certificate.authority_signature for certificate in self.state.sent_certificates]
+
+        transfer_signatures = [c.authority_signature for c in self.state.sent_certificates]
         order = self.state.pending_transfer
         confirmation = ConfirmationOrder(
             order_id=order.order_id,
@@ -276,36 +279,47 @@ class Client(Station):
         )
 
         req = ConfirmationRequestMessage(confirmation_order=confirmation)
-
-        for auth in self.state.committee:
-            msg = Message(
-                message_id=uuid4(),
-                message_type=MessageType.CONFIRMATION_REQUEST,
-                sender=self.address,
-                recipient=auth.address,
-                timestamp=time.time(),
-                payload=req.to_payload(),
-            )
-            self.transport.send_message(msg, auth.address)
+        relay_msg = self._build_relay_message(
+            inner_type=MessageType.CONFIRMATION_REQUEST.value,
+            inner_payload=req.to_payload(),
+            order_id=str(order.order_id),
+        )
+        self._relay_to_neighbors(relay_msg)
 
         self.state.pending_transfer = None
         self.state.sequence_number += 1
         self.state.sent_certificates = []
         self.state.balance -= order.amount
 
+    # ------------------------------------------------------------------
+    # Message processing – mesh relay aware
+    # ------------------------------------------------------------------
+
     def _process_message(self, message: Message) -> None:
-        """Process incoming message."""
+        """Process incoming message, handling mesh relay wrapping."""
         try:
+            if message.message_type == MessageType.MESH_RELAY:
+                self._handle_mesh_relay(
+                    message,
+                    on_transfer_response=self.handle_transfer_response,
+                    on_confirmation=self.handle_confirmation_order,
+                )
+                return
+
+            # Legacy direct messages (backwards compat).
             if message.message_type == MessageType.TRANSFER_RESPONSE:
                 request = TransferResponseMessage.from_payload(message.payload)
                 self.handle_transfer_response(request)
-
-            if message.message_type == MessageType.CONFIRMATION_REQUEST:
+            elif message.message_type == MessageType.CONFIRMATION_REQUEST:
                 request = ConfirmationRequestMessage.from_payload(message.payload)
                 self.handle_confirmation_order(request.confirmation_order)
-                
+
         except Exception as e:
             self.logger.error(f"Error processing message: {e}")
+
+    # ------------------------------------------------------------------
+    # Background loop
+    # ------------------------------------------------------------------
 
     def _message_handler_loop(self) -> None:
         """Background thread loop that polls the transport for incoming messages."""
@@ -314,12 +328,10 @@ class Client(Station):
                 message = self.transport.receive_message(timeout=1.0)
                 if message:
                     self._process_message(message)
-            except Exception as exc:  # pragma: no cover
+            except Exception as exc:
                 if hasattr(self, "logger"):
                     self.logger.error(f"Error in message handler loop: {exc}")
                 time.sleep(0.2)
 
+
 __all__ = ["Client"]
-
-
-

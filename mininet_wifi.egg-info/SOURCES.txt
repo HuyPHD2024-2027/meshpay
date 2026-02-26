@@ -5,7 +5,6 @@ bin/mn
 meshpay/__init__.py
 meshpay/cli_fastpay.py
 meshpay/messages.py
-meshpay/types.py
 meshpay/api/__init__.py
 meshpay/api/bridge.py
 meshpay/api/gateway.py
@@ -22,11 +21,17 @@ meshpay/nodes/__init__.py
 meshpay/nodes/authority.py
 meshpay/nodes/client.py
 meshpay/nodes/client1.py
+meshpay/nodes/mesh_utils.py
 meshpay/transport/__init__.py
 meshpay/transport/tcp.py
 meshpay/transport/transport.py
 meshpay/transport/udp.py
 meshpay/transport/wifiDirect.py
+meshpay/types/__init__.py
+meshpay/types/common.py
+meshpay/types/network.py
+meshpay/types/state.py
+meshpay/types/transaction.py
 mininet_wifi.egg-info/PKG-INFO
 mininet_wifi.egg-info/SOURCES.txt
 mininet_wifi.egg-info/dependency_links.txt

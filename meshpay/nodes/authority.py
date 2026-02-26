@@ -1,15 +1,13 @@
 """WiFi Authority Node implementation for MeshPay simulation.
 
-This implementation was moved from ``mn_wifi.authority`` into the structured
-MeshPay namespace. Backward compatibility is preserved by a small shim in
-``mn_wifi.authority`` which re-exports this class.
+Inherits shared mesh networking behavior from :class:`MeshMixin`.
 """
 
 from __future__ import annotations
 
 import threading
 import time
-from queue import Queue
+
 from typing import Any, Dict, List, Optional, Set
 from uuid import uuid4
 from datetime import datetime
@@ -33,7 +31,10 @@ from meshpay.messages import (
     MessageType,
     TransferRequestMessage,
     TransferResponseMessage,
+    MeshRelayMessage,
 )
+
+from mn_wifi.services.core.config import DEFAULT_RELAY_TTL
 
 from meshpay.transport.transport import NetworkTransport, TransportKind
 from meshpay.transport.tcp import TCPTransport
@@ -43,6 +44,8 @@ from meshpay.transport.wifiDirect import WiFiDirectTransport
 from mn_wifi.metrics import MetricsCollector
 from meshpay.logger.authorityLogger import AuthorityLogger
 from mn_wifi.services.blockchain_client import BlockchainClient, TokenBalance
+
+from meshpay.nodes.mesh_utils import MeshMixin
 
 
 DEFAULT_BALANCES = {
@@ -81,8 +84,13 @@ DEFAULT_BALANCES = {
 }
 
 
-class WiFiAuthority(Station):
-    """Authority node that runs on Mininet-WiFi host, inheriting from Station."""
+class WiFiAuthority(MeshMixin, Station):
+    """Authority node that runs on Mininet-WiFi host.
+
+    Inherits mesh networking (neighbor management, discovery, relay) from
+    :class:`MeshMixin`.  Overrides ``_handle_mesh_relay`` to process
+    transfer requests and relay responses back through the mesh.
+    """
 
     def __init__(
         self,
@@ -138,14 +146,15 @@ class WiFiAuthority(Station):
             stake=0,
         )
 
-        self.p2p_connections: Dict[str, Address] = {}
-        self.message_queue: Queue[Message] = Queue()
         self.performance_metrics = MetricsCollector()
 
         self._running = False
         self._epoch: int = 1  # committee epoch for Flash-Mesh BCB
         self._message_handler_thread: Optional[threading.Thread] = None
         self._blockchain_sync_thread: Optional[threading.Thread] = None
+
+        # Init mesh mixin data structures
+        self._init_mesh()
 
         if transport is not None:
             self.transport = transport
@@ -158,6 +167,13 @@ class WiFiAuthority(Station):
                 self.transport = WiFiDirectTransport(self, self.address)
             else:
                 raise ValueError(f"Unsupported transport kind: {transport_kind}")
+
+    # Neighbor management, discovery, and relay inherited from MeshMixin
+    _service_capabilities = ["relay", "authority", "validation"]
+
+    # ------------------------------------------------------------------
+    # Service lifecycle
+    # ------------------------------------------------------------------
 
     def start_fastpay_services(self, enable_internet: bool = False) -> bool:
         """Boot-strap background processing threads and ready the chosen transport."""
@@ -185,6 +201,8 @@ class WiFiAuthority(Station):
             )
             self._blockchain_sync_thread.start()
 
+        self._start_discovery_service()
+
         self.logger.info(f"Authority {self.name} started successfully")
         return True
 
@@ -202,6 +220,8 @@ class WiFiAuthority(Station):
         if self._blockchain_sync_thread:
             self._blockchain_sync_thread.join(timeout=5.0)
         self.logger.info(f"Authority {self.name} stopped")
+
+    # Discovery loops inherited from MeshMixin
 
     async def update_account_balance(self) -> None:
         """Update account balance.
@@ -464,8 +484,13 @@ class WiFiAuthority(Station):
                 time.sleep(0.1)
 
     def _process_message(self, message: Message) -> None:
-        """Process incoming message."""
+        """Process incoming message, including mesh relay."""
         try:
+            if message.message_type == MessageType.MESH_RELAY:
+                self._handle_mesh_relay(message)
+                return
+
+            # Legacy direct messages (backwards compatibility).
             if message.message_type == MessageType.TRANSFER_REQUEST:
                 request = TransferRequestMessage.from_payload(message.payload)
                 response = self.handle_transfer_order(request.transfer_order)
@@ -485,6 +510,57 @@ class WiFiAuthority(Station):
 
         except Exception as e:
             self.logger.error(f"Error processing message: {e}")
+
+    def _handle_mesh_relay(self, message: Message, **_kwargs) -> None:
+        """Unwrap a mesh relay message and process the inner payload.
+
+        Authority override: processes TRANSFER_REQUESTs locally and relays
+        signed responses back through the mesh.
+        """
+        relay = MeshRelayMessage.from_payload(message.payload)
+        order_key = relay.order_id
+
+        # ── Deduplication ──
+        if order_key in self.state.seen_order_ids:
+            self.logger.debug(f"Duplicate relay {order_key} – skipping")
+            return
+        self.state.seen_order_ids.add(order_key)
+
+        # ── TRANSFER_REQUEST: process and relay response back ──
+        if relay.inner_message_type == MessageType.TRANSFER_REQUEST.value:
+            request = TransferRequestMessage.from_payload(relay.inner_payload)
+            response = self.handle_transfer_order(request.transfer_order)
+
+            self.logger.info(
+                f"Processed relayed transfer {order_key} from {relay.original_sender_id}"
+            )
+
+            response_relay = self._build_relay_message(
+                inner_type=MessageType.TRANSFER_RESPONSE.value,
+                inner_payload=response.to_payload(),
+                order_id=relay.order_id,
+                sender_id=relay.original_sender_id,
+                origin_address=relay.origin_address,
+            )
+            self._relay_to_neighbors(response_relay)
+
+        # ── CONFIRMATION_REQUEST: process locally ──
+        elif relay.inner_message_type == MessageType.CONFIRMATION_REQUEST.value:
+            req = ConfirmationRequestMessage.from_payload(relay.inner_payload)
+            self.handle_confirmation_order(req.confirmation_order)
+
+        # ── Re-relay the original message to other neighbours ──
+        if relay.ttl > 1:
+            next_relay = MeshRelayMessage(
+                original_sender_id=relay.original_sender_id,
+                origin_address=relay.origin_address,
+                inner_message_type=relay.inner_message_type,
+                inner_payload=relay.inner_payload,
+                order_id=relay.order_id,
+                ttl=relay.ttl - 1,
+                hop_path=relay.hop_path + [self.name],
+            )
+            self._relay_to_neighbors(next_relay)
 
     def _blockchain_sync_loop(self) -> None:
         """Periodic blockchain synchronization loop."""

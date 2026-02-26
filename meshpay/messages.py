@@ -6,10 +6,10 @@ import json
 import time
 from dataclasses import asdict, dataclass
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 from uuid import UUID, uuid4
 
-from meshpay.types import Address, ConfirmationOrder, TransferOrder
+from meshpay.types import Address, ConfirmationOrder, TransferOrder, NodeType
 
 
 class MessageType(Enum):
@@ -23,6 +23,7 @@ class MessageType(Enum):
     SYNC_RESPONSE = "sync_response"
     PEER_DISCOVERY = "peer_discovery"
     HEARTBEAT = "heartbeat"
+    MESH_RELAY = "mesh_relay"
     ERROR = "error"
 
 
@@ -47,10 +48,23 @@ class Message:
     
     def to_json(self) -> str:
         """Serialize message to JSON."""
+        # We need a custom encoder or pre-processing because 'sender' and 'recipient'
+        # are Address objects containing NodeType enums which json.dumps fails on.
         data = asdict(self)
+        
         # Convert UUID to string for JSON serialization
         data['message_id'] = str(data['message_id'])
         data['message_type'] = data['message_type'].value
+        
+        # Fix top-level sender/recipient serialization
+        if 'sender' in data and isinstance(data['sender'], dict):
+             if 'node_type' in data['sender'] and isinstance(data['sender']['node_type'], Enum):
+                 data['sender']['node_type'] = data['sender']['node_type'].value
+
+        if 'recipient' in data and data['recipient'] and isinstance(data['recipient'], dict):
+             if 'node_type' in data['recipient'] and isinstance(data['recipient']['node_type'], Enum):
+                 data['recipient']['node_type'] = data['recipient']['node_type'].value
+                 
         return json.dumps(data)
     
     @classmethod
@@ -59,6 +73,22 @@ class Message:
         data = json.loads(json_str)
         data['message_id'] = UUID(data['message_id'])
         data['message_type'] = MessageType(data['message_type'])
+        
+        # Reconstruct sender/recipient if needed (dictionaries to objects)
+        # Note: Address(**dict) might fail if node_type is string and we expect Enum?
+        # dataclass constructor doesn't validate types, so it might store string.
+        # Ideally we should convert back to Enum.
+        
+        if isinstance(data['sender'], dict):
+            if isinstance(data['sender'].get('node_type'), str):
+                data['sender']['node_type'] = NodeType(data['sender']['node_type'])
+            data['sender'] = Address(**data['sender'])
+            
+        if data.get('recipient') and isinstance(data['recipient'], dict):
+            if isinstance(data['recipient'].get('node_type'), str):
+                data['recipient']['node_type'] = NodeType(data['recipient']['node_type'])
+            data['recipient'] = Address(**data['recipient'])
+            
         return cls(**data)
 
 
@@ -182,16 +212,26 @@ class PeerDiscoveryMessage:
     
     def to_payload(self) -> Dict[str, Any]:
         """Convert to message payload."""
-        return {
+        data = {
             'node_info': asdict(self.node_info),
             'service_capabilities': self.service_capabilities,
             'network_metrics': self.network_metrics
         }
+        # Explicitly convert Enum to value for JSON serialization
+        if hasattr(self.node_info, 'node_type') and isinstance(self.node_info.node_type, Enum):
+            data['node_info']['node_type'] = self.node_info.node_type.value
+            
+        return data
     
     @classmethod
     def from_payload(cls, payload: Dict[str, Any]) -> "PeerDiscoveryMessage":
         """Create from message payload."""
         node_data = payload['node_info']
+        
+        # Convert string back to Enum if needed
+        if isinstance(node_data.get('node_type'), str):
+            node_data['node_type'] = NodeType(node_data['node_type'])
+            
         node_info = Address(**node_data)
         return cls(
             node_info=node_info,
@@ -200,4 +240,45 @@ class PeerDiscoveryMessage:
         )
 
 
+@dataclass
+class MeshRelayMessage:
+    """Wrapper for messages relayed through the opportunistic wireless mesh.
+
+    Any inner message (transfer request, transfer response, confirmation)
+    is wrapped with relay metadata so that intermediate nodes can forward
+    it toward its destination without needing end-to-end connectivity.
+    """
+
+    original_sender_id: str          # node_id of the originator
+    origin_address: Dict[str, Any]   # serialised Address of the originator
+    inner_message_type: str          # MessageType.value of the wrapped msg
+    inner_payload: Dict[str, Any]    # payload of the wrapped message
+    order_id: str                    # transfer order ID (for dedup)
+    ttl: int                         # remaining hops
+    hop_path: List[str]              # node_ids already traversed
+
+    def to_payload(self) -> Dict[str, Any]:
+        """Serialise to a dict suitable for ``Message.payload``."""
+        return {
+            "original_sender_id": self.original_sender_id,
+            "origin_address": self.origin_address,
+            "inner_message_type": self.inner_message_type,
+            "inner_payload": self.inner_payload,
+            "order_id": self.order_id,
+            "ttl": self.ttl,
+            "hop_path": list(self.hop_path),
+        }
+
+    @classmethod
+    def from_payload(cls, payload: Dict[str, Any]) -> "MeshRelayMessage":
+        """Reconstruct from a ``Message.payload`` dict."""
+        return cls(
+            original_sender_id=payload["original_sender_id"],
+            origin_address=payload["origin_address"],
+            inner_message_type=payload["inner_message_type"],
+            inner_payload=payload["inner_payload"],
+            order_id=payload["order_id"],
+            ttl=payload["ttl"],
+            hop_path=payload["hop_path"],
+        )
 

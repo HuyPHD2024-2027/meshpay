@@ -643,9 +643,14 @@ class MeshPayCLI(CLI):  # pylint: disable=too-many-instance-attributes
         for auth_state in committee:
             a_name = getattr(auth_state, 'name', '?')
             a_addr = getattr(auth_state, 'address', None)
+        for auth_state in committee:
+            a_name = getattr(auth_state, 'name', '?')
+            a_addr = getattr(auth_state, 'address', None)
             a_ip = f"{getattr(a_addr, 'ip_address', '?')}:{getattr(a_addr, 'port', '?')}" if a_addr else 'N/A'
             row(f"   └─ {a_name} ({a_ip})")
 
+        sep()
+        
         sep()
 
         # ── Pending transfer (detailed) ──
@@ -798,9 +803,66 @@ class MeshPayCLI(CLI):  # pylint: disable=too-many-instance-attributes
         print(f"├─────────────────────┼───────────────┤")
         for key, value in metrics.items():
             label = key.replace('_', ' ').title()
-            val_str = f"{value}"
-            print(f"│  {label:<19}│  {val_str:<13}│")
+            print(f"│  {label:<19}│  {str(value):<13}│")
         print(f"└─────────────────────┴───────────────┘")
+
+    # 10. -----------------------------------------------------------------
+    def do_neighbor(self, line: str) -> None:
+        """Show discovered neighbors for a node.
+        
+        Usage: neighbor <node|all>
+        """
+        args = line.split()
+        if not args:
+            print("Usage: neighbor <node|all>")
+            return
+            
+        target = args[0]
+        
+        if target.lower() in {"all", "*"}:
+            print("\n" + "=" * 60)
+            print("NEIGHBOR TABLES")
+            print("=" * 60)
+            for node in self.authorities + self.clients:
+                self._print_neighbors(node)
+            return
+            
+        node = self._find_node(target)
+        if node:
+            self._print_neighbors(node)
+        else:
+            print(f"❌ Unknown node '{target}'")
+
+    def _print_neighbors(self, node: Station) -> None:
+        """Helper to print neighbors for a single node."""
+        if not hasattr(node, 'state') or not hasattr(node.state, 'neighbors'):
+            print(f"⚠️  {node.name}: No neighbor state available")
+            return
+            
+        # Use get_neighbors() to trigger pruning of stale entries first
+        if hasattr(node, "get_neighbors"):
+            neighbors = node.get_neighbors()
+        else:
+            neighbors = node.state.neighbors
+
+        print(f"\n📡 {node.name} neighbors ({len(neighbors)}):")
+        if not neighbors:
+            print("   (none)")
+        else:
+            import time
+            now = time.time()
+            print(f"   {'Node ID':<10} {'Address':<21} {'Last Seen':<10}")
+            print(f"   {'─'*10} {'─'*21} {'─'*10}")
+            for nid, addr in neighbors.items():
+                last_seen_str = "N/A"
+                if hasattr(node, "get_neighbor_last_seen"):
+                    ts = node.get_neighbor_last_seen(nid)
+                    if ts:
+                        ago = now - ts
+                        last_seen_str = f"{ago:.1f}s ago"
+                
+                print(f"   • {nid:<8} {addr.ip_address}:{addr.port:<15} {last_seen_str}")
+        print("")
 
     # 10. -----------------------------------------------------------------
     def do_broadcast_confirmation(self, line: str) -> None:

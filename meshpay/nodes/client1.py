@@ -1,52 +1,66 @@
-from __future__ import annotations
+"""MeshPay client – opportunistic mesh relay with buffered retry.
 
-"""MeshPay client implementation capable of using multiple network transports.
+This variant of the Client extends the basic mesh-relay design with a
+*buffered transaction* mechanism: when a transfer order does not reach
+enough authorities to form a quorum on the first attempt, it is buffered
+and periodically re-relayed through the mesh until quorum is achieved.
 
-This class mirrors the previous implementation under ``mn_wifi.client`` but is
-now housed under the MeshPay namespace. It communicates via a pluggable
-``NetworkTransport`` and operates in the Mininet-WiFi simulation environment.
+Inherits shared mesh networking behavior from :class:`MeshMixin`.
 """
+
+from __future__ import annotations
 
 import time
 import threading
 from queue import Queue
-from typing import Dict, Optional, List
+from typing import Dict, List, Optional, Set
 from uuid import UUID, uuid4
+
+from mn_wifi.node import Station
 
 from meshpay.types import (
     Address,
-    ClientState,
-    NodeType,
-    TransferOrder,
-    KeyPair,
-    AuthorityName,
-    ConfirmationOrder,
-    TransactionStatus,
     BufferedTransaction,
+    ClientState,
+    ConfirmationOrder,
+    KeyPair,
+    NodeType,
+    TransactionStatus,
+    TransferOrder,
 )
 from meshpay.messages import (
+    ConfirmationRequestMessage,
     Message,
     MessageType,
+    MeshRelayMessage,
     TransferRequestMessage,
     TransferResponseMessage,
-    ConfirmationRequestMessage,
 )
-from mn_wifi.node import Station
-from meshpay.transport.transport import NetworkTransport, TransportKind
+from meshpay.transport import NetworkTransport, TransportKind
 from meshpay.transport.tcp import TCPTransport
 from meshpay.transport.udp import UDPTransport
 from meshpay.transport.wifiDirect import WiFiDirectTransport
 from meshpay.logger.clientLogger import ClientLogger
 
+from mn_wifi.services.core.config import (
+    DEFAULT_RELAY_TTL,
+    DISCOVERY_PORT,
+    DISCOVERY_INTERVAL,
+    NEIGHBOR_TIMEOUT,
+)
 
-class Client(Station):
-    """Client node which can be added to a Mininet-WiFi topology using addStation.
+from meshpay.nodes.mesh_utils import MeshMixin
 
-    The class embeds the FastPay client logic while extending Station so that it
-    participates in the wireless network simulation natively. Upon construction
-    the caller may choose one of the supported transport kinds or inject an
-    already configured NetworkTransport instance.
+
+class Client(MeshMixin, Station):
+    """Client node for opportunistic wireless mesh payment relay (buffered).
+
+    Inherits mesh networking (neighbor management, discovery, relay) from
+    :class:`MeshMixin`.  Adds transaction queuing, quorum tracking, and
+    confirmation broadcasting on top.
     """
+
+    _service_capabilities = ["relay", "client-buffered"]
 
     def __init__(
         self,
@@ -83,9 +97,6 @@ class Client(Station):
             node_type=NodeType.CLIENT,
         )
 
-        self.p2p_connections: Dict[str, Address] = {}
-        self.message_queue: Queue[Message] = Queue()
-
         self.state = ClientState(
             name=name,
             address=self.address,
@@ -98,6 +109,7 @@ class Client(Station):
             received_certificates={},
         )
 
+        # Transport
         if transport is not None:
             self.transport = transport
         else:
@@ -112,62 +124,79 @@ class Client(Station):
 
         self.logger = ClientLogger(name)
         self._running = False
-        self._message_handler_thread: Optional[threading.Thread] = None
-        
-        # Buffered transactions awaiting quorum
-        self._buffered_transactions: Dict[UUID, BufferedTransaction] = {}
-        self._retry_thread: Optional[threading.Thread] = None
-        self._retry_interval: float = 5.0  # Retry every 5 seconds
-        self._quorum_threshold: int = 0  # Will be set based on committee size
 
+        # Transaction queue (DTN store-carry-forward)
+        self.transaction_queue: Dict[UUID, BufferedTransaction] = {}
+        self._quorum_threshold: int = 0
 
-    def start_fastpay_services(self) -> bool:
-        """Boot-strap background processing threads and ready the transport."""
+        # Background threads
+        self._threads: List[threading.Thread] = []
+        self._retry_interval: float = 5.0
+
+        # Init mesh mixin data structures
+        self._init_mesh()
+
+    # ------------------------------------------------------------------
+    # Service lifecycle
+    # ------------------------------------------------------------------
+
+    def _connect_transport(self) -> bool:
+        """Connect the transport layer."""
         if hasattr(self.transport, "connect"):
             try:
                 if not self.transport.connect():  # type: ignore[attr-defined]
                     self.logger.error("Failed to connect transport")
                     return False
-            except Exception as exc:  # pragma: no cover
+            except Exception as exc:
                 self.logger.error(f"Transport connect error: {exc}")
                 return False
+        return True
+
+    def _calculate_quorum(self) -> int:
+        """Calculate quorum threshold from committee size."""
+        committee_size = len(self.state.committee)
+        return int(committee_size * 2 / 3) + 1
+
+    def _start_background_threads(self) -> None:
+        """Start message handler and retry threads."""
+        for target in [self._message_handler_loop, self._retry_loop]:
+            t = threading.Thread(target=target, daemon=True)
+            t.start()
+            self._threads.append(t)
+
+    def start_fastpay_services(self) -> bool:
+        """Boot-strap background processing threads and ready the transport."""
+        if not self._connect_transport():
+            return False
 
         self._running = True
-        
-        # Calculate quorum threshold (2/3 + 1 of committee)
-        committee_size = len(self.state.committee)
-        self._quorum_threshold = int(committee_size * 2 / 3) + 1
-        
-        self._message_handler_thread = threading.Thread(
-            target=self._message_handler_loop,
-            daemon=True,
-        )
-        self._message_handler_thread.start()
-        
-        # Start retry thread for buffered transactions
-        self._retry_thread = threading.Thread(
-            target=self._retry_loop,
-            daemon=True,
-        )
-        self._retry_thread.start()
+        self._quorum_threshold = self._calculate_quorum()
+        self._start_background_threads()
+        self._start_discovery_service()
 
-        self.logger.info(f"Client {self.name} started (quorum={self._quorum_threshold}/{committee_size})")
+        self.logger.info(
+            f"Client {self.name} started "
+            f"(quorum={self._quorum_threshold}/{len(self.state.committee)})"
+        )
         return True
-    
+
     def stop_fastpay_services(self) -> None:
-        """Stop the FastPay client services."""
+        """Stop all services."""
         self._running = False
         if hasattr(self.transport, "disconnect"):
             try:
                 self.transport.disconnect()  # type: ignore[attr-defined]
-            except Exception:  # pragma: no cover
+            except Exception:
                 pass
-        
-        if self._message_handler_thread:
-            self._message_handler_thread.join(timeout=5.0)
-        if self._retry_thread:
-            self._retry_thread.join(timeout=5.0)
+
+        for t in self._threads:
+            t.join(timeout=5.0)
+
         self.logger.info(f"Client {self.name} stopped")
+
+    # ------------------------------------------------------------------
+    # Transfer – opportunistic mesh relay
+    # ------------------------------------------------------------------
 
     def transfer(
         self,
@@ -175,11 +204,10 @@ class Client(Station):
         token_address: str,
         amount: int,
     ) -> TransactionStatus:
-        """Broadcast a transfer order to the committee.
-        
+        """Relay a transfer order through the mesh.
+
         Returns:
-            TransactionStatus: PENDING if broadcast started, BUFFERED if quorum
-            not immediately reached, FINALIZED if instant quorum (rare).
+            TransactionStatus: BUFFERED — queued for retry until quorum.
         """
         order = TransferOrder(
             order_id=uuid4(),
@@ -193,132 +221,133 @@ class Client(Station):
         )
         request = TransferRequestMessage(transfer_order=order)
         self.state.pending_transfer = order
+        self.state.seen_order_ids.add(str(order.order_id))
 
-        message = Message(
-            message_id=uuid4(),
-            message_type=MessageType.TRANSFER_REQUEST,
-            sender=self.state.address,
-            recipient=None,
-            timestamp=time.time(),
-            payload=request.to_payload(),
+        relay_msg = self._build_relay_message(
+            inner_type=MessageType.TRANSFER_REQUEST.value,
+            inner_payload=request.to_payload(),
+            order_id=str(order.order_id),
         )
-        
-        # Broadcast and track signatures
-        signatures_received = self._broadcast_and_collect_signatures(order, message)
-        
-        if signatures_received >= self._quorum_threshold:
-            self.logger.info(f"Transfer {order.order_id} reached quorum immediately!")
-            return TransactionStatus.FINALIZED
-        else:
-            # Buffer for retry
-            buffered = BufferedTransaction(
-                order=order,
-                signatures_received={},  # Will be populated by responses
-                signatures_required=self._quorum_threshold,
-                status=TransactionStatus.BUFFERED,
-            )
-            self._buffered_transactions[order.order_id] = buffered
-            self.logger.info(
-                f"Transfer {order.order_id} buffered ({signatures_received}/{self._quorum_threshold} signatures)"
-            )
-            return TransactionStatus.BUFFERED
-    
-    def _broadcast_and_collect_signatures(
-        self, order: TransferOrder, message: Message
-    ) -> int:
-        """Broadcast transfer request and return number of successful sends."""
+        self._relay_to_neighbors(relay_msg)
+
+        # Buffer for retry
+        self.transaction_queue[order.order_id] = BufferedTransaction(
+            order=order,
+            signatures_received={},
+            signatures_required=self._quorum_threshold,
+            status=TransactionStatus.BUFFERED,
+        )
         self.logger.info(
-            f"Broadcasting transfer request to {len(self.state.committee)} authorities"
+            f"Transfer {order.order_id} relayed to mesh and queued for retry"
         )
+        return TransactionStatus.BUFFERED
 
-        successes = 0
-        for auth in self.state.committee:
-            msg = Message(
-                message_id=uuid4(),
-                message_type=message.message_type,
-                sender=message.sender,
-                recipient=auth.address,
-                timestamp=time.time(),
-                payload=message.payload,
-            )
+    # ------------------------------------------------------------------
+    # Transfer response handling
+    # ------------------------------------------------------------------
 
-            if self.transport.send_message(msg, auth.address):
-                successes += 1
-            else:
-                self.logger.warning(f"Failed to send to authority {auth.name}")
-
-        if successes == 0:
-            self.logger.error("Failed to send transfer request to any authority")
-
-        self.logger.info(
-            f"Transfer request delivered to {successes}/{len(self.state.committee)} authorities"
-        )
-        return successes
-    
-    def _validate_transfer_response(self, transfer_response: TransferResponseMessage) -> bool:
+    def _validate_transfer_response(self, resp: TransferResponseMessage) -> bool:
         """Validate a transfer response received from an authority."""
-        if transfer_response.transfer_order.sender != self.state.name:
-            self.logger.error(f"Transfer {transfer_response.transfer_order.order_id} failed: sender mismatch")
+        if resp.transfer_order.sender != self.state.name:
+            self.logger.error(f"Transfer {resp.transfer_order.order_id} failed: sender mismatch")
             return False
-        
-        if transfer_response.transfer_order.sequence_number != self.state.sequence_number:
-            self.logger.error(f"Transfer {transfer_response.transfer_order.order_id} failed: sequence number mismatch")
+        if resp.transfer_order.sequence_number != self.state.sequence_number:
+            self.logger.error(f"Transfer {resp.transfer_order.order_id} failed: sequence mismatch")
             return False
         return True
-    
-    def handle_transfer_response(self, transfer_response: TransferResponseMessage) -> bool:
-        """Handle transfer response from authority."""
+
+    def _track_signature(self, resp: TransferResponseMessage) -> None:
+        """Record a signature from an authority."""
+        self.state.sent_certificates.append(resp)
+        order_id = resp.transfer_order.order_id
+        if order_id in self.transaction_queue:
+            bt = self.transaction_queue[order_id]
+            auth_name = resp.authority_signature or "unknown"
+            bt.add_signature(auth_name, resp.authority_signature or "")
+        self.logger.info(
+            f"Collected signature ({len(self.state.sent_certificates)} total) "
+            f"for order {order_id}"
+        )
+
+    def _check_quorum(self, order_id: UUID) -> bool:
+        """Check if enough signatures have been collected for an order."""
+        relevant = [
+            c for c in self.state.sent_certificates
+            if c.transfer_order.order_id == order_id
+        ]
+        return len(relevant) >= self._quorum_threshold
+
+    def _on_quorum_reached(self, order_id: UUID) -> None:
+        """Handle quorum reached: broadcast confirmation, purge from queue."""
+        self.logger.info("Quorum reached – broadcasting confirmation via mesh")
+        self.broadcast_confirmation()
+        if order_id in self.transaction_queue:
+            self.transaction_queue[order_id].status = TransactionStatus.FINALIZED
+            del self.transaction_queue[order_id]
+
+    def handle_transfer_response(self, resp: TransferResponseMessage) -> bool:
+        """Handle transfer response from authority (received via mesh relay)."""
         try:
-            if not self._validate_transfer_response(transfer_response):
+            if not self._validate_transfer_response(resp):
                 return False
-            
-            self.state.sent_certificates.append(transfer_response)
+            self._track_signature(resp)
+            if self._check_quorum(resp.transfer_order.order_id) and self.state.pending_transfer:
+                self._on_quorum_reached(resp.transfer_order.order_id)
             return True
-            
         except Exception as e:
             self.logger.error(f"Error handling transfer response: {e}")
             return False
-        
+
+    # ------------------------------------------------------------------
+    # Confirmation handling
+    # ------------------------------------------------------------------
+
     def _validate_confirmation_order(self, confirmation_order: ConfirmationOrder) -> bool:
         """Validate a confirmation order (placeholder)."""
-        return True     
-        
+        return True
+
     def handle_confirmation_order(self, confirmation_order: ConfirmationOrder) -> bool:
-        """Handle confirmation order from committee."""
+        """Handle a confirmation order received for us as the recipient."""
         try:
             transfer = confirmation_order.transfer_order
-            
             if transfer.recipient != self.state.name:
                 return False
-            
             if not self._validate_confirmation_order(confirmation_order):
                 return False
-            
+
             self.state.balance += transfer.amount
+            self.state.seen_order_ids.discard(str(transfer.order_id))
+
+            if transfer.order_id in self.transaction_queue:
+                del self.transaction_queue[transfer.order_id]
 
             self.logger.info(
-                f"Confirmation {transfer.order_id} applied – sender={transfer.sender}, amount={transfer.amount}"
+                f"Confirmation {transfer.order_id} applied – "
+                f"sender={transfer.sender}, amount={transfer.amount}"
             )
-            self.logger.info(f"Confirmation order {confirmation_order.order_id} processed")
             return True
-            
         except Exception as e:
             self.logger.error(f"Error handling confirmation order: {e}")
-            # Note: client has no performance metrics collector yet
             return False
 
     def broadcast_confirmation(self) -> None:
-        """Create and broadcast a ConfirmationOrder (internal helper)."""
+        """Create and relay a ConfirmationOrder through the mesh."""
         order = self.state.pending_transfer
-        
-        # Filter certificates to only include those for the current pending transfer
-        relevant_certs = [c for c in self.state.sent_certificates 
-                         if c.transfer_order.order_id == order.order_id]
-
-        if len(relevant_certs) < self._quorum_threshold:
-            self.logger.error(f"Insufficient certificates for {order.order_id} ({len(relevant_certs)}/{self._quorum_threshold})")
+        if not order:
+            self.logger.error("No pending transfer to confirm")
             return
-        
+
+        relevant_certs = [
+            c for c in self.state.sent_certificates
+            if c.transfer_order.order_id == order.order_id
+        ]
+        if len(relevant_certs) < self._quorum_threshold:
+            self.logger.error(
+                f"Insufficient certificates for {order.order_id} "
+                f"({len(relevant_certs)}/{self._quorum_threshold})"
+            )
+            return
+
         transfer_signatures = [c.authority_signature for c in relevant_certs]
         confirmation = ConfirmationOrder(
             order_id=order.order_id,
@@ -329,127 +358,144 @@ class Client(Station):
         )
 
         req = ConfirmationRequestMessage(confirmation_order=confirmation)
+        relay_msg = self._build_relay_message(
+            inner_type=MessageType.CONFIRMATION_REQUEST.value,
+            inner_payload=req.to_payload(),
+            order_id=str(order.order_id),
+        )
+        self._relay_to_neighbors(relay_msg)
 
-        for auth in self.state.committee:
-            msg = Message(
-                message_id=uuid4(),
-                message_type=MessageType.CONFIRMATION_REQUEST,
-                sender=self.address,
-                recipient=auth.address,
-                timestamp=time.time(),
-                payload=req.to_payload(),
-            )
-            self.transport.send_message(msg, auth.address)
-
+        # Clear local state
         self.state.pending_transfer = None
         self.state.sequence_number += 1
-        # Remove only certificates related to this specific order
-        self.state.sent_certificates = [c for c in self.state.sent_certificates 
-                                       if c.transfer_order.order_id != order.order_id]
+        self.state.sent_certificates = [
+            c for c in self.state.sent_certificates
+            if c.transfer_order.order_id != order.order_id
+        ]
         self.state.balance -= order.amount
 
+    # ------------------------------------------------------------------
+    # Message processing – mesh relay aware
+    # ------------------------------------------------------------------
+
     def _process_message(self, message: Message) -> None:
-        """Process incoming message."""
+        """Process incoming message, handling mesh relay wrapping."""
         try:
+            if message.message_type == MessageType.MESH_RELAY:
+                self._handle_mesh_relay(
+                    message,
+                    on_transfer_response=self.handle_transfer_response,
+                    on_confirmation=self.handle_confirmation_order,
+                )
+                return
+
+            # Legacy direct messages (backwards compat).
             if message.message_type == MessageType.TRANSFER_RESPONSE:
                 request = TransferResponseMessage.from_payload(message.payload)
                 self.handle_transfer_response(request)
-
-            if message.message_type == MessageType.CONFIRMATION_REQUEST:
+            elif message.message_type == MessageType.CONFIRMATION_REQUEST:
                 request = ConfirmationRequestMessage.from_payload(message.payload)
                 self.handle_confirmation_order(request.confirmation_order)
-                
+
         except Exception as e:
             self.logger.error(f"Error processing message: {e}")
 
+    # ------------------------------------------------------------------
+    # Background loops
+    # ------------------------------------------------------------------
+
     def _message_handler_loop(self) -> None:
-        """Background thread loop that polls the transport for incoming messages."""
+        """Background thread that polls the transport for incoming messages."""
         while self._running:
             try:
                 message = self.transport.receive_message(timeout=1.0)
                 if message:
                     self._process_message(message)
-            except Exception as exc:  # pragma: no cover
+            except Exception as exc:
                 if hasattr(self, "logger"):
                     self.logger.error(f"Error in message handler loop: {exc}")
                 time.sleep(0.2)
 
     def _retry_loop(self) -> None:
-        """Background thread that retries buffered transactions every 5 seconds."""
+        """Background thread that re-relays queued transactions periodically."""
         while self._running:
             time.sleep(self._retry_interval)
-            
-            if not self._buffered_transactions:
-                continue
-                
-            self.logger.info(
-                f"Retry loop: {len(self._buffered_transactions)} buffered transactions"
-            )
-            
-            # Process each buffered transaction
-            completed_txs: List[UUID] = []
-            
-            for tx_id, buffered_tx in self._buffered_transactions.items():
-                if buffered_tx.status != TransactionStatus.BUFFERED:
-                    continue
-                    
-                # Retry broadcasting
-                buffered_tx.retry_count += 1
-                buffered_tx.last_retry = time.time()
-                
-                self.logger.info(
-                    f"Retrying tx {tx_id} (attempt {buffered_tx.retry_count})"
-                )
-                
-                # Create new request message
-                request = TransferRequestMessage(transfer_order=buffered_tx.order)
-                message = Message(
-                    message_id=uuid4(),
-                    message_type=MessageType.TRANSFER_REQUEST,
-                    sender=self.state.address,
-                    recipient=None,
-                    timestamp=time.time(),
-                    payload=request.to_payload(),
-                )
-                
-                # Re-broadcast
-                signatures = self._broadcast_and_collect_signatures(
-                    buffered_tx.order, message
-                )
-                
-                # Check quorum for this specific transaction
-                relevant_votes = [c for c in self.state.sent_certificates 
-                                if c.transfer_order.order_id == tx_id]
-                if len(relevant_votes) >= self._quorum_threshold:
-                    self.logger.info(
-                        f"Transaction {tx_id} reached quorum after retry!"
-                    )
-                    buffered_tx.status = TransactionStatus.FINALIZED
-                    completed_txs.append(tx_id)
-                    
-                    # Complete the transaction
-                    self._finalize_buffered_transaction(buffered_tx)
-            
-            # Remove completed transactions
-            for tx_id in completed_txs:
-                del self._buffered_transactions[tx_id]
 
-    def _finalize_buffered_transaction(self, buffered_tx: BufferedTransaction) -> None:
+            if not self.transaction_queue:
+                continue
+
+            self.logger.info(
+                f"Retry loop: {len(self.transaction_queue)} queued transactions"
+            )
+
+            completed: List[UUID] = []
+
+            for tx_id, btx in list(self.transaction_queue.items()):
+                if btx.status != TransactionStatus.BUFFERED:
+                    continue
+
+                # Purge relayed messages older than 2 minutes
+                if btx.is_relay and (time.time() - btx.created_at > 120):
+                    completed.append(tx_id)
+                    continue
+
+                btx.retry_count += 1
+                btx.last_retry = time.time()
+                self.logger.info(
+                    f"Retrying tx {tx_id} via mesh relay (attempt {btx.retry_count})"
+                )
+
+                self.state.seen_order_ids.discard(str(tx_id))
+                self.state.seen_order_ids.add(str(tx_id))
+
+                request = TransferRequestMessage(transfer_order=btx.order)
+
+                if btx.is_relay and btx.relay_metadata:
+                    relay_msg = self._build_relay_message(
+                        inner_type=MessageType.TRANSFER_REQUEST.value,
+                        inner_payload=request.to_payload(),
+                        order_id=str(tx_id),
+                        sender_id=btx.relay_metadata["original_sender_id"],
+                        origin_address=btx.relay_metadata["origin_address"],
+                        ttl=btx.relay_metadata.get("ttl", DEFAULT_RELAY_TTL),
+                        hop_path=btx.relay_metadata.get("hop_path", [self.name]),
+                    )
+                else:
+                    relay_msg = self._build_relay_message(
+                        inner_type=MessageType.TRANSFER_REQUEST.value,
+                        inner_payload=request.to_payload(),
+                        order_id=str(tx_id),
+                    )
+                self._relay_to_neighbors(relay_msg)
+
+                # Check for quorum (own TXs only)
+                if not btx.is_relay and self._check_quorum(tx_id):
+                    self.logger.info(f"Transaction {tx_id} reached quorum after retry!")
+                    btx.status = TransactionStatus.FINALIZED
+                    completed.append(tx_id)
+                    self._finalize_buffered_transaction(btx)
+
+            for tx_id in completed:
+                self.transaction_queue.pop(tx_id, None)
+
+    def _finalize_buffered_transaction(self, btx: BufferedTransaction) -> None:
         """Complete a buffered transaction that has reached quorum."""
-        self.logger.info(f"Finalizing transaction {buffered_tx.order.order_id}")
-        
-        # Broadcast confirmation
-        self.state.pending_transfer = buffered_tx.order
+        self.logger.info(f"Finalizing transaction {btx.order.order_id}")
+        self.state.pending_transfer = btx.order
         self.broadcast_confirmation()
 
+    # ------------------------------------------------------------------
+    # Inspection helpers
+    # ------------------------------------------------------------------
+
     def get_buffered_transactions(self) -> Dict[UUID, BufferedTransaction]:
-        """Return dict of buffered transactions for inspection."""
-        return self._buffered_transactions.copy()
+        """Return dict of queued transactions for inspection."""
+        return self.transaction_queue.copy()
 
     def get_transaction_status(self, order_id: UUID) -> Optional[TransactionStatus]:
         """Get the status of a transaction by its order ID."""
-        if order_id in self._buffered_transactions:
-            return self._buffered_transactions[order_id].status
+        if order_id in self.transaction_queue:
+            return self.transaction_queue[order_id].status
         return None
 
 

@@ -107,13 +107,13 @@ def create_mesh_network_with_internet(
             ip=f"10.0.0.{10 + i}/8",
             port=8000 + i,
             position=f'{40 + (i * 15)},100,0',
-            range=20,
-            txpower=20
+            range=15,
+            txpower=10
         )
         authorities.append(auth)
     
     # Create mobile clients as mesh points
-    clients: List[Client] = []
+    clients: List[Client] = [] 
     for i in range(1, num_clients + 1):
         name = f"user{i}"
         client = net.addStation(
@@ -122,8 +122,8 @@ def create_mesh_network_with_internet(
             ip=f"10.0.0.{20 + i}/8",
             port=9000 + i,
             min_x=0, max_x=200, min_y=0, max_y=150, min_v=1, max_v=3,    
-            range=20,
-            txpower=20,
+            range=15,
+            txpower=10,
         )
         clients.append(client)
     

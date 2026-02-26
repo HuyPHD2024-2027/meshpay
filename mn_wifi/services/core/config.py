@@ -61,6 +61,12 @@ class Settings():
     mesh_authority_port: int = int(os.getenv("MESH_AUTHORITY_PORT", "8080"))
     mesh_scan_network: str = os.getenv("MESH_SCAN_NETWORK", "10.0.0.0/8")
     
+    # Mesh Discovery & Relay Configuration
+    default_relay_ttl: int = int(os.getenv("DEFAULT_RELAY_TTL", "10"))
+    discovery_port: int = int(os.getenv("DISCOVERY_PORT", "9999"))
+    discovery_interval: float = float(os.getenv("DISCOVERY_INTERVAL", "5.0")) # Faster updates
+    neighbor_timeout: float = float(os.getenv("NEIGHBOR_TIMEOUT", "5.0"))   # Quick pruning
+    
     # WebSocket Configuration
     ws_enable: bool = os.getenv("WS_ENABLE", True)
     ws_path: str = os.getenv("WS_PATH", "/ws")
@@ -176,7 +182,13 @@ SUPPORTED_TOKENS = {
         'name': 'USD Coin',
         'is_native': False,
     },
-} 
+}
+
+# Mesh Discovery & Relay Constants
+DEFAULT_RELAY_TTL = settings.default_relay_ttl
+DISCOVERY_PORT = settings.discovery_port
+DISCOVERY_INTERVAL = settings.discovery_interval
+NEIGHBOR_TIMEOUT = settings.neighbor_timeout
 
 def get_settings():
     return settings
