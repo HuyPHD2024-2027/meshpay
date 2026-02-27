@@ -11,7 +11,6 @@ from uuid import UUID, uuid4
 
 from meshpay.types import Address, ConfirmationOrder, TransferOrder
 
-
 class MessageType(Enum):
     """Types of messages in the MeshPay WiFi protocol."""
     
@@ -24,6 +23,11 @@ class MessageType(Enum):
     PEER_DISCOVERY = "peer_discovery"
     HEARTBEAT = "heartbeat"
     ERROR = "error"
+    PREENDORSEMENT = "preendorsement"
+    CERTIFICATE = "certificate"
+    ANCHOR_COMMITMENT = "anchor_commitment"
+    RECONCILE_REQUEST = "reconcile_request"
+    RECONCILE_RESPONSE = "reconcile_response"
 
 
 @dataclass
@@ -199,5 +203,137 @@ class PeerDiscoveryMessage:
             network_metrics=payload.get('network_metrics')
         )
 
+@dataclass
+class PreendorsementMessage:
+    """Authority preendorsement (prevote) for a proposal/transfer hash."""
+
+    order_id: UUID
+    authority: AuthorityName
+    proposal_hash: str
+    signature: str
+
+    def to_payload(self) -> Dict[str, Any]:
+        """Convert to message payload."""
+        return {
+            "order_id": str(self.order_id),
+            "authority": self.authority,
+            "proposal_hash": self.proposal_hash,
+            "signature": self.signature,
+        }
+
+    @classmethod
+    def from_payload(cls, payload: Dict[str, Any]) -> "PreendorsementMessage":
+        """Create from message payload."""
+        return cls(
+            order_id=UUID(payload["order_id"]),
+            authority=payload["authority"],
+            proposal_hash=payload["proposal_hash"],
+            signature=payload["signature"],
+        )
 
 
+@dataclass
+class CertificateMessage:
+    """Commit certificate formed from ≥2f+1 precommits."""
+
+    order_id: UUID
+    proposal_hash: str
+    precommits: Dict[AuthorityName, str]
+    threshold: int
+
+    def to_payload(self) -> Dict[str, Any]:
+        """Convert to message payload."""
+        return {
+            "order_id": str(self.order_id),
+            "proposal_hash": self.proposal_hash,
+            "precommits": self.precommits,
+            "threshold": self.threshold,
+        }
+
+    @classmethod
+    def from_payload(cls, payload: Dict[str, Any]) -> "CertificateMessage":
+        """Create from message payload."""
+        return cls(
+            order_id=UUID(payload["order_id"]),
+            proposal_hash=payload["proposal_hash"],
+            precommits=payload["precommits"],
+            threshold=int(payload["threshold"]),
+        )
+
+
+@dataclass
+class AnchorCommitmentMessage:
+    """Batch anchor commitment for L1 posting."""
+
+    shard_id: str
+    height: int
+    state_root: str
+    signatures: Dict[AuthorityName, str]
+
+    def to_payload(self) -> Dict[str, Any]:
+        """Convert to message payload."""
+        return {
+            "shard_id": self.shard_id,
+            "height": self.height,
+            "state_root": self.state_root,
+            "signatures": self.signatures,
+        }
+
+    @classmethod
+    def from_payload(cls, payload: Dict[str, Any]) -> "AnchorCommitmentMessage":
+        """Create from message payload."""
+        return cls(
+            shard_id=payload["shard_id"],
+            height=int(payload["height"]),
+            state_root=payload["state_root"],
+            signatures=payload["signatures"],
+        )
+
+
+@dataclass
+class ReconcileRequestMessage:
+    """Request missing certificates/blocks for a shard."""
+
+    shard_id: str
+    from_height: int
+    to_height: Optional[int] = None
+
+    def to_payload(self) -> Dict[str, Any]:
+        """Convert to message payload."""
+        return {
+            "shard_id": self.shard_id,
+            "from_height": self.from_height,
+            "to_height": self.to_height,
+        }
+
+    @classmethod
+    def from_payload(cls, payload: Dict[str, Any]) -> "ReconcileRequestMessage":
+        """Create from message payload."""
+        return cls(
+            shard_id=payload["shard_id"],
+            from_height=int(payload["from_height"]),
+            to_height=payload.get("to_height"),
+        )
+
+
+@dataclass
+class ReconcileResponseMessage:
+    """Return a sequence of committed certificates for reconciliation."""
+
+    shard_id: str
+    certificates: List[Dict[str, Any]]
+
+    def to_payload(self) -> Dict[str, Any]:
+        """Convert to message payload."""
+        return {
+            "shard_id": self.shard_id,
+            "certificates": self.certificates,
+        }
+
+    @classmethod
+    def from_payload(cls, payload: Dict[str, Any]) -> "ReconcileResponseMessage":
+        """Create from message payload."""
+        return cls(
+            shard_id=payload["shard_id"],
+            certificates=payload["certificates"],
+        )
