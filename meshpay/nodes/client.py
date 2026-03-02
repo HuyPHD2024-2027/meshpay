@@ -180,7 +180,7 @@ class Client(MeshMixin, Station):
         )
         request = TransferRequestMessage(transfer_order=order)
         self.state.pending_transfer = order
-        self.state.seen_order_ids.add(str(order.order_id))
+        self.state.seen_order_ids.add(f"{order.order_id}:req")
 
         relay_msg = self._build_relay_message(
             inner_type=MessageType.TRANSFER_REQUEST.value,
@@ -244,7 +244,8 @@ class Client(MeshMixin, Station):
                 return False
 
             self.state.balance += transfer.amount
-            self.state.seen_order_ids.discard(str(transfer.order_id))
+            self.state.seen_order_ids.discard(f"{transfer.order_id}:req")
+            self.state.seen_order_ids.discard(f"{transfer.order_id}:conf")
 
             self.logger.info(
                 f"Confirmation {transfer.order_id} applied – "

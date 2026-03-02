@@ -221,7 +221,8 @@ class Client(MeshMixin, Station):
         )
         request = TransferRequestMessage(transfer_order=order)
         self.state.pending_transfer = order
-        self.state.seen_order_ids.add(str(order.order_id))
+        # Mark own request as seen (dedup key: order_id:req)
+        self.state.seen_order_ids.add(f"{order.order_id}:req")
 
         relay_msg = self._build_relay_message(
             inner_type=MessageType.TRANSFER_REQUEST.value,
@@ -248,46 +249,85 @@ class Client(MeshMixin, Station):
 
     def _validate_transfer_response(self, resp: TransferResponseMessage) -> bool:
         """Validate a transfer response received from an authority."""
-        if resp.transfer_order.sender != self.state.name:
+        if str(resp.transfer_order.sender) != str(self.state.name):
             self.logger.error(f"Transfer {resp.transfer_order.order_id} failed: sender mismatch")
             return False
-        if resp.transfer_order.sequence_number != self.state.sequence_number:
-            self.logger.error(f"Transfer {resp.transfer_order.order_id} failed: sequence mismatch")
+        if int(resp.transfer_order.sequence_number) != int(self.state.sequence_number):
+            self.logger.error(
+                f"Transfer {resp.transfer_order.order_id} failed: sequence mismatch "
+                f"(got {resp.transfer_order.sequence_number!r}, expected {self.state.sequence_number!r})"
+            )
             return False
         return True
 
     def _track_signature(self, resp: TransferResponseMessage) -> None:
-        """Record a signature from an authority."""
+        """Record a signature from an authority (deduplicated per authority)."""
+        auth_name = resp.authority_signature or "unknown"
+        order_id_str = str(resp.transfer_order.order_id)
+
+        # Deduplicate: only track one response per authority per order
+        already = any(
+            str(c.transfer_order.order_id) == order_id_str
+            and c.authority_signature == auth_name
+            for c in self.state.sent_certificates
+        )
+        if already:
+            self.logger.debug(f"Already have sig from {auth_name} for {order_id_str}")
+            return
+
         self.state.sent_certificates.append(resp)
-        order_id = resp.transfer_order.order_id
-        if order_id in self.transaction_queue:
-            bt = self.transaction_queue[order_id]
-            auth_name = resp.authority_signature or "unknown"
-            bt.add_signature(auth_name, resp.authority_signature or "")
+        
+        # Ensure we look up using UUID if the dictionary keys are UUIDs
+        try:
+            tx_uuid = UUID(str(resp.transfer_order.order_id))
+        except Exception:
+            tx_uuid = resp.transfer_order.order_id
+
+        if tx_uuid in self.transaction_queue:
+            bt = self.transaction_queue[tx_uuid]
+            bt.add_signature(auth_name, auth_name)
+            
         self.logger.info(
-            f"Collected signature ({len(self.state.sent_certificates)} total) "
-            f"for order {order_id}"
+            f"Collected signature from {auth_name} "
+            f"({len(self.state.sent_certificates)} total) for order {order_id_str}"
         )
 
-    def _check_quorum(self, order_id: UUID) -> bool:
+    def _check_quorum(self, order_id) -> bool:
         """Check if enough signatures have been collected for an order."""
+        oid = str(order_id)
         relevant = [
             c for c in self.state.sent_certificates
-            if c.transfer_order.order_id == order_id
+            if str(c.transfer_order.order_id) == oid
         ]
         return len(relevant) >= self._quorum_threshold
 
-    def _on_quorum_reached(self, order_id: UUID) -> None:
+    def _on_quorum_reached(self, order_id) -> None:
         """Handle quorum reached: broadcast confirmation, purge from queue."""
         self.logger.info("Quorum reached – broadcasting confirmation via mesh")
         self.broadcast_confirmation()
-        if order_id in self.transaction_queue:
-            self.transaction_queue[order_id].status = TransactionStatus.FINALIZED
-            del self.transaction_queue[order_id]
+        
+        # Try testing str, direct object, and cast to UUID
+        keys_to_test = [order_id, str(order_id)]
+        try:
+            keys_to_test.append(UUID(str(order_id)))
+        except Exception:
+            pass
+
+        for key in keys_to_test:
+            if key in self.transaction_queue:
+                self.transaction_queue[key].status = TransactionStatus.FINALIZED
+                del self.transaction_queue[key]
+                break
 
     def handle_transfer_response(self, resp: TransferResponseMessage) -> bool:
         """Handle transfer response from authority (received via mesh relay)."""
         try:
+            if not resp.success:
+                self.logger.warning(
+                    f"Authority rejected transfer {resp.transfer_order.order_id}: "
+                    f"{resp.error_message}"
+                )
+                return False
             if not self._validate_transfer_response(resp):
                 return False
             self._track_signature(resp)
@@ -316,7 +356,8 @@ class Client(MeshMixin, Station):
                 return False
 
             self.state.balance += transfer.amount
-            self.state.seen_order_ids.discard(str(transfer.order_id))
+            self.state.seen_order_ids.discard(f"{transfer.order_id}:req")
+            self.state.seen_order_ids.discard(f"{transfer.order_id}:conf")
 
             if transfer.order_id in self.transaction_queue:
                 del self.transaction_queue[transfer.order_id]
@@ -339,7 +380,7 @@ class Client(MeshMixin, Station):
 
         relevant_certs = [
             c for c in self.state.sent_certificates
-            if c.transfer_order.order_id == order.order_id
+            if str(c.transfer_order.order_id) == str(order.order_id)
         ]
         if len(relevant_certs) < self._quorum_threshold:
             self.logger.error(
@@ -370,7 +411,7 @@ class Client(MeshMixin, Station):
         self.state.sequence_number += 1
         self.state.sent_certificates = [
             c for c in self.state.sent_certificates
-            if c.transfer_order.order_id != order.order_id
+            if str(c.transfer_order.order_id) != str(order.order_id)
         ]
         self.state.balance -= order.amount
 
@@ -439,14 +480,24 @@ class Client(MeshMixin, Station):
                     completed.append(tx_id)
                     continue
 
+                # ── Check quorum FIRST — don't retry if we already have it ──
+                if not btx.is_relay and self._check_quorum(tx_id):
+                    self.logger.info(f"Transaction {tx_id} reached quorum!")
+                    btx.status = TransactionStatus.FINALIZED
+                    completed.append(tx_id)
+                    self._finalize_buffered_transaction(btx)
+                    continue
+
                 btx.retry_count += 1
                 btx.last_retry = time.time()
                 self.logger.info(
                     f"Retrying tx {tx_id} via mesh relay (attempt {btx.retry_count})"
                 )
 
-                self.state.seen_order_ids.discard(str(tx_id))
-                self.state.seen_order_ids.add(str(tx_id))
+                # Clear OUR request dedup so we re-send; authorities already
+                # processed it and won't re-process, but new neighbours
+                # (from mobility) might relay it to unvisited authorities.
+                self.state.seen_order_ids.discard(f"{tx_id}:req")
 
                 request = TransferRequestMessage(transfer_order=btx.order)
 
@@ -467,13 +518,6 @@ class Client(MeshMixin, Station):
                         order_id=str(tx_id),
                     )
                 self._relay_to_neighbors(relay_msg)
-
-                # Check for quorum (own TXs only)
-                if not btx.is_relay and self._check_quorum(tx_id):
-                    self.logger.info(f"Transaction {tx_id} reached quorum after retry!")
-                    btx.status = TransactionStatus.FINALIZED
-                    completed.append(tx_id)
-                    self._finalize_buffered_transaction(btx)
 
             for tx_id in completed:
                 self.transaction_queue.pop(tx_id, None)

@@ -421,35 +421,56 @@ class WiFiAuthority(MeshMixin, Station):
     def _validate_transfer_order(self, transfer_order: TransferOrder) -> bool:
         """Validate a transfer order."""
         if transfer_order.amount <= 0:
+            self.logger.debug(f"Validation failed: amount <= 0 ({transfer_order.amount})")
             return False
         if transfer_order.sender == transfer_order.recipient:
+            self.logger.debug("Validation failed: sender == recipient")
             return False
         if not transfer_order.sender or not transfer_order.recipient:
+            self.logger.debug("Validation failed: empty sender or recipient")
             return False
 
         # Sender must exist in local state
         sender_account = self.state.accounts.get(transfer_order.sender)
         if sender_account is None:
+            self.logger.debug(
+                f"Validation failed: sender '{transfer_order.sender}' not in accounts "
+                f"(known: {list(self.state.accounts.keys())})"
+            )
             return False
 
         # Sequence number must be monotonically increasing
         try:
             if int(transfer_order.sequence_number) < int(sender_account.sequence_number):
+                self.logger.debug(
+                    f"Validation failed: seq {transfer_order.sequence_number} < "
+                    f"account seq {sender_account.sequence_number}"
+                )
                 return False
         except Exception:
+            self.logger.debug("Validation failed: sequence_number conversion error")
             return False
 
         # Sender must have a tracked balance for the token
         token_balance = sender_account.balances.get(transfer_order.token_address)
         if token_balance is None:
+            self.logger.debug(
+                f"Validation failed: token '{transfer_order.token_address}' not in "
+                f"sender balances (known: {list(sender_account.balances.keys())})"
+            )
             return False
 
         try:
             meshpay_balance = float(token_balance.meshpay_balance)
         except Exception:
+            self.logger.debug("Validation failed: meshpay_balance conversion error")
             return False
 
         if meshpay_balance < float(transfer_order.amount):
+            self.logger.debug(
+                f"Validation failed: insufficient balance "
+                f"({meshpay_balance} < {transfer_order.amount})"
+            )
             return False
         return True
 
@@ -516,15 +537,37 @@ class WiFiAuthority(MeshMixin, Station):
 
         Authority override: processes TRANSFER_REQUESTs locally and relays
         signed responses back through the mesh.
+
+        Dedup strategy (mirrors MeshMixin):
+          - TRANSFER_REQUEST  → ``order_id:req``
+          - TRANSFER_RESPONSE → ``order_id:resp:authority``
+          - CONFIRMATION_REQ  → ``order_id:conf``
         """
         relay = MeshRelayMessage.from_payload(message.payload)
         order_key = relay.order_id
 
-        # ── Deduplication ──
-        if order_key in self.state.seen_order_ids:
+        # ── Build dedup key ──
+        if relay.inner_message_type == MessageType.TRANSFER_RESPONSE.value:
+            auth_id = relay.hop_path[0] if relay.hop_path else "unknown"
+            dedup_key = f"{order_key}:resp:{auth_id}"
+        elif relay.inner_message_type == MessageType.TRANSFER_REQUEST.value:
+            dedup_key = f"{order_key}:req"
+        elif relay.inner_message_type == MessageType.CONFIRMATION_REQUEST.value:
+            dedup_key = f"{order_key}:conf"
+        else:
+            dedup_key = f"{order_key}:{relay.inner_message_type}"
+
+        if dedup_key in self.state.seen_order_ids:
             self.logger.debug(f"Duplicate relay {order_key} – skipping")
             return
-        self.state.seen_order_ids.add(order_key)
+        self.state.seen_order_ids.add(dedup_key)
+
+        # ── Drop if order already confirmed ──
+        conf_key = f"{order_key}:conf"
+        if (relay.inner_message_type != MessageType.CONFIRMATION_REQUEST.value
+                and conf_key in self.state.seen_order_ids):
+            self.logger.debug(f"Order {order_key} already confirmed – dropping")
+            return
 
         # ── TRANSFER_REQUEST: process and relay response back ──
         if relay.inner_message_type == MessageType.TRANSFER_REQUEST.value:

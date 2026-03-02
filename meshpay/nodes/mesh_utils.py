@@ -249,10 +249,15 @@ class MeshMixin:
     ) -> None:
         """Unwrap and process a mesh relay message.
 
+        Dedup strategy:
+          - TRANSFER_REQUEST  → key ``order_id:req``   (one per order)
+          - TRANSFER_RESPONSE → key ``order_id:resp:X`` (one per authority X)
+          - CONFIRMATION_REQ  → key ``order_id:conf``   (one per order)
+
         Callbacks:
-          - on_transfer_response(resp): called when a TRANSFER_RESPONSE is for us
-          - on_transfer_request(relay): called when a TRANSFER_REQUEST arrives (authority)
-          - on_confirmation(order): called when a CONFIRMATION_REQUEST is for us
+          - on_transfer_response(resp): TRANSFER_RESPONSE destined for us
+          - on_transfer_request(relay): TRANSFER_REQUEST (authority uses this)
+          - on_confirmation(order):     CONFIRMATION_REQUEST for us
         """
         from meshpay.messages import (
             ConfirmationRequestMessage,
@@ -262,16 +267,33 @@ class MeshMixin:
         relay = MeshRelayMessage.from_payload(message.payload)
         order_key = relay.order_id
 
-        # ── Deduplication ──
-        if order_key in self.state.seen_order_ids:
-            if not (
-                relay.inner_message_type == MessageType.TRANSFER_RESPONSE.value
-                and relay.original_sender_id == self.name
-            ):
-                self.logger.debug(f"Duplicate relay for order {order_key} – skipping")
-                return
+        # ── Build dedup key ──────────────────────────────────────────
+        if relay.inner_message_type == MessageType.TRANSFER_RESPONSE.value:
+            # Each authority's response is unique — use the first hop
+            # (the authority that created this response) as differentiator.
+            auth_id = relay.hop_path[0] if relay.hop_path else "unknown"
+            dedup_key = f"{order_key}:resp:{auth_id}"
+        elif relay.inner_message_type == MessageType.TRANSFER_REQUEST.value:
+            dedup_key = f"{order_key}:req"
+        elif relay.inner_message_type == MessageType.CONFIRMATION_REQUEST.value:
+            dedup_key = f"{order_key}:conf"
         else:
-            self.state.seen_order_ids.add(order_key)
+            dedup_key = f"{order_key}:{relay.inner_message_type}"
+
+        # Per-authority response keys (order_id:resp:auth_id) naturally
+        # allow one response from each authority. No blanket bypass needed.
+        if dedup_key in self.state.seen_order_ids:
+            return
+        self.state.seen_order_ids.add(dedup_key)
+
+        # ── If we already saw a CONFIRMATION for this order, drop everything ──
+        conf_key = f"{order_key}:conf"
+        if (relay.inner_message_type != MessageType.CONFIRMATION_REQUEST.value
+                and conf_key in self.state.seen_order_ids):
+            self.logger.debug(
+                f"Order {order_key} already confirmed – dropping relay"
+            )
+            return
 
         consumed = False
 
@@ -310,3 +332,4 @@ class MeshMixin:
             self._relay_to_neighbors(next_relay)
         else:
             self.logger.debug(f"Relay TTL expired for order {order_key}")
+
