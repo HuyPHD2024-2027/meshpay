@@ -97,7 +97,7 @@ class ConfirmationOrder:
 
 
 @dataclass
-class BufferedTransaction:
+class BufferedTransfer:
     """Transaction buffered on client awaiting quorum.
 
     When a client broadcasts a transfer and doesn't receive enough
@@ -136,3 +136,30 @@ class BufferedTransaction:
         if authority_name not in self.signatures_received:
             self.signatures_received[authority_name] = signature
         return self.has_quorum
+
+
+@dataclass
+class MessageBufferItem:
+    """An item stored in the DTN message buffer for Store-Carry-Forward routing."""
+    
+    message_id: str
+    message_type: str
+    payload: Dict[str, Any]
+    sender_id: str
+    ttl: int
+    created_at: float = 0.0
+    expires_at: float = 0.0
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    
+    def __post_init__(self) -> None:
+        """Initialize timestamps if not set."""
+        if self.created_at == 0.0:
+            self.created_at = time.time()
+        # Default expiration: 24 hours if not explicitly set
+        if self.expires_at == 0.0:
+            self.expires_at = self.created_at + (24 * 3600)
+    
+    @property
+    def is_expired(self) -> bool:
+        """Check if the buffered message has expired based on TTL or time."""
+        return time.time() > self.expires_at or self.ttl <= 0

@@ -257,14 +257,20 @@ if __name__ == '__main__':
         script_path = f"/tmp/send_{uuid.uuid4().hex}.py"
 
         try:
-            # 1. Dump script inside the node's filesystem.
-            self.node.cmd(f"cat > {script_path} << 'PY'\n{client_code}\nPY")
-
-            # 2. Execute script from within the namespace.
-            output = self.node.cmd(f"python3 {script_path} | cat").strip()
-
-            # 3. Clean-up temporary file.
-            self.node.cmd(f"rm -f {script_path}")
+            # Mininet node.cmd is not thread-safe. Ensure we serialize calls to it.
+            if not hasattr(self.node, '_cmd_lock'):
+                import threading
+                self.node._cmd_lock = threading.Lock()
+                
+            with self.node._cmd_lock:
+                # 1. Dump script inside the node's filesystem.
+                self.node.cmd(f"cat > {script_path} << 'PY'\n{client_code}\nPY")
+    
+                # 2. Execute script from within the namespace.
+                output = self.node.cmd(f"python3 {script_path} | cat").strip()
+    
+                # 3. Clean-up temporary file.
+                self.node.cmd(f"rm -f {script_path}")
 
             if "SUCCESS" in output:
                 return True
@@ -273,7 +279,13 @@ if __name__ == '__main__':
                 f"Send failed to {target.ip_address}:{target.port}: {output or '<no output>'}")
             return False
         except Exception as exc:  # pragma: no cover
-            self.node.logger.error(f"Failed to send message in namespace: {exc}")
+            exc_str = str(exc)
+            if "I/O" in exc_str or "closed file" in exc_str or not getattr(self, "running", True):
+                self.node.logger.debug(f"Failed to send message in namespace (shutdown?): {exc}")
+            else:
+                import traceback
+                tb = traceback.format_exc()
+                self.node.logger.error(f"Failed to send message in namespace: {repr(exc)}\n{tb}")
             return False
     
     def receive_message(self, timeout: float = 1.0) -> Optional[Message]:

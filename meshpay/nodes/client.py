@@ -41,6 +41,7 @@ from meshpay.transport.wifiDirect import WiFiDirectTransport
 from meshpay.logger.clientLogger import ClientLogger
 
 from meshpay.nodes.mesh_utils import MeshMixin
+from mn_wifi.metrics import MetricsCollector
 
 
 class Client(MeshMixin, Station):
@@ -113,6 +114,7 @@ class Client(MeshMixin, Station):
                 raise ValueError(f"Unsupported transport kind: {transport_kind}")
 
         self.logger = ClientLogger(name)
+        self.performance_metrics = MetricsCollector()
         self._running = False
         self._message_handler_thread: Optional[threading.Thread] = None
 
@@ -182,12 +184,22 @@ class Client(MeshMixin, Station):
         self.state.pending_transfer = order
         self.state.seen_order_ids.add(f"{order.order_id}:req")
 
-        relay_msg = self._build_relay_message(
-            inner_type=MessageType.TRANSFER_REQUEST.value,
-            inner_payload=request.to_payload(),
-            order_id=str(order.order_id),
-        )
-        return self._relay_to_neighbors(relay_msg) > 0
+        # Buffer for epidemic spread
+        from meshpay.types.transaction import MessageBufferItem
+        from mn_wifi.services.core.config import DEFAULT_RELAY_TTL
+        msg_id = str(order.order_id)
+        if msg_id not in self.message_buffer:
+            self.message_buffer[msg_id] = MessageBufferItem(
+                message_id=msg_id,
+                message_type=MessageType.TRANSFER_REQUEST.value,
+                payload=request.to_payload(),
+                sender_id=self.name,
+                ttl=DEFAULT_RELAY_TTL,
+            )
+            self.routing_protocol.on_message_added_to_buffer(msg_id, self.message_buffer)
+        
+        self.performance_metrics.record_transaction()
+        return True
 
     # ------------------------------------------------------------------
     # Transfer response handling
@@ -224,6 +236,7 @@ class Client(MeshMixin, Station):
             return True
         except Exception as e:
             self.logger.error(f"Error handling transfer response: {e}")
+            self.performance_metrics.record_error()
             return False
 
     # ------------------------------------------------------------------
@@ -254,6 +267,7 @@ class Client(MeshMixin, Station):
             return True
         except Exception as e:
             self.logger.error(f"Error handling confirmation order: {e}")
+            self.performance_metrics.record_error()
             return False
 
     def broadcast_confirmation(self) -> None:
@@ -280,12 +294,20 @@ class Client(MeshMixin, Station):
         )
 
         req = ConfirmationRequestMessage(confirmation_order=confirmation)
-        relay_msg = self._build_relay_message(
-            inner_type=MessageType.CONFIRMATION_REQUEST.value,
-            inner_payload=req.to_payload(),
-            order_id=str(order.order_id),
-        )
-        self._relay_to_neighbors(relay_msg)
+
+        # Buffer for epidemic spread
+        from meshpay.types.transaction import MessageBufferItem
+        from mn_wifi.services.core.config import DEFAULT_RELAY_TTL
+        conf_msg_id = f"{order.order_id}:conf"
+        if conf_msg_id not in self.message_buffer:
+            self.message_buffer[conf_msg_id] = MessageBufferItem(
+                message_id=conf_msg_id,
+                message_type=MessageType.CONFIRMATION_REQUEST.value,
+                payload=req.to_payload(),
+                sender_id=self.name,
+                ttl=DEFAULT_RELAY_TTL,
+            )
+            self.routing_protocol.on_message_added_to_buffer(conf_msg_id, self.message_buffer)
 
         self.state.pending_transfer = None
         self.state.sequence_number += 1
@@ -299,14 +321,6 @@ class Client(MeshMixin, Station):
     def _process_message(self, message: Message) -> None:
         """Process incoming message, handling mesh relay wrapping."""
         try:
-            if message.message_type == MessageType.MESH_RELAY:
-                self._handle_mesh_relay(
-                    message,
-                    on_transfer_response=self.handle_transfer_response,
-                    on_confirmation=self.handle_confirmation_order,
-                )
-                return
-
             # Legacy direct messages (backwards compat).
             if message.message_type == MessageType.TRANSFER_RESPONSE:
                 request = TransferResponseMessage.from_payload(message.payload)
@@ -314,6 +328,8 @@ class Client(MeshMixin, Station):
             elif message.message_type == MessageType.CONFIRMATION_REQUEST:
                 request = ConfirmationRequestMessage.from_payload(message.payload)
                 self.handle_confirmation_order(request.confirmation_order)
+            elif message.message_type == MessageType.ROUTING_MESSAGE:
+                self._handle_routing_message(message)
 
         except Exception as e:
             self.logger.error(f"Error processing message: {e}")
@@ -333,6 +349,17 @@ class Client(MeshMixin, Station):
                 if hasattr(self, "logger"):
                     self.logger.error(f"Error in message handler loop: {exc}")
                 time.sleep(0.2)
+
+    def on_dtn_bundle_received(self, item) -> None:
+        """Client application hook for DTN bundles."""
+        from meshpay.messages import MessageType
+
+        if item.message_type == MessageType.TRANSFER_RESPONSE.value:
+            resp = TransferResponseMessage.from_payload(item.payload)
+            self.handle_transfer_response(resp)
+        elif item.message_type == MessageType.CONFIRMATION_REQUEST.value:
+            req = ConfirmationRequestMessage.from_payload(item.payload)
+            self.handle_confirmation_order(req.confirmation_order)
 
 
 __all__ = ["Client"]

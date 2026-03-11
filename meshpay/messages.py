@@ -24,6 +24,7 @@ class MessageType(Enum):
     PEER_DISCOVERY = "peer_discovery"
     HEARTBEAT = "heartbeat"
     MESH_RELAY = "mesh_relay"
+    ROUTING_MESSAGE = "routing_message"
     ERROR = "error"
 
 
@@ -209,13 +210,15 @@ class PeerDiscoveryMessage:
     node_info: Address
     service_capabilities: List[str]
     network_metrics: Optional[Dict[str, float]] = None
+    position: Optional[Tuple[float, float, float]] = None
     
     def to_payload(self) -> Dict[str, Any]:
         """Convert to message payload."""
         data = {
             'node_info': asdict(self.node_info),
             'service_capabilities': self.service_capabilities,
-            'network_metrics': self.network_metrics
+            'network_metrics': self.network_metrics,
+            'position': list(self.position) if self.position else None
         }
         # Explicitly convert Enum to value for JSON serialization
         if hasattr(self.node_info, 'node_type') and isinstance(self.node_info.node_type, Enum):
@@ -233,10 +236,12 @@ class PeerDiscoveryMessage:
             node_data['node_type'] = NodeType(node_data['node_type'])
             
         node_info = Address(**node_data)
+        pos = payload.get('position')
         return cls(
             node_info=node_info,
             service_capabilities=payload['service_capabilities'],
-            network_metrics=payload.get('network_metrics')
+            network_metrics=payload.get('network_metrics'),
+            position=tuple(pos) if pos else None
         )
 
 
@@ -282,3 +287,25 @@ class MeshRelayMessage:
             hop_path=payload["hop_path"],
         )
 
+
+@dataclass
+class RoutingMessage:
+    """Wrapper for DTN routing protocol exchange messages."""
+
+    protocol_type: str
+    data: Dict[str, Any]
+
+    def to_payload(self) -> Dict[str, Any]:
+        """Convert to message payload."""
+        return {
+            "protocol_type": self.protocol_type,
+            "data": self.data
+        }
+
+    @classmethod
+    def from_payload(cls, payload: Dict[str, Any]) -> "RoutingMessage":
+        """Reconstruct from message payload."""
+        return cls(
+            protocol_type=payload["protocol_type"],
+            data=payload["data"]
+        )

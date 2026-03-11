@@ -19,7 +19,7 @@ from .common import (  # noqa: F401
 
 # Transaction --------------------------------------------------------------
 from .transaction import (  # noqa: F401
-    BufferedTransaction,
+    BufferedTransfer,
     ConfirmationOrder,
     SignedTransferOrder,
     TransferOrder,
@@ -51,7 +51,7 @@ __all__ = [
     "NodeType",
     "TransactionStatus",
     # transaction
-    "BufferedTransaction",
+    "BufferedTransfer",
     "ConfirmationOrder",
     "SignedTransferOrder",
     "TransferOrder",

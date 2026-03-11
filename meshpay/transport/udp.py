@@ -97,7 +97,12 @@ class UDPTransport:  # pylint: disable=too-few-public-methods
                 escaped_payload
             )
             
-            self.node.cmd(cmd)
+            if not hasattr(self.node, '_cmd_lock'):
+                import threading
+                self.node._cmd_lock = threading.Lock()
+                
+            with self.node._cmd_lock:
+                self.node.cmd(cmd)
             return True
         except Exception as exc:  # pragma: no cover
             self.logger.error(f"UDP send failed: {exc}")

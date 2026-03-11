@@ -419,12 +419,22 @@ def main() -> None:
         if bridge:
             bridge.stop_bridge_server()
         if net is not None:
+            info("*** Stopping node services gracefully\n")
+            for node in authorities + clients:
+                if hasattr(node, 'stop_fastpay_services'):
+                    node.stop_fastpay_services()
+            
             info("*** Stopping enhanced mesh network\n")
             net.stop()
             if args.logs:
                 _close_xterms(authorities, clients)
+        
         info("*** Enhanced mesh demo completed\n")
-
+        try:
+            import matplotlib.pyplot as plt
+            plt.close('all')
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     main() 

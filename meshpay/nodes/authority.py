@@ -31,7 +31,6 @@ from meshpay.messages import (
     MessageType,
     TransferRequestMessage,
     TransferResponseMessage,
-    MeshRelayMessage,
 )
 
 from mn_wifi.services.core.config import DEFAULT_RELAY_TTL
@@ -88,8 +87,7 @@ class WiFiAuthority(MeshMixin, Station):
     """Authority node that runs on Mininet-WiFi host.
 
     Inherits mesh networking (neighbor management, discovery, relay) from
-    :class:`MeshMixin`.  Overrides ``_handle_mesh_relay`` to process
-    transfer requests and relay responses back through the mesh.
+    :class:`MeshMixin`. 
     """
 
     def __init__(
@@ -167,9 +165,6 @@ class WiFiAuthority(MeshMixin, Station):
                 self.transport = WiFiDirectTransport(self, self.address)
             else:
                 raise ValueError(f"Unsupported transport kind: {transport_kind}")
-
-    # Neighbor management, discovery, and relay inherited from MeshMixin
-    _service_capabilities = ["relay", "authority", "validation"]
 
     # ------------------------------------------------------------------
     # Service lifecycle
@@ -505,14 +500,25 @@ class WiFiAuthority(MeshMixin, Station):
                 time.sleep(0.1)
 
     def _process_message(self, message: Message) -> None:
-        """Process incoming message, including mesh relay."""
+        """Process incoming raw network packets directly from the transport layer.
+        
+        This handler catches two types of communication:
+        1. Pure DTN Routing (Mesh): The foundation of the mesh network. Summaries 
+           and bundles wrapped in ROUTING_MESSAGEs.
+        2. Direct Transport (Legacy/Internet): If a client is connected directly to 
+           this authority (e.g., via TCP/Internet), bypass the buffer and process 
+           immediately.
+        """
         try:
-            if message.message_type == MessageType.MESH_RELAY:
-                self._handle_mesh_relay(message)
-                return
+            # ── 1. Pure DTN / Mesh Network Flow ──
+            if message.message_type == MessageType.ROUTING_MESSAGE:
+                # Hand this over to the DTN bridge (MeshMixin) which parses it.
+                # If it's data, the DTN bridge will eventually call `on_dtn_bundle_received`.
+                self._handle_routing_message(message)
 
-            # Legacy direct messages (backwards compatibility).
-            if message.message_type == MessageType.TRANSFER_REQUEST:
+            # ── 2. Direct Internet / Legacy Flow ──
+            elif message.message_type == MessageType.TRANSFER_REQUEST:
+                # Received directly from a client. Process and instantly reply directly.
                 request = TransferRequestMessage.from_payload(message.payload)
                 response = self.handle_transfer_order(request.transfer_order)
                 response_message = Message(
@@ -526,84 +532,12 @@ class WiFiAuthority(MeshMixin, Station):
                 self.transport.send_message(response_message, message.sender)
 
             elif message.message_type == MessageType.CONFIRMATION_REQUEST:
+                # Received directly
                 request = ConfirmationRequestMessage.from_payload(message.payload)
                 self.handle_confirmation_order(request.confirmation_order)
 
         except Exception as e:
             self.logger.error(f"Error processing message: {e}")
-
-    def _handle_mesh_relay(self, message: Message, **_kwargs) -> None:
-        """Unwrap a mesh relay message and process the inner payload.
-
-        Authority override: processes TRANSFER_REQUESTs locally and relays
-        signed responses back through the mesh.
-
-        Dedup strategy (mirrors MeshMixin):
-          - TRANSFER_REQUEST  → ``order_id:req``
-          - TRANSFER_RESPONSE → ``order_id:resp:authority``
-          - CONFIRMATION_REQ  → ``order_id:conf``
-        """
-        relay = MeshRelayMessage.from_payload(message.payload)
-        order_key = relay.order_id
-
-        # ── Build dedup key ──
-        if relay.inner_message_type == MessageType.TRANSFER_RESPONSE.value:
-            auth_id = relay.hop_path[0] if relay.hop_path else "unknown"
-            dedup_key = f"{order_key}:resp:{auth_id}"
-        elif relay.inner_message_type == MessageType.TRANSFER_REQUEST.value:
-            dedup_key = f"{order_key}:req"
-        elif relay.inner_message_type == MessageType.CONFIRMATION_REQUEST.value:
-            dedup_key = f"{order_key}:conf"
-        else:
-            dedup_key = f"{order_key}:{relay.inner_message_type}"
-
-        if dedup_key in self.state.seen_order_ids:
-            self.logger.debug(f"Duplicate relay {order_key} – skipping")
-            return
-        self.state.seen_order_ids.add(dedup_key)
-
-        # ── Drop if order already confirmed ──
-        conf_key = f"{order_key}:conf"
-        if (relay.inner_message_type != MessageType.CONFIRMATION_REQUEST.value
-                and conf_key in self.state.seen_order_ids):
-            self.logger.debug(f"Order {order_key} already confirmed – dropping")
-            return
-
-        # ── TRANSFER_REQUEST: process and relay response back ──
-        if relay.inner_message_type == MessageType.TRANSFER_REQUEST.value:
-            request = TransferRequestMessage.from_payload(relay.inner_payload)
-            response = self.handle_transfer_order(request.transfer_order)
-
-            self.logger.info(
-                f"Processed relayed transfer {order_key} from {relay.original_sender_id}"
-            )
-
-            response_relay = self._build_relay_message(
-                inner_type=MessageType.TRANSFER_RESPONSE.value,
-                inner_payload=response.to_payload(),
-                order_id=relay.order_id,
-                sender_id=relay.original_sender_id,
-                origin_address=relay.origin_address,
-            )
-            self._relay_to_neighbors(response_relay)
-
-        # ── CONFIRMATION_REQUEST: process locally ──
-        elif relay.inner_message_type == MessageType.CONFIRMATION_REQUEST.value:
-            req = ConfirmationRequestMessage.from_payload(relay.inner_payload)
-            self.handle_confirmation_order(req.confirmation_order)
-
-        # ── Re-relay the original message to other neighbours ──
-        if relay.ttl > 1:
-            next_relay = MeshRelayMessage(
-                original_sender_id=relay.original_sender_id,
-                origin_address=relay.origin_address,
-                inner_message_type=relay.inner_message_type,
-                inner_payload=relay.inner_payload,
-                order_id=relay.order_id,
-                ttl=relay.ttl - 1,
-                hop_path=relay.hop_path + [self.name],
-            )
-            self._relay_to_neighbors(next_relay)
 
     def _blockchain_sync_loop(self) -> None:
         """Periodic blockchain synchronization loop."""
@@ -628,41 +562,47 @@ class WiFiAuthority(MeshMixin, Station):
                 self.logger.error(f"Error in blockchain sync loop: {e}")
                 time.sleep(10)
 
-    # ── Flash-Mesh / D-SDN helpers ────────────────────────────────────
+    def on_dtn_bundle_received(self, item) -> None:
+        """Application hook triggered by the DTN layer when a new bundle arrives.
+        
+        Unlike `_process_message` which sees all raw packets, this is ONLY called 
+        when the Epidemic routing protocol successfully downloads a new transaction 
+        from a neighbor and saves it to the `message_buffer`.
 
-    def get_link_stats(self) -> Dict[str, Any]:
-        """Expose iw-based link metrics for the SDN controller layer.
-
-        Runs ``iw dev <intf> station dump`` inside the node namespace and
-        parses signal strength, tx/rx bytes, and expected throughput.
+        As an Authority, our job is to ACT on these buffered transactions:
+        - If it's a TRANSFER_REQUEST, we validate it, sign it, and inject the 
+          resulting TRANSFER_RESPONSE *back* into the buffer so the epidemic 
+          routing will carry it back to the client.
+        - If it's a CONFIRMATION_REQUEST, we finalize the transaction locally.
         """
-        try:
-            # Determine wireless interface name
-            intf = f"{self.name}-wlan0"
-            raw = self.cmd(f"iw dev {intf} station dump")
-            return self._parse_iw_station_dump(raw)
-        except Exception as e:
-            self.logger.error(f"get_link_stats failed: {e}")
-            return {}
+        from meshpay.messages import MessageType, TransferRequestMessage
+        from meshpay.types.transaction import MessageBufferItem
+        from mn_wifi.services.core.config import DEFAULT_RELAY_TTL
 
-    @staticmethod
-    def _parse_iw_station_dump(raw: str) -> Dict[str, Any]:
-        """Parse output of ``iw dev ... station dump`` into a dict."""
-        stats: Dict[str, Any] = {}
-        for line in raw.splitlines():
-            line = line.strip()
-            if ":" not in line:
-                continue
-            key, _, val = line.partition(":")
-            key = key.strip().lower().replace(" ", "_")
-            val = val.strip()
-            # Try to convert numeric values
-            for suffix in (" dBm", " MBit/s", " bytes", " packets", " ms"):
-                if val.endswith(suffix):
-                    val = val[: -len(suffix)]
-                    break
-            try:
-                stats[key] = float(val) if "." in val else int(val)
-            except (ValueError, TypeError):
-                stats[key] = val
-        return stats
+        if item.message_type == MessageType.TRANSFER_REQUEST.value:
+            request = TransferRequestMessage.from_payload(item.payload)
+            
+            # Process the transaction and generate our signature/response
+            response = self.handle_transfer_order(request.transfer_order)
+
+            # Important: Inject response back into message_buffer for epidemic spread
+            # We don't send it directly over the transport because we don't know where 
+            # the client is. Epidemic routing will spread it until it reaches them.
+            resp_msg_id = f"{request.transfer_order.order_id}:resp:{self.name}"
+            
+            if resp_msg_id not in self.message_buffer:
+                self.message_buffer[resp_msg_id] = MessageBufferItem(
+                    message_id=resp_msg_id,
+                    message_type=MessageType.TRANSFER_RESPONSE.value,
+                    payload=response.to_payload(),
+                    sender_id=self.name,
+                    ttl=DEFAULT_RELAY_TTL,
+                )
+                # Tell the DTN protocol we have a new item ready to spread
+                self.routing_protocol.on_message_added_to_buffer(
+                    resp_msg_id, self.message_buffer
+                )
+
+        elif item.message_type == MessageType.CONFIRMATION_REQUEST.value:
+            request = ConfirmationRequestMessage.from_payload(item.payload)
+            self.handle_confirmation_order(request.confirmation_order)

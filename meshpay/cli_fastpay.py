@@ -145,22 +145,19 @@ class MeshPayCLI(CLI):  # pylint: disable=too-many-instance-attributes
             print(f"\n  ⚠️  No account found for '{user}' on any authority")
             return
 
-        print(f"\n╔══════════════════════════════════════════════════════╗")
-        print(f"║  💰 Balances for {user:<37}║")
-        print(f"╠══════════════════════════════════════════════════════╣")
-        print(f"║  Source: {source_auth:<43}║")
-        print(f"║  Seq#:   {account.sequence_number:<43}║")
-        print(f"╠════════╦═══════════════╦═══════════════╦═════════════╣")
-        print(f"║ Token  ║  MeshPay Bal  ║  Wallet Bal   ║  Total Bal  ║")
-        print(f"╠════════╬═══════════════╬═══════════════╬═════════════╣")
+        print(f"\n   💰 Balances for {user}")
+        print(f"   {'─'*50}")
+        print(f"   Source: {source_auth} | Seq#: {account.sequence_number}")
+        print(f"   {'─'*50}")
+        print(f"   {'Token':<8} {'MeshPay':>13} {'Wallet':>13} {'Total':>10}")
+        print(f"   {'─'*8} {'─'*13} {'─'*13} {'─'*10}")
         for _addr, bal in account.balances.items():
             sym = getattr(bal, 'token_symbol', '???')
             mp = getattr(bal, 'meshpay_balance', 0.0)
             wb = getattr(bal, 'wallet_balance', 0.0)
             tb = getattr(bal, 'total_balance', 0.0)
-            print(f"║ {sym:<6} ║ {mp:>11.3f}   ║ {wb:>11.3f}   ║ {tb:>9.3f}   ║")
-        print(f"╚════════╩═══════════════╩═══════════════╩═════════════╝")
-        print()
+            print(f"   {sym:<8} {mp:>13.3f} {wb:>13.3f} {tb:>10.3f}")
+        print(f"   {'─'*50}\n")
 
     # 2. ------------------------------------------------------------------
     def do_balances(self, line: str) -> None:
@@ -168,9 +165,8 @@ class MeshPayCLI(CLI):  # pylint: disable=too-many-instance-attributes
 
         Usage: balances
         """
-        print(f"\n╔══════════════════════════════════════════════════════════════════╗")
-        print(f"║                     💰 ALL USER BALANCES                        ║")
-        print(f"╚══════════════════════════════════════════════════════════════════╝")
+        print(f"\n   💰 ALL USER BALANCES")
+        print(f"   {'═'*60}")
 
         for client in self.clients:
             # Use first authority that has the account
@@ -197,40 +193,6 @@ class MeshPayCLI(CLI):  # pylint: disable=too-many-instance-attributes
                 wb = getattr(bal, 'wallet_balance', 0.0)
                 tb = getattr(bal, 'total_balance', 0.0)
                 print(f"     {sym:<6}  {mp:>10.3f}  {wb:>10.3f}  {tb:>10.3f}")
-
-    # 3. ------------------------------------------------------------------
-    def do_sync(self, line: str) -> None:
-        """Sync client state from authorities.
-        
-        Usage: sync <client>
-        Example: sync user1
-        """
-        args = line.split()
-        if not args:
-            print("Usage: sync <client>")
-            return
-        
-        client_name = args[0]
-        client = self._find_node(client_name)
-        
-        if not client:
-            print(f"Error: Client '{client_name}' not found")
-            return
-        
-        if not hasattr(client, 'state'):
-            print(f"Error: Client '{client_name}' has no state")
-            return
-        
-        print(f"Syncing {client_name}...")
-        # Get balance from first authority as reference
-        for auth in self.authorities:
-            if hasattr(auth, "state") and hasattr(auth.state, "accounts"):
-                account = auth.state.accounts.get(client_name)
-                if account:
-                    print(f"✓ Synced from {auth.name}: seq={account.sequence_number}")
-                    break
-        else:
-            print("⚠️ No authority has account data for this client")
 
     # 4. ------------------------------------------------------------------
     def do_status(self, line: str) -> None:
@@ -319,47 +281,6 @@ class MeshPayCLI(CLI):  # pylint: disable=too-many-instance-attributes
         print("           DEMO COMPLETE")
         print("=" * 60)
         print("\n✅ Demo sequence finished!")
-
-    # 6a. -----------------------------------------------------------------
-    def do_buffered(self, line: str) -> None:
-        """Show buffered transactions awaiting quorum.
-        
-        Usage: buffered [client]
-        
-        If no client specified, shows buffered transactions for all clients.
-        """
-        print("\n" + "=" * 60)
-        print("BUFFERED TRANSACTIONS")
-        print("=" * 60)
-        
-        args = line.split()
-        clients_to_check = self.clients
-        
-        if args:
-            client = self._find_node(args[0])
-            if client and client in self.clients:
-                clients_to_check = [client]
-            else:
-                print(f"⚠️ Client '{args[0]}' not found")
-                return
-        
-        total_buffered = 0
-        for client in clients_to_check:
-            if hasattr(client, 'get_buffered_transactions'):
-                buffered = client.get_buffered_transactions()
-                if buffered:
-                    print(f"\n{client.name}: {len(buffered)} buffered")
-                    for tx_id, tx in buffered.items():
-                        print(f"  📋 TX {str(tx_id)[:8]}...")
-                        print(f"     Status: {tx.status.value}")
-                        print(f"     Amount: {tx.order.amount} -> {tx.order.recipient}")
-                        print(f"     Retries: {tx.retry_count}")
-                        print(f"     Sigs: {len(tx.signatures_received)}/{tx.signatures_required}")
-                    total_buffered += len(buffered)
-                else:
-                    print(f"\n{client.name}: No buffered transactions")
-        
-        print(f"\nTotal buffered: {total_buffered}")
 
     # 7. ------------------------------------------------------------------
     def do_transfer(self, line: str) -> None:
@@ -450,18 +371,18 @@ class MeshPayCLI(CLI):  # pylint: disable=too-many-instance-attributes
         addr = getattr(state, 'address', None)
         is_authority = hasattr(state, 'accounts')  # AuthorityState has accounts dict
 
-        W = 62  # inner width between ║ characters
+        W = 60
 
         def row(text: str) -> None:
-            print(f"║  {text:<{W-2}}║")
+            print(f"   {text:<{W}}")
 
         def sep() -> None:
-            print(f"╠{'═' * W}╣")
+            print(f"   {'─' * W}")
 
         role_icon = "🏛️" if is_authority else "👤"
         role_label = "AUTHORITY" if is_authority else "USER"
 
-        print(f"\n╔{'═' * W}╗")
+        print(f"\n   {'═' * W}")
         row(f"{role_icon}  {station_name:<10}  [{role_label}]")
         sep()
 
@@ -479,7 +400,7 @@ class MeshPayCLI(CLI):  # pylint: disable=too-many-instance-attributes
         else:
             self._print_client_state(state, station_name, row, sep)
 
-        print(f"╚{'═' * W}╝")
+        print(f"   {'═' * W}")
         print()
 
     # ── Authority state helper ─────────────────────────────────────────
@@ -676,39 +597,15 @@ class MeshPayCLI(CLI):  # pylint: disable=too-many-instance-attributes
 
         sep()
 
-        # ── Sent certificates (detailed) ──
+        # ── Sent certificates (count only) ──
         sent_certs = getattr(state, 'sent_certificates', [])
         row(f"📤 Sent Certificates: {len(sent_certs)}")
-        for i, cert in enumerate(sent_certs):
-            txo = getattr(cert, 'transfer_order', None)
-            if txo:
-                oid = str(getattr(cert, 'order_id', '?'))[:8]
-                frm = getattr(txo, 'sender', '?')
-                to = getattr(txo, 'recipient', '?')
-                amt = getattr(txo, 'amount', 0)
-                tok = self._resolve_token_symbol(getattr(txo, 'token_address', ''))
-                nsigs = len(getattr(cert, 'authority_signature', {}))
-                ts = getattr(cert, 'timestamp', 0)
-                ts_str = datetime.fromtimestamp(ts).strftime('%H:%M:%S') if ts else '?'
-                row(f"   [{oid}] {frm}→{to} {amt} {tok} ({nsigs} sigs, {ts_str})")
 
         sep()
 
-        # ── Received certificates (detailed) ──
+        # ── Received certificates (count only) ──
         recv_certs = getattr(state, 'received_certificates', {})
         row(f"📨 Received Certificates: {len(recv_certs)}")
-        for (sender, seq_num), cert in recv_certs.items():
-            txo = getattr(cert, 'transfer_order', None)
-            if txo:
-                oid = str(getattr(cert, 'order_id', '?'))[:8]
-                frm = getattr(txo, 'sender', '?')
-                to = getattr(txo, 'recipient', '?')
-                amt = getattr(txo, 'amount', 0)
-                tok = self._resolve_token_symbol(getattr(txo, 'token_address', ''))
-                nsigs = len(getattr(cert, 'authority_signature', {}))
-                ts = getattr(cert, 'timestamp', 0)
-                ts_str = datetime.fromtimestamp(ts).strftime('%H:%M:%S') if ts else '?'
-                row(f"   [{oid}] {frm}→{to} {amt} {tok} ({nsigs} sigs, {ts_str})")
 
     def _resolve_token_symbol(self, token_address: str) -> str:
         """Resolve a token address to its symbol using SUPPORTED_TOKENS."""
@@ -865,52 +762,47 @@ class MeshPayCLI(CLI):  # pylint: disable=too-many-instance-attributes
         print("")
 
     # 10. -----------------------------------------------------------------
-    def do_broadcast_confirmation(self, line: str) -> None:
-        """Broadcast a transfer order using :pymeth:`mn_wifi.client.Client.transfer`.
+    def do_summary(self, line: str) -> None:
+        """Show epidemic summary (message buffer) for a node.
         
-        Usage: broadcast_confirmation <sender>
+        Usage: summary <node>
         """
         args = line.split()
-        if len(args) != 1:
-            print("Usage: broadcast_confirmation <sender>")
+        if not args:
+            print("Usage: summary <node>")
             return
             
-        sender = args[0]
-        client = self._find_node(sender)
-        if client is None:
-            print(f"❌ Unknown client '{sender}'")
+        target = args[0]
+        node = self._find_node(target)
+        if not node:
+            print(f"❌ Unknown node '{target}'")
             return
-        
-        print(f"🚀 {sender} → broadcast confirmation")
-        try:
-            client.broadcast_confirmation()
-        except Exception as exc:  # pragma: no cover – defensive, should not occur
-            print(f"❌ Broadcast confirmation failed: {exc}")
+            
+        if not hasattr(node, "message_buffer"):
+            print(f"⚠️  {node.name}: No message buffer available")
+            return
 
-    # 11. -----------------------------------------------------------------
-    def do_update_onchain_balance(self, line: str) -> None:
-        """Update account balance.
+        buffer = node.message_buffer
+        active_items = [item for item in buffer.values() if not item.is_expired]
         
-        Usage: update_onchain_balance <user>"
-        """
-        args = line.split()
-        if len(args) != 1:
-            print("Usage: update_onchain_balance <user>")
-            return
-            
-        user = args[0]
-        client = self._find_node(user)
-        if client is None:
-            print(f"❌ Unknown client '{user}'")
-            return
+        print(f"\n📦 {node.name} Epidemic Summary:")
+        print(f"   Buffer Size: {len(buffer)} total items ({len(active_items)} active)")
         
-        # Handle async method properly
-        try:
-            import asyncio
-            asyncio.run(client.update_account_balance())
-            print(f"✅ Account balance updated for {user}")
-        except Exception as e:
-            print(f"❌ Failed to update account balance: {e}")
+        if not buffer:
+            print("   (empty)")
+        else:
+            print(f"   {'Message ID':<25} {'Type':<20} {'Sender':<12} {'TTL':<5} {'Status':<10}")
+            print(f"   {'─'*25} {'─'*20} {'─'*12} {'─'*5} {'─'*10}")
+            for msg_id, item in buffer.items():
+                short_id = str(msg_id)
+                if len(short_id) > 23:
+                    short_id = short_id[:10] + '...' + short_id[-10:]
+                short_type = str(item.message_type)[:18]
+                short_sender = str(item.sender_id)[:10]
+                status = "Expired" if item.is_expired else "Active"
+                ttl_str = str(item.ttl)
+                print(f"   • {short_id:<23} {short_type:<20} {short_sender:<12} {ttl_str:<5} {status:<10}")
+        print("")
 
     # 12. -----------------------------------------------------------------
     def do_log(self, line: str) -> None:
@@ -960,16 +852,15 @@ class MeshPayCLI(CLI):  # pylint: disable=too-many-instance-attributes
         total = len(lines)
         shown = lines[-num_lines:] if total > num_lines else lines
 
-        print(f"\n╔══════════════════════════════════════════════════════════════╗")
-        print(f"║  📜 Log: {node_name:<15} ({total} total, showing last {len(shown)}){' ' * max(0, 18 - len(str(total)) - len(str(len(shown))))}║")
-        print(f"╠══════════════════════════════════════════════════════════════╣")
+        print(f"\n   📜 Log: {node_name} ({total} total, showing last {len(shown)})")
+        print(f"   {'─' * 62}")
         for entry in shown:
             entry = entry.rstrip('\n')
             # Truncate long lines for display
             if len(entry) > 60:
                 entry = entry[:57] + '...'
-            print(f"║  {entry:<60}║")
-        print(f"╚══════════════════════════════════════════════════════════════╝")
+            print(f"   {entry:<60}")
+        print(f"   {'─' * 62}")
         print()
 
     # 13. -----------------------------------------------------------------
@@ -1002,13 +893,13 @@ class MeshPayCLI(CLI):  # pylint: disable=too-many-instance-attributes
 
         nm = getattr(collector, 'network_metrics', None)
 
-        W = 62
+        W = 60
         def row(text: str) -> None:
-            print(f"║  {text:<{W-2}}║")
+            print(f"   {text:<{W}}")
         def sep() -> None:
-            print(f"╠{'═' * W}╣")
+            print(f"   {'─' * W}")
 
-        print(f"\n╔{'═' * W}╗")
+        print(f"\n   {'═' * W}")
         row(f"📡 Network Metrics: {target}")
         sep()
 
@@ -1053,7 +944,7 @@ class MeshPayCLI(CLI):  # pylint: disable=too-many-instance-attributes
                 conn_v = f"{conn.average:.2f}" if conn else '—'
                 row(f"{peer:<14} {lat_v:>11} {bw_v:>10} {conn_v:>8}")
 
-        print(f"╚{'═' * W}╝")
+        print(f"   {'═' * W}")
         print()
 
     def do_help_meshpay(self, line: str) -> None:
@@ -1062,36 +953,24 @@ class MeshPayCLI(CLI):  # pylint: disable=too-many-instance-attributes
         print("╔════════════════════════════════════════════════════════════════╗")
         print("║             MESHPAY CONSENSUS CLI COMMANDS                     ║")
         print("╠════════════════════════════════════════════════════════════════╣")
-        print("║  ACCOUNT COMMANDS                                              ║")
+        print("║  ACCOUNT & TRANSFER COMMANDS                                   ║")
         print("║    balance <user>               - User balance (detailed)      ║")
         print("║    balances                     - All users (summary table)    ║")
-        print("║    sync <client>                - Sync client state            ║")
-        print("║    update_onchain_balance <user> - Update on-chain balance     ║")
-        print("╠════════════════════════════════════════════════════════════════╣")
-        print("║  TRANSFER COMMANDS                                             ║")
-        print("║    transfer <from> <to> <tkn> <amt> - Execute a transfer       ║")
-        print("║    broadcast_confirmation <sender>  - Broadcast confirmation   ║")
+        print("║    transfer <from> <to> <t> <r> - Execute a transfer           ║")
         print("╠════════════════════════════════════════════════════════════════╣")
         print("║  INFO & MONITORING                                             ║")
-        print("║    infor <node|all|users|authorities> - Node info (role-based) ║")
         print("║    status                       - Network status summary       ║")
-        print("║    buffered [client]            - Buffered transactions        ║")
-        print("║    voting_power                 - Show voting power            ║")
-        print("║    performance <authority|all>  - Performance metrics           ║")
-        print("║    network_metrics <auth|all>   - Network metrics (per-peer)   ║")
+        print("║    infor <node|all|nodes>       - Node info (role-based)       ║")
+        print("║    neighbor <node|all>          - Display mesh neighbors       ║")
+        print("║    summary <node>               - View epidemic message buffer ║")
         print("║    log <node> [lines]           - Show node log history        ║")
+        print("║    voting_power                 - Show voting power            ║")
+        print("║    performance <authority|all>  - Performance metrics          ║")
+        print("║    network_metrics <auth|all>   - Link metrics (latency, b/w)  ║")
         print("╠════════════════════════════════════════════════════════════════╣")
-        print("║  DEMO COMMANDS                                                 ║")
-        print("║    demo                         - Run automated demo           ║")
-        print("╠════════════════════════════════════════════════════════════════╣")
-        print("║  FLASH-MESH D-SDN COMMANDS                                     ║")
-        print("║    fm_status                    - Controller + QoS status       ║")
-        print("║    fm_telemetry [node]          - Link stats from collector     ║")
-        print("║    fm_certs [client]            - Collected BCB certificates    ║")
-        print("╠════════════════════════════════════════════════════════════════╣")
-        print("║  MININET-WIFI COMMANDS                                         ║")
-        print("║    stop                         - Stop mobility simulation     ║")
-        print("║    start                        - Start mobility simulation    ║")
+        print("║  DEMO & MININET-WIFI COMMANDS                                  ║")
+        print("║    demo                         - Run automated demo sequence  ║")
+        print("║    stop / start                 - Stop/Start mobility config   ║")
         print("║    distance <sta1> <sta2>       - Distance between stations    ║")
         print("║    nodes / net / links          - Show network topology        ║")
         print("║    <node> ping <node>           - Ping between nodes           ║")
@@ -1099,62 +978,3 @@ class MeshPayCLI(CLI):  # pylint: disable=too-many-instance-attributes
         print("╚════════════════════════════════════════════════════════════════╝")
         print("")
 
-    # ── Flash-Mesh D-SDN commands ─────────────────────────────────────────
-
-    def do_fm_status(self, _line: str) -> None:
-        """Show Flash-Mesh D-SDN controller status."""
-        print("\n─── Flash-Mesh D-SDN Status ─────────────────────────")
-        if self._qos_mgr is None:
-            print("  ⚠  D-SDN controller not enabled (use --flashmesh)")
-            print()
-            return
-        installed = self._qos_mgr._installed_nodes
-        print(f"  QoS nodes : {len(installed)} ({', '.join(sorted(installed)) or 'none'})")
-        if self._link_stats:
-            stats = self._link_stats.get_all()
-            print(f"  Link stats: {len(stats)} samples")
-        else:
-            print("  Link stats: disabled")
-        print()
-
-    def do_fm_telemetry(self, line: str) -> None:
-        """Show link-stats telemetry.  Usage: fm_telemetry [node_name]"""
-        if self._link_stats is None:
-            print("  ⚠  Link stats collector not enabled (use --flashmesh)")
-            return
-        parts = line.strip().split()
-        if parts:
-            sample = self._link_stats.get(parts[0])
-            if sample:
-                print(f"\n─── Link Stats: {sample.node_name} ─────────────────────")
-                print(f"  RSSI             : {sample.rssi} dBm")
-                print(f"  TX/RX bytes      : {sample.tx_bytes} / {sample.rx_bytes}")
-                print(f"  Exp. throughput  : {sample.expected_throughput} Mbit/s")
-                print(f"  Sampled at       : {datetime.fromtimestamp(sample.timestamp).strftime('%H:%M:%S')}")
-            else:
-                print(f"  No data for '{parts[0]}'")
-        else:
-            all_samples = self._link_stats.get_all()
-            if not all_samples:
-                print("  No telemetry data yet")
-                return
-            print("\n─── Link Telemetry (all nodes) ──────────────────────")
-            print(f"  {'Node':<12} {'RSSI':>6} {'TX bytes':>12} {'RX bytes':>12} {'Tput (Mb)':>10}")
-            for name, s in sorted(all_samples.items()):
-                print(f"  {name:<12} {s.rssi:>5}  {s.tx_bytes:>12} {s.rx_bytes:>12} {s.expected_throughput:>9.1f}")
-        print()
-
-    def do_fm_certs(self, line: str) -> None:
-        """Show collected BCB certificates.  Usage: fm_certs [client_name]"""
-        targets = [c for c in self.clients if not line.strip() or c.name == line.strip()]
-        if not targets:
-            print(f"  Client '{line.strip()}' not found")
-            return
-        for client in targets:
-            certs = getattr(client.state, 'sent_certificates', [])
-            print(f"\n─── Certificates for {client.name} ({len(certs)} votes) ─────")
-            for i, cert in enumerate(certs, 1):
-                sig = getattr(cert, 'authority_signature', '?')[:20]
-                ok = getattr(cert, 'success', None)
-                print(f"  [{i}] sig={sig}…  success={ok}")
-        print()

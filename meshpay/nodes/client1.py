@@ -20,7 +20,7 @@ from mn_wifi.node import Station
 
 from meshpay.types import (
     Address,
-    BufferedTransaction,
+    BufferedTransfer,
     ClientState,
     ConfirmationOrder,
     KeyPair,
@@ -32,7 +32,6 @@ from meshpay.messages import (
     ConfirmationRequestMessage,
     Message,
     MessageType,
-    MeshRelayMessage,
     TransferRequestMessage,
     TransferResponseMessage,
 )
@@ -48,6 +47,10 @@ from mn_wifi.services.core.config import (
     DISCOVERY_INTERVAL,
     NEIGHBOR_TIMEOUT,
 )
+from meshpay.messages import TransferRequestMessage, MessageType
+from meshpay.types.transaction import MessageBufferItem
+from mn_wifi.services.core.config import DEFAULT_RELAY_TTL
+from mn_wifi.metrics import MetricsCollector
 
 from meshpay.nodes.mesh_utils import MeshMixin
 
@@ -59,8 +62,6 @@ class Client(MeshMixin, Station):
     :class:`MeshMixin`.  Adds transaction queuing, quorum tracking, and
     confirmation broadcasting on top.
     """
-
-    _service_capabilities = ["relay", "client-buffered"]
 
     def __init__(
         self,
@@ -123,10 +124,9 @@ class Client(MeshMixin, Station):
                 raise ValueError(f"Unsupported transport kind: {transport_kind}")
 
         self.logger = ClientLogger(name)
+        self.performance_metrics = MetricsCollector()
         self._running = False
 
-        # Transaction queue (DTN store-carry-forward)
-        self.transaction_queue: Dict[UUID, BufferedTransaction] = {}
         self._quorum_threshold: int = 0
 
         # Background threads
@@ -157,13 +157,6 @@ class Client(MeshMixin, Station):
         committee_size = len(self.state.committee)
         return int(committee_size * 2 / 3) + 1
 
-    def _start_background_threads(self) -> None:
-        """Start message handler and retry threads."""
-        for target in [self._message_handler_loop, self._retry_loop]:
-            t = threading.Thread(target=target, daemon=True)
-            t.start()
-            self._threads.append(t)
-
     def start_fastpay_services(self) -> bool:
         """Boot-strap background processing threads and ready the transport."""
         if not self._connect_transport():
@@ -171,8 +164,12 @@ class Client(MeshMixin, Station):
 
         self._running = True
         self._quorum_threshold = self._calculate_quorum()
-        self._start_background_threads()
         self._start_discovery_service()
+
+        # Start message handler loop
+        t = threading.Thread(target=self._message_handler_loop, daemon=True)
+        t.start()
+        self._threads.append(t)
 
         self.logger.info(
             f"Client {self.name} started "
@@ -188,9 +185,6 @@ class Client(MeshMixin, Station):
                 self.transport.disconnect()  # type: ignore[attr-defined]
             except Exception:
                 pass
-
-        for t in self._threads:
-            t.join(timeout=5.0)
 
         self.logger.info(f"Client {self.name} stopped")
 
@@ -219,28 +213,27 @@ class Client(MeshMixin, Station):
             timestamp=time.time(),
             signature=self.state.secret,
         )
-        request = TransferRequestMessage(transfer_order=order)
         self.state.pending_transfer = order
-        # Mark own request as seen (dedup key: order_id:req)
-        self.state.seen_order_ids.add(f"{order.order_id}:req")
 
-        relay_msg = self._build_relay_message(
-            inner_type=MessageType.TRANSFER_REQUEST.value,
-            inner_payload=request.to_payload(),
-            order_id=str(order.order_id),
-        )
-        self._relay_to_neighbors(relay_msg)
+        request = TransferRequestMessage(transfer_order=order)
+        msg_id = str(order.order_id)
+        
+        # Buffer raw request, so Epidemic logic transmits it via summary vector
+        if msg_id not in self.message_buffer:
+            self.message_buffer[msg_id] = MessageBufferItem(
+                message_id=msg_id,
+                message_type=MessageType.TRANSFER_REQUEST.value,
+                payload=request.to_payload(),
+                sender_id=self.name,
+                ttl=DEFAULT_RELAY_TTL,
+            )
+            # Notify routing protocol locally
+            self.routing_protocol.on_message_added_to_buffer(msg_id, self.message_buffer)
 
-        # Buffer for retry
-        self.transaction_queue[order.order_id] = BufferedTransaction(
-            order=order,
-            signatures_received={},
-            signatures_required=self._quorum_threshold,
-            status=TransactionStatus.BUFFERED,
-        )
         self.logger.info(
-            f"Transfer {order.order_id} relayed to mesh and queued for retry"
+            f"Transfer {order.order_id} queued"
         )
+        self.performance_metrics.record_transaction()
         return TransactionStatus.BUFFERED
 
     # ------------------------------------------------------------------
@@ -248,9 +241,9 @@ class Client(MeshMixin, Station):
     # ------------------------------------------------------------------
 
     def _validate_transfer_response(self, resp: TransferResponseMessage) -> bool:
-        """Validate a transfer response received from an authority."""
+        """Validate a transfer response received ."""
         if str(resp.transfer_order.sender) != str(self.state.name):
-            self.logger.error(f"Transfer {resp.transfer_order.order_id} failed: sender mismatch")
+            self.logger.info(f"Transfer {resp.transfer_order.order_id} skipped: not my transfer")
             return False
         if int(resp.transfer_order.sequence_number) != int(self.state.sequence_number):
             self.logger.error(
@@ -265,28 +258,7 @@ class Client(MeshMixin, Station):
         auth_name = resp.authority_signature or "unknown"
         order_id_str = str(resp.transfer_order.order_id)
 
-        # Deduplicate: only track one response per authority per order
-        already = any(
-            str(c.transfer_order.order_id) == order_id_str
-            and c.authority_signature == auth_name
-            for c in self.state.sent_certificates
-        )
-        if already:
-            self.logger.debug(f"Already have sig from {auth_name} for {order_id_str}")
-            return
-
         self.state.sent_certificates.append(resp)
-        
-        # Ensure we look up using UUID if the dictionary keys are UUIDs
-        try:
-            tx_uuid = UUID(str(resp.transfer_order.order_id))
-        except Exception:
-            tx_uuid = resp.transfer_order.order_id
-
-        if tx_uuid in self.transaction_queue:
-            bt = self.transaction_queue[tx_uuid]
-            bt.add_signature(auth_name, auth_name)
-            
         self.logger.info(
             f"Collected signature from {auth_name} "
             f"({len(self.state.sent_certificates)} total) for order {order_id_str}"
@@ -303,21 +275,10 @@ class Client(MeshMixin, Station):
 
     def _on_quorum_reached(self, order_id) -> None:
         """Handle quorum reached: broadcast confirmation, purge from queue."""
-        self.logger.info("Quorum reached – broadcasting confirmation via mesh")
+        self.logger.info("Quorum reached – broadcasting confirmation via opportunistic mesh")
         self.broadcast_confirmation()
-        
-        # Try testing str, direct object, and cast to UUID
-        keys_to_test = [order_id, str(order_id)]
-        try:
-            keys_to_test.append(UUID(str(order_id)))
-        except Exception:
-            pass
-
-        for key in keys_to_test:
-            if key in self.transaction_queue:
-                self.transaction_queue[key].status = TransactionStatus.FINALIZED
-                del self.transaction_queue[key]
-                break
+        # Remove transfer request from buffer
+        self.message_buffer.pop(str(order_id), None)
 
     def handle_transfer_response(self, resp: TransferResponseMessage) -> bool:
         """Handle transfer response from authority (received via mesh relay)."""
@@ -336,6 +297,7 @@ class Client(MeshMixin, Station):
             return True
         except Exception as e:
             self.logger.error(f"Error handling transfer response: {e}")
+            self.performance_metrics.record_error()
             return False
 
     # ------------------------------------------------------------------
@@ -359,9 +321,6 @@ class Client(MeshMixin, Station):
             self.state.seen_order_ids.discard(f"{transfer.order_id}:req")
             self.state.seen_order_ids.discard(f"{transfer.order_id}:conf")
 
-            if transfer.order_id in self.transaction_queue:
-                del self.transaction_queue[transfer.order_id]
-
             self.logger.info(
                 f"Confirmation {transfer.order_id} applied – "
                 f"sender={transfer.sender}, amount={transfer.amount}"
@@ -369,10 +328,11 @@ class Client(MeshMixin, Station):
             return True
         except Exception as e:
             self.logger.error(f"Error handling confirmation order: {e}")
+            self.performance_metrics.record_error()
             return False
 
     def broadcast_confirmation(self) -> None:
-        """Create and relay a ConfirmationOrder through the mesh."""
+        """Create a ConfirmationOrder."""
         order = self.state.pending_transfer
         if not order:
             self.logger.error("No pending transfer to confirm")
@@ -389,23 +349,6 @@ class Client(MeshMixin, Station):
             )
             return
 
-        transfer_signatures = [c.authority_signature for c in relevant_certs]
-        confirmation = ConfirmationOrder(
-            order_id=order.order_id,
-            transfer_order=order,
-            authority_signatures=transfer_signatures,
-            timestamp=time.time(),
-            status=TransactionStatus.CONFIRMED,
-        )
-
-        req = ConfirmationRequestMessage(confirmation_order=confirmation)
-        relay_msg = self._build_relay_message(
-            inner_type=MessageType.CONFIRMATION_REQUEST.value,
-            inner_payload=req.to_payload(),
-            order_id=str(order.order_id),
-        )
-        self._relay_to_neighbors(relay_msg)
-
         # Clear local state
         self.state.pending_transfer = None
         self.state.sequence_number += 1
@@ -420,21 +363,30 @@ class Client(MeshMixin, Station):
     # ------------------------------------------------------------------
 
     def _process_message(self, message: Message) -> None:
-        """Process incoming message, handling mesh relay wrapping."""
+        """Process incoming raw network packets directly from the transport layer.
+        
+        This handler catches two types of communication:
+        1. Pure DTN Routing (Mesh): The foundation of the mesh network. Summaries 
+           and bundles wrapped in ROUTING_MESSAGEs.
+        2. Direct Transport (Legacy/Internet): If a client is connected directly to an 
+           authority (e.g., via TCP/Internet) rather than through the mesh, it receives 
+           direct responses.
+        """
         try:
-            if message.message_type == MessageType.MESH_RELAY:
-                self._handle_mesh_relay(
-                    message,
-                    on_transfer_response=self.handle_transfer_response,
-                    on_confirmation=self.handle_confirmation_order,
-                )
-                return
+            # ── 1. Pure DTN / Mesh Network Flow ──
+            if message.message_type == MessageType.ROUTING_MESSAGE:
+                # Hand this over to the DTN bridge (MeshMixin) which parses it.
+                # If it's data, the DTN bridge will eventually call `on_dtn_bundle_received`.
+                self._handle_routing_message(message)
 
-            # Legacy direct messages (backwards compat).
-            if message.message_type == MessageType.TRANSFER_RESPONSE:
+            # ── 2. Direct Internet / Legacy Flow ──
+            elif message.message_type == MessageType.TRANSFER_RESPONSE:
+                # Received directly from an authority without being buffered
                 request = TransferResponseMessage.from_payload(message.payload)
                 self.handle_transfer_response(request)
+            
             elif message.message_type == MessageType.CONFIRMATION_REQUEST:
+                # Received directly
                 request = ConfirmationRequestMessage.from_payload(message.payload)
                 self.handle_confirmation_order(request.confirmation_order)
 
@@ -457,90 +409,28 @@ class Client(MeshMixin, Station):
                     self.logger.error(f"Error in message handler loop: {exc}")
                 time.sleep(0.2)
 
-    def _retry_loop(self) -> None:
-        """Background thread that re-relays queued transactions periodically."""
-        while self._running:
-            time.sleep(self._retry_interval)
+    def on_dtn_bundle_received(self, item) -> None:
+        """Application hook triggered by the DTN layer when a new bundle arrives.
+        
+        Unlike `_process_message` which sees all raw packets, this is ONLY called 
+        when the Epidemic routing protocol successfully exchanges a missing piece 
+        of data and saves it to the `message_buffer`.
 
-            if not self.transaction_queue:
-                continue
+        As a Client in the mesh, our primary job is just to carry data for others.
+        However, we MUST inspect the bundles to see if they relate to our own transfers:
+        - Did an authority finally sign my transaction? (TRANSFER_RESPONSE)
+        - Was a transaction sent to me finalized? (CONFIRMATION_REQUEST)
+        """
+        from meshpay.messages import MessageType
 
-            self.logger.info(
-                f"Retry loop: {len(self.transaction_queue)} queued transactions"
-            )
-
-            completed: List[UUID] = []
-
-            for tx_id, btx in list(self.transaction_queue.items()):
-                if btx.status != TransactionStatus.BUFFERED:
-                    continue
-
-                # Purge relayed messages older than 2 minutes
-                if btx.is_relay and (time.time() - btx.created_at > 120):
-                    completed.append(tx_id)
-                    continue
-
-                # ── Check quorum FIRST — don't retry if we already have it ──
-                if not btx.is_relay and self._check_quorum(tx_id):
-                    self.logger.info(f"Transaction {tx_id} reached quorum!")
-                    btx.status = TransactionStatus.FINALIZED
-                    completed.append(tx_id)
-                    self._finalize_buffered_transaction(btx)
-                    continue
-
-                btx.retry_count += 1
-                btx.last_retry = time.time()
-                self.logger.info(
-                    f"Retrying tx {tx_id} via mesh relay (attempt {btx.retry_count})"
-                )
-
-                # Clear OUR request dedup so we re-send; authorities already
-                # processed it and won't re-process, but new neighbours
-                # (from mobility) might relay it to unvisited authorities.
-                self.state.seen_order_ids.discard(f"{tx_id}:req")
-
-                request = TransferRequestMessage(transfer_order=btx.order)
-
-                if btx.is_relay and btx.relay_metadata:
-                    relay_msg = self._build_relay_message(
-                        inner_type=MessageType.TRANSFER_REQUEST.value,
-                        inner_payload=request.to_payload(),
-                        order_id=str(tx_id),
-                        sender_id=btx.relay_metadata["original_sender_id"],
-                        origin_address=btx.relay_metadata["origin_address"],
-                        ttl=btx.relay_metadata.get("ttl", DEFAULT_RELAY_TTL),
-                        hop_path=btx.relay_metadata.get("hop_path", [self.name]),
-                    )
-                else:
-                    relay_msg = self._build_relay_message(
-                        inner_type=MessageType.TRANSFER_REQUEST.value,
-                        inner_payload=request.to_payload(),
-                        order_id=str(tx_id),
-                    )
-                self._relay_to_neighbors(relay_msg)
-
-            for tx_id in completed:
-                self.transaction_queue.pop(tx_id, None)
-
-    def _finalize_buffered_transaction(self, btx: BufferedTransaction) -> None:
-        """Complete a buffered transaction that has reached quorum."""
-        self.logger.info(f"Finalizing transaction {btx.order.order_id}")
-        self.state.pending_transfer = btx.order
-        self.broadcast_confirmation()
-
-    # ------------------------------------------------------------------
-    # Inspection helpers
-    # ------------------------------------------------------------------
-
-    def get_buffered_transactions(self) -> Dict[UUID, BufferedTransaction]:
-        """Return dict of queued transactions for inspection."""
-        return self.transaction_queue.copy()
-
-    def get_transaction_status(self, order_id: UUID) -> Optional[TransactionStatus]:
-        """Get the status of a transaction by its order ID."""
-        if order_id in self.transaction_queue:
-            return self.transaction_queue[order_id].status
-        return None
+        # The DTN protocol tells us the inner type of the package it just downloaded
+        if item.message_type == MessageType.TRANSFER_RESPONSE.value:
+            resp = TransferResponseMessage.from_payload(item.payload)
+            self.handle_transfer_response(resp)
+            
+        elif item.message_type == MessageType.CONFIRMATION_REQUEST.value:
+            req = ConfirmationRequestMessage.from_payload(item.payload)
+            self.handle_confirmation_order(req.confirmation_order)
 
 
 __all__ = ["Client"]

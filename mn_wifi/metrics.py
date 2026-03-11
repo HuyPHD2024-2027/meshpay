@@ -74,6 +74,8 @@ class MetricsCollector:
         self.transaction_count = 0
         self.error_count = 0
         self.sync_count = 0
+        self._validation_latency = RollingAverage()
+        
         
     def record_transaction(self) -> None:
         """Record a transaction."""
@@ -86,6 +88,15 @@ class MetricsCollector:
     def record_sync(self) -> None:
         """Record a synchronization."""
         self.sync_count += 1
+        
+    def record_validation_time(self, latency_ms: float) -> None:
+        """Record the time spent validating a transaction/shard."""
+        self._validation_latency.add(latency_ms)
+
+    def get_reputation_score(self) -> float:
+        """Calculate the node's reputation score (success completion ratio)."""
+        tot = self.transaction_count + self.error_count
+        return self.transaction_count / tot if tot > 0 else 1.0
         
     def update_network_metrics(self, metrics: NetworkMetrics) -> None:
         """Update network metrics.
@@ -144,6 +155,8 @@ class MetricsCollector:
             "transaction_count": self.transaction_count,
             "error_count": self.error_count,
             "sync_count": self.sync_count,
+            "validation_latency_ms": self._validation_latency.average,
+            "reputation_score": self.get_reputation_score(),
             "network_metrics": asdict(self.network_metrics),
             "peer_metrics": peer_stats,
         } 
