@@ -101,7 +101,10 @@ class LinkStatsCollector:
     def _collect_sample(node) -> LinkSample:
         """Run ``iw`` inside the node namespace and parse results."""
         intf = f"{node.name}-wlan0"
-        raw = node.cmd(f"iw dev {intf} station dump 2>/dev/null")
+        import subprocess
+        cmd = ["iw", "dev", intf, "station", "dump"]
+        proc = node.popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        raw, _ = proc.communicate(timeout=1.0)
 
         sample = LinkSample(node_name=node.name)
         for line in raw.splitlines():

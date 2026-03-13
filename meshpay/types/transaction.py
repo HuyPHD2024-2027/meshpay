@@ -32,8 +32,10 @@ class TransferOrder:
     ttl: float = 30.0        # seconds until lock expires
 
     def __post_init__(self) -> None:
-        """Initialize default values."""
-        if self.order_id is None:
+        """Initialize default values and sanitise nested fields."""
+        if isinstance(self.order_id, str):
+            self.order_id = UUID(self.order_id)
+        elif self.order_id is None:
             self.order_id = uuid4()
         if self.timestamp == 0:
             self.timestamp = time.time()
@@ -49,11 +51,20 @@ class SignedTransferOrder:
     timestamp: float
 
     def __post_init__(self) -> None:
-        """Initialize default values."""
-        if self.order_id is None:
+        """Initialize default values and sanitise nested fields."""
+        if isinstance(self.order_id, str):
+            self.order_id = UUID(self.order_id)
+        elif self.order_id is None:
             self.order_id = uuid4()
         if self.timestamp == 0:
             self.timestamp = time.time()
+        
+        # Sanitise nested transfer_order
+        if isinstance(self.transfer_order, dict):
+            raw = self.transfer_order
+            if isinstance(raw.get("order_id"), str):
+                raw["order_id"] = UUID(raw["order_id"])
+            self.transfer_order = TransferOrder(**raw)
 
 
 @dataclass

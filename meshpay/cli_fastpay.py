@@ -112,7 +112,7 @@ class MeshPayCLI(CLI):  # pylint: disable=too-many-instance-attributes
     def _find_node(self, name: str) -> Optional[Station]:
         """Return *any* station (authority or client) with the given *name*."""
         for node in [*self.authorities, *self.clients, self.gateway]:
-            if node.name == name:
+            if node and node.name == name:
                 return node
         return None
 

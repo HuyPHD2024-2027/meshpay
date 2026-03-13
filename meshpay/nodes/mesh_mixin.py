@@ -345,8 +345,29 @@ class MeshMixin:
         pass
 
     # ------------------------------------------------------------------
-    # Telemetry and state exposure
+    # Telemetry and state exposure (Delegated to mesh_utils)
     # ------------------------------------------------------------------
+
+    def get_link_stats(self) -> Dict[str, Any]:
+        return mesh_utils.get_link_stats(self)
+
+    def _get_wireless_interfaces(self) -> List[str]:
+        return mesh_utils.get_wireless_interfaces(self)
+
+    def _get_best_rssi_fallback(self) -> float:
+        return mesh_utils.get_best_rssi_fallback(self)
+
+    def _estimate_rssi_geospatial(self) -> float:
+        return mesh_utils.estimate_rssi_geospatial(self)
+
+    def _get_sinr_from_interfaces(self) -> Optional[float]:
+        return mesh_utils.get_sinr_from_interfaces(self)
+
+    def get_buffer_occupancy(self) -> int:
+        return mesh_utils.get_buffer_occupancy(self)
+
+    def get_encounter_history(self) -> List[str]:
+        return mesh_utils.get_encounter_history(self)
 
     def _update_telemetry_aggregator(self, telemetry_dict: Optional[Dict[str, Any]]) -> None:
         mesh_utils.update_telemetry_aggregator(self, telemetry_dict)

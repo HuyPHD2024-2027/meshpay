@@ -49,24 +49,16 @@ class Message:
     
     def to_json(self) -> str:
         """Serialize message to JSON."""
-        # We need a custom encoder or pre-processing because 'sender' and 'recipient'
-        # are Address objects containing NodeType enums which json.dumps fails on.
-        data = asdict(self)
-        
-        # Convert UUID to string for JSON serialization
-        data['message_id'] = str(data['message_id'])
-        data['message_type'] = data['message_type'].value
-        
-        # Fix top-level sender/recipient serialization
-        if 'sender' in data and isinstance(data['sender'], dict):
-             if 'node_type' in data['sender'] and isinstance(data['sender']['node_type'], Enum):
-                 data['sender']['node_type'] = data['sender']['node_type'].value
+        def json_serial(obj):
+            """JSON serializer for objects not serializable by default json code."""
+            if isinstance(obj, UUID):
+                return str(obj)
+            if isinstance(obj, Enum):
+                return obj.value
+            raise TypeError(f"Type {type(obj)} not serializable")
 
-        if 'recipient' in data and data['recipient'] and isinstance(data['recipient'], dict):
-             if 'node_type' in data['recipient'] and isinstance(data['recipient']['node_type'], Enum):
-                 data['recipient']['node_type'] = data['recipient']['node_type'].value
-                 
-        return json.dumps(data)
+        data = asdict(self)
+        return json.dumps(data, default=json_serial)
     
     @classmethod
     def from_json(cls, json_str: str) -> "Message":
