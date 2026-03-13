@@ -52,7 +52,7 @@ from meshpay.types.transaction import MessageBufferItem
 from mn_wifi.services.core.config import DEFAULT_RELAY_TTL
 from mn_wifi.metrics import MetricsCollector
 
-from meshpay.nodes.mesh_utils import MeshMixin
+from meshpay.nodes.mesh_mixin import MeshMixin
 
 
 class Client(MeshMixin, Station):

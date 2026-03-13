@@ -11,6 +11,7 @@ Run with root privileges:
 import time
 import json
 import threading
+import subprocess
 from mininet.log import info, setLogLevel
 from mn_wifi.link import wmediumd, mesh
 from mn_wifi.wmediumdConnector import interference
@@ -58,7 +59,7 @@ def main() -> None:
         cls=Client,
         ip="10.0.0.21/8",
         min_x=0, max_x=150, min_y=0, max_y=150, min_v=1, max_v=5,
-        range=20,
+        range=40,
         battery=85.0,
     )
     
@@ -67,7 +68,7 @@ def main() -> None:
         cls=Client,
         ip="10.0.0.22/8",
         min_x=0, max_x=150, min_y=0, max_y=150, min_v=1, max_v=5,
-        range=20,
+        range=40,
         battery=42.5,
     )
 
@@ -82,7 +83,7 @@ def main() -> None:
     net.configureNodes()
 
     for node in [auth1, auth2, client1, client2]:
-        net.addLink(node, cls=mesh, ssid="meshNet", intf=f"{node.name}-wlan0", channel=5)
+        net.addLink(node, cls=mesh, ssid="meshpay-mesh", intf=f"{node.name}-wlan0", channel=1)
 
     # 5. Configure mobility
     info("*** Setting up mobility\n")
@@ -97,24 +98,39 @@ def main() -> None:
 
     # 6. Build and start network
     info("*** Building network\n")
+    net.plotGraph(max_x=200, max_y=150)
     net.build()
     
     for node in [auth1, auth2, client1, client2]:
         node.start_fastpay_services()
-        # Add default route for UDP broadcasts
+        # Add default route for UDP broadcasts and ensure loopback is UP for local telemetry
         node.cmd(f"ip route add default dev {node.name}-wlan0")
+        node.cmd("ip link set lo up")
+        
+        # FIX: Explicit Mesh Peering and Interface setup
+        intf = f"{node.name}-wlan0"
+        node.cmd(f"ifconfig {intf} up")
+        node.cmd(f"iw dev {intf} set type mesh")
+        node.cmd(f"iw dev {intf} mesh join meshpay-mesh")
+        
+        # FIX: Ensure MeshMixin knows to report to the host's NAT IP
+        node.telemetry_aggregator_ip = "10.0.0.1"
 
-    # 7. Start Telemetry Daemons on all nodes (Broadcasting UDP)
-    info("📊 Starting UDP Telemetry Daemons on all nodes...\n")
+    # 7. Start Telemetry Daemons on all nodes (Broadcasting DISABLED, using Piggybacking)
+    info("📊 Starting Telemetry Daemons on all nodes (Piggybacking mode)...\n")
     daemons = []
     for node in [auth1, auth2, client1, client2]:
-        daemon = TelemetryDaemon(node, udp_port=5005, interval=2.0)
+        # FIX: Report to the host namespace's NAT IP (10.0.0.1)
+        daemon = TelemetryDaemon(node, interval=2.0, enable_broadcast=False, aggregator_ip="10.0.0.1")
         daemon.start()
         daemons.append(daemon)
+        # Attach daemon to node so MeshMixin can see it
+        node.telemetry_daemon = daemon
 
-    # 8. Start Telemetry Aggregator natively inside auth1 namespace
-    info("📈 Starting UDP Telemetry Aggregator on auth1...\n")
-    aggregator = TelemetryAggregator(udp_port=5005, node=auth1)
+    # 8. Start Telemetry Aggregator natively on the HOST (root namespace)
+    # This ensures it can always receive packets sent to 10.0.0.1 (NAT gateway)
+    info("📈 Starting UDP Telemetry Aggregator on host...\n")
+    aggregator = TelemetryAggregator(udp_port=5005, node=None)
     aggregator.start()
 
     # 9. Start background traffic (ping) to ensure links are active and measurable
@@ -157,6 +173,19 @@ def main() -> None:
                 rssi_str = f"{rssi:.1f}dBm" if rssi is not None else "N/A"
                 sinr_str = f"{sinr:.1f}dB" if sinr is not None else "N/A"
                 info(f"[{node_name}] Pos: ({pos[0]:.1f}, {pos[1]:.1f}) | RSSI: {rssi_str} | Batt: {batt_str} | Buf: {buf} | RX: {rx}B, TX: {tx}B | SINR: {sinr_str} | Rep: {rep:.2f}\n")
+            
+            # Link-Layer Connectivity monitoring (show once per loop)
+            try:
+                # Use popen instead of cmd to avoid shell contention (AssertionError)
+                proc = auth1.popen(["iw", "dev", "auth1-wlan0", "station", "dump"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                peer_check, _ = proc.communicate(timeout=2.0)
+                if "Station" in peer_check:
+                    num_peers = len([l for l in peer_check.split('\n') if "Station" in l])
+                    info(f"✅ auth1 link layer: {num_peers} active mesh peers\n")
+                else:
+                    info(f"❌ auth1 link layer: No mesh peers established yet\n")
+            except Exception as e:
+                info(f"⚠️  auth1 link check error: {e}\n")
     except KeyboardInterrupt:
         info("\n*** Interrupted by user\n")
     finally:

@@ -209,7 +209,7 @@ class PeerDiscoveryMessage:
     
     node_info: Address
     service_capabilities: List[str]
-    network_metrics: Optional[Dict[str, float]] = None
+    telemetry: Optional[Dict[str, Any]] = None
     position: Optional[Tuple[float, float, float]] = None
     
     def to_payload(self) -> Dict[str, Any]:
@@ -217,7 +217,7 @@ class PeerDiscoveryMessage:
         data = {
             'node_info': asdict(self.node_info),
             'service_capabilities': self.service_capabilities,
-            'network_metrics': self.network_metrics,
+            'telemetry': self.telemetry,
             'position': list(self.position) if self.position else None
         }
         # Explicitly convert Enum to value for JSON serialization
@@ -240,7 +240,7 @@ class PeerDiscoveryMessage:
         return cls(
             node_info=node_info,
             service_capabilities=payload['service_capabilities'],
-            network_metrics=payload.get('network_metrics'),
+            telemetry=payload.get('telemetry'),
             position=tuple(pos) if pos else None
         )
 
@@ -294,12 +294,14 @@ class RoutingMessage:
 
     protocol_type: str
     data: Dict[str, Any]
+    telemetry: Optional[Dict[str, Any]] = None
 
     def to_payload(self) -> Dict[str, Any]:
         """Convert to message payload."""
         return {
             "protocol_type": self.protocol_type,
-            "data": self.data
+            "data": self.data,
+            "telemetry": self.telemetry
         }
 
     @classmethod
@@ -307,5 +309,6 @@ class RoutingMessage:
         """Reconstruct from message payload."""
         return cls(
             protocol_type=payload["protocol_type"],
-            data=payload["data"]
+            data=payload["data"],
+            telemetry=payload.get("telemetry")
         )

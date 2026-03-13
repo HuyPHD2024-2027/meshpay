@@ -21,6 +21,7 @@ meshpay/nodes/__init__.py
 meshpay/nodes/authority.py
 meshpay/nodes/client.py
 meshpay/nodes/client1.py
+meshpay/nodes/mesh_mixin.py
 meshpay/nodes/mesh_utils.py
 meshpay/routing/dtn.py
 meshpay/routing/epidemic.py

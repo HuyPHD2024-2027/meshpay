@@ -72,15 +72,26 @@ class MetricsCollector:
 
         # Transaction-level counters --------------------------------------------
         self.transaction_count = 0
+        self.successful_transaction_count = 0
         self.error_count = 0
         self.sync_count = 0
         self._validation_latency = RollingAverage()
+        self._e2e_latency = RollingAverage()
         
+        # TPS calculation
+        self._last_tps_check = time.time()
+        self._tx_at_last_check = 0
+        self._rolling_tps = RollingAverage(capacity=10)
         
     def record_transaction(self) -> None:
         """Record a transaction."""
         self.transaction_count += 1
+        self._update_tps()
         
+    def record_success(self) -> None:
+        """Record a successful transaction completion."""
+        self.successful_transaction_count += 1
+
     def record_error(self) -> None:
         """Record an error."""
         self.error_count += 1
@@ -92,6 +103,26 @@ class MetricsCollector:
     def record_validation_time(self, latency_ms: float) -> None:
         """Record the time spent validating a transaction/shard."""
         self._validation_latency.add(latency_ms)
+
+    def record_e2e_latency(self, latency_ms: float) -> None:
+        """Record end-to-end transaction latency."""
+        self._e2e_latency.add(latency_ms)
+
+    def _update_tps(self) -> None:
+        """Update rolling TPS estimation."""
+        now = time.time()
+        dt = now - self._last_tps_check
+        if dt >= 1.0:
+            current_tx = self.transaction_count
+            delta_tx = current_tx - self._tx_at_last_check
+            self._rolling_tps.add(delta_tx / dt)
+            self._last_tps_check = now
+            self._tx_at_last_check = current_tx
+
+    def get_tps(self) -> float:
+        """Return rolling average TPS."""
+        self._update_tps() # Ensure it's fresh if called between transactions
+        return self._rolling_tps.average
 
     def get_reputation_score(self) -> float:
         """Calculate the node's reputation score (success completion ratio)."""
@@ -153,10 +184,13 @@ class MetricsCollector:
 
         return {
             "transaction_count": self.transaction_count,
+            "successful_transaction_count": self.successful_transaction_count,
             "error_count": self.error_count,
             "sync_count": self.sync_count,
             "validation_latency_ms": self._validation_latency.average,
+            "average_e2e_latency_ms": self._e2e_latency.average,
+            "tps": self.get_tps(),
             "reputation_score": self.get_reputation_score(),
             "network_metrics": asdict(self.network_metrics),
             "peer_metrics": peer_stats,
-        } 
+        }

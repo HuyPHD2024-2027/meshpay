@@ -44,7 +44,7 @@ from mn_wifi.metrics import MetricsCollector
 from meshpay.logger.authorityLogger import AuthorityLogger
 from mn_wifi.services.blockchain_client import BlockchainClient, TokenBalance
 
-from meshpay.nodes.mesh_utils import MeshMixin
+from meshpay.nodes.mesh_mixin import MeshMixin
 
 
 DEFAULT_BALANCES = {
@@ -295,6 +295,7 @@ class WiFiAuthority(MeshMixin, Station):
 
     def handle_transfer_order(self, transfer_order: TransferOrder) -> TransferResponseMessage:
         """Handle transfer order from client."""
+        start_time = time.time()
         try:
             if not self._validate_transfer_order(transfer_order):
                 return TransferResponseMessage(
@@ -322,6 +323,8 @@ class WiFiAuthority(MeshMixin, Station):
                 )
 
             self.performance_metrics.record_transaction()
+            validation_time = (time.time() - start_time) * 1000
+            self.performance_metrics.record_validation_time(validation_time)
 
             return TransferResponseMessage(
                 transfer_order=transfer_order,
@@ -382,6 +385,7 @@ class WiFiAuthority(MeshMixin, Station):
             recipient.balances[transfer.token_address].meshpay_balance += transfer.amount
             recipient.last_update = time.time()
 
+            self.performance_metrics.record_success()
             self.logger.info(f"Confirmation order {confirmation_order.order_id} processed")
             return True
 

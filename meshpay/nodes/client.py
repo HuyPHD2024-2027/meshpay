@@ -40,7 +40,7 @@ from meshpay.transport.udp import UDPTransport
 from meshpay.transport.wifiDirect import WiFiDirectTransport
 from meshpay.logger.clientLogger import ClientLogger
 
-from meshpay.nodes.mesh_utils import MeshMixin
+from meshpay.nodes.mesh_mixin import MeshMixin
 from mn_wifi.metrics import MetricsCollector
 
 
@@ -198,6 +198,8 @@ class Client(MeshMixin, Station):
             )
             self.routing_protocol.on_message_added_to_buffer(msg_id, self.message_buffer)
         
+        
+        self._pending_tx_start_time = time.time()
         self.performance_metrics.record_transaction()
         return True
 
@@ -230,6 +232,10 @@ class Client(MeshMixin, Station):
             committee_size = len(self.state.committee)
             quorum = int(committee_size * 2 / 3) + 1 if committee_size > 0 else 1
             if len(self.state.sent_certificates) >= quorum and self.state.pending_transfer:
+                latency = (time.time() - getattr(self, "_pending_tx_start_time", time.time())) * 1000
+                self.performance_metrics.record_e2e_latency(latency)
+                self.performance_metrics.record_success()
+                
                 self.logger.info("Quorum reached – broadcasting confirmation via mesh")
                 self.broadcast_confirmation()
 

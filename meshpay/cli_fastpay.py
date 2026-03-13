@@ -886,7 +886,10 @@ class MeshPayCLI(CLI):  # pylint: disable=too-many-instance-attributes
             print(f"❌ Unknown authority '{target}'")
             return
 
-        collector = getattr(auth_node, 'metrics_collector', None)
+        collector = getattr(auth_node, 'performance_metrics', None)
+        if collector is None:
+            collector = getattr(auth_node, 'metrics_collector', None)
+
         if collector is None:
             print(f"⚠️  '{target}' has no metrics collector")
             return
@@ -920,6 +923,9 @@ class MeshPayCLI(CLI):  # pylint: disable=too-many-instance-attributes
 
         # ── Counters ──
         row(f"Transactions:  {getattr(collector, 'transaction_count', 0)}")
+        row(f"Successes:     {getattr(collector, 'successful_transaction_count', 0)}")
+        row(f"TPS:           {getattr(collector, 'get_tps', lambda: 0.0)() : >12.2f}")
+        row(f"Avg E2E Lat:   {getattr(collector, '_e2e_latency', type('obj', (), {'average': 0.0})).average : >12.2f} ms")
         row(f"Errors:        {getattr(collector, 'error_count', 0)}")
         row(f"Syncs:         {getattr(collector, 'sync_count', 0)}")
 

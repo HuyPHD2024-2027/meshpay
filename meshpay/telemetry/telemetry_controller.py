@@ -45,6 +45,7 @@ class TelemetryAggregator:
             "while True:\n"
             "  data, addr = s.recvfrom(65535)\n"
             "  sys.stdout.write(data.decode() + '\\n')\n"
+            "  sys.stdout.flush()\n"
         )
         cmd = ["python3", "-u", "-c", "import sys; exec(sys.stdin.read())"]
         
@@ -80,6 +81,7 @@ class TelemetryAggregator:
 
                 line = self._process.stdout.readline()
                 if line:
+                    # info(f"TelemetryAggregator: Received raw line: {line[:50]}...")
                     self._handle_message(line)
                 else:
                     time.sleep(0.1)
@@ -93,8 +95,8 @@ class TelemetryAggregator:
             state = TelemetryState.from_dict(data)
             self.global_state[state.node_id] = state
         except Exception as e:
-            # print(f"TelemetryAggregator: Failed to parse message: {e}")
-            pass
+            msg_snippet = message[:50].replace('\n', ' ')
+            print(f"TelemetryAggregator: Failed to parse telemetry from {msg_snippet}... Error: {e}")
 
     def get_network_state(self) -> Dict[str, TelemetryState]:
         """Return the aggregated state of the network."""
