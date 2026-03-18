@@ -597,15 +597,41 @@ class MeshPayCLI(CLI):  # pylint: disable=too-many-instance-attributes
 
         sep()
 
-        # ── Sent certificates (count only) ──
+        # ── Sent certificates (detailed) ──
         sent_certs = getattr(state, 'sent_certificates', [])
-        row(f"📤 Sent Certificates: {len(sent_certs)}")
-
+        row(f"📤 Sent Certificates (Collected Signatures): {len(sent_certs)}")
+        
+        for resp in sent_certs:
+            txo = getattr(resp, 'transfer_order', None)
+            if txo:
+                oid = str(getattr(txo, 'order_id', '?'))[:8]
+                to = getattr(txo, 'recipient', '?')
+                amt = getattr(txo, 'amount', 0)
+                tok = self._resolve_token_symbol(getattr(txo, 'token_address', ''))
+                ts = getattr(txo, 'timestamp', 0)
+                ts_str = datetime.fromtimestamp(ts).strftime('%H:%M:%S') if ts else '?'
+                
+                # Each response only has one signature from the authority that sent it
+                signer = getattr(resp, 'authority_signature', 'Unknown')
+                
+                row(f"   ✅ [{oid}] → {to} {amt} {tok} (Signed by {signer} at {ts_str})")
+        
         sep()
 
-        # ── Received certificates (count only) ──
-        recv_certs = getattr(state, 'received_certificates', {})
-        row(f"📨 Received Certificates: {len(recv_certs)}")
+        # ── Received certificates (detailed) ──
+        received = getattr(state, 'received_certificates', {})
+        row(f"📨 Received Confirmed Transfers: {len(received)}")
+        for (snd, seq), conf in received.items():
+            txo = getattr(conf, 'transfer_order', None)
+            if txo:
+                oid = str(getattr(conf, 'order_id', '?'))[:8]
+                frm = getattr(txo, 'sender', '?')
+                amt = getattr(txo, 'amount', 0)
+                tok = self._resolve_token_symbol(getattr(txo, 'token_address', ''))
+                ts = getattr(conf, 'timestamp', 0)
+                ts_str = datetime.fromtimestamp(ts).strftime('%H:%M:%S') if ts else '?'
+                nsigs = len(getattr(conf, 'authority_signatures', []))
+                row(f"   ⬇️  [{oid}] from {frm} {amt} {tok} ({nsigs} sigs at {ts_str})")
 
     def _resolve_token_symbol(self, token_address: str) -> str:
         """Resolve a token address to its symbol using SUPPORTED_TOKENS."""

@@ -321,6 +321,9 @@ class Client(MeshMixin, Station):
             self.state.seen_order_ids.discard(f"{transfer.order_id}:req")
             self.state.seen_order_ids.discard(f"{transfer.order_id}:conf")
 
+            # Save certificate
+            self.state.received_certificates[(transfer.sender, transfer.sequence_number)] = confirmation_order
+
             self.logger.info(
                 f"Confirmation {transfer.order_id} applied – "
                 f"sender={transfer.sender}, amount={transfer.amount}"
@@ -348,6 +351,33 @@ class Client(MeshMixin, Station):
                 f"({len(relevant_certs)}/{self._quorum_threshold})"
             )
             return
+
+        transfer_signatures = [c.authority_signature for c in self.state.sent_certificates]
+        order = self.state.pending_transfer
+        confirmation = ConfirmationOrder(
+            order_id=order.order_id,
+            transfer_order=order,
+            authority_signatures=transfer_signatures,
+            timestamp=time.time(),
+            status=TransactionStatus.CONFIRMED,
+        )
+
+        req = ConfirmationRequestMessage(confirmation_order=confirmation)
+
+        # Buffer for epidemic spread
+        from meshpay.types.transaction import MessageBufferItem
+        from mn_wifi.services.core.config import DEFAULT_RELAY_TTL
+        conf_msg_id = f"{order.order_id}:conf"
+        if conf_msg_id not in self.message_buffer:
+            self.message_buffer[conf_msg_id] = MessageBufferItem(
+                message_id=conf_msg_id,
+                message_type=MessageType.CONFIRMATION_REQUEST.value,
+                payload=req.to_payload(),
+                sender_id=self.name,
+                ttl=DEFAULT_RELAY_TTL,
+            )
+            # Notify routing protocol locally
+            self.routing_protocol.on_message_added_to_buffer(conf_msg_id, self.message_buffer)
 
         # Clear local state
         self.state.pending_transfer = None
