@@ -224,7 +224,7 @@ if __name__ == '__main__':
             msg = data.encode('utf-8')
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(5)
+                sock.settimeout(2)
                 sock.connect((ip, port))
                 sock.send(struct.pack('>I', len(msg)) + msg)
                 try:

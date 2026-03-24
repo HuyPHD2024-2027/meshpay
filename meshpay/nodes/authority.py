@@ -636,10 +636,10 @@ class WiFiAuthority(MeshMixin, Station):
                     sender_id=self.name,
                     ttl=DEFAULT_RELAY_TTL,
                 )
-                # Tell the DTN protocol we have a new item ready to spread
                 self.routing_protocol.on_message_added_to_buffer(
                     resp_msg_id, self.message_buffer
                 )
+                self._flush_routing_outbox()
 
         elif item.message_type == MessageType.CONFIRMATION_REQUEST.value:
             request = ConfirmationRequestMessage.from_payload(item.payload)

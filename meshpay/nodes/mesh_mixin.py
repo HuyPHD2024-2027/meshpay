@@ -239,7 +239,7 @@ class MeshMixin:
     # ------------------------------------------------------------------
 
     def _flush_routing_outbox(self) -> None:
-        """Drain the routing protocol's outbox and send over transport."""
+        """Drain the routing protocol's outbox and send over transport (in parallel)."""
         outbox = self.routing_protocol.get_messages_to_send()
 
         for instr in outbox:
@@ -295,7 +295,12 @@ class MeshMixin:
             else:
                 self.control_bytes_sent += msg_size
 
-            self.transport.send_message(msg, recipient_addr)
+            # Launch in background thread to avoid blocking on slow TCP connects/timeouts
+            threading.Thread(
+                target=self.transport.send_message,
+                args=(msg, recipient_addr),
+                daemon=True
+            ).start()
 
     def _handle_routing_message(self, message: Message) -> None:
         """Dispatch an incoming ROUTING_MESSAGE."""
@@ -338,6 +343,7 @@ class MeshMixin:
         )
         self.message_buffer[msg_id] = item
         self.routing_protocol.on_message_added_to_buffer(msg_id, self.message_buffer)
+        self._flush_routing_outbox()
         self.on_dtn_bundle_received(item)
 
     def on_dtn_bundle_received(self, item) -> None:

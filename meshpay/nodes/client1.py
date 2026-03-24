@@ -238,6 +238,7 @@ class Client(MeshMixin, Station):
             )
             # Notify routing protocol locally
             self.routing_protocol.on_message_added_to_buffer(msg_id, self.message_buffer)
+            self._flush_routing_outbox()
 
         self.logger.info(
             f"Transfer {order.order_id} queued"
@@ -290,6 +291,7 @@ class Client(MeshMixin, Station):
         if hasattr(self, "_pending_tx_start_time"):
             e2e_latency = (time.time() - self._pending_tx_start_time) * 1000
             self.performance_metrics.record_e2e_latency(e2e_latency)
+            self.performance_metrics.record_success()
 
         self.logger.info("Quorum reached – broadcasting confirmation via opportunistic mesh")
         self.broadcast_confirmation()
@@ -405,6 +407,7 @@ class Client(MeshMixin, Station):
             )
             # Notify routing protocol locally
             self.routing_protocol.on_message_added_to_buffer(conf_msg_id, self.message_buffer)
+            self._flush_routing_outbox()
             self.logger.info(f"✅ Confirmation Order {order.order_id} injected into buffer")
 
         # Clear local state

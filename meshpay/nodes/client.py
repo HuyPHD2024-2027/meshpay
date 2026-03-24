@@ -197,6 +197,7 @@ class Client(MeshMixin, Station):
                 ttl=DEFAULT_RELAY_TTL,
             )
             self.routing_protocol.on_message_added_to_buffer(msg_id, self.message_buffer)
+            self._flush_routing_outbox()
         
         
         self._pending_tx_start_time = time.time()
@@ -314,6 +315,7 @@ class Client(MeshMixin, Station):
                 ttl=DEFAULT_RELAY_TTL,
             )
             self.routing_protocol.on_message_added_to_buffer(conf_msg_id, self.message_buffer)
+            self._flush_routing_outbox()
 
         self.state.pending_transfer = None
         self.state.sequence_number += 1

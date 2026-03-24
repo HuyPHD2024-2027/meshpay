@@ -28,7 +28,7 @@ class EpidemicRouting(DTNRoutingProtocol):
         super().__init__(node_id)
         # Track last summary exchange time to avoid spamming
         self._last_summary_sent: Dict[str, float] = {}
-        self.summary_cooldown = 2.0  # seconds
+        self.summary_cooldown = 1.0  # seconds
 
     def on_neighbor_discovered(self, neighbor_id: str, current_buffer: Dict[str, MessageBufferItem]) -> None:
         """Send a summary vector if cooldown has passed."""
@@ -62,11 +62,21 @@ class EpidemicRouting(DTNRoutingProtocol):
             logger.warning(f"[{self.node_id}] Unknown Epidemic routing protocol_type: {p_type}")
 
     def on_message_added_to_buffer(self, msg_id: str, current_buffer: Dict[str, MessageBufferItem]) -> None:
-        """For pure Epidemic, we rely on the periodic summary exchange, 
-        but we could optionally proactively broadcast to known neighbors here.
-        For now, do nothing and wait for discovery/cooldown.
-        """
-        pass
+        """Proactively notify all neighbors about the new message."""
+        now = time.time()
+        keys = [msg_id] # Just send the new key to save bandwidth
+        
+        # We assume we have access to the neighbor list via some discovery mechanism,
+        # but the protocol itself only knows who it has seen.
+        # We'll queue a summary for every neighbor we've ever interacted with.
+        for neighbor_id in self._last_summary_sent.keys():
+            logger.debug(f"[{self.node_id}] Proactively sending epidemic_summary for {msg_id} to {neighbor_id}")
+            self._queue_routing_message(
+                recipient_id=neighbor_id,
+                protocol_type="epidemic_summary",
+                data={"keys": keys}
+            )
+            self._last_summary_sent[neighbor_id] = now
 
     def _handle_summary(self, sender_id: str, neighbor_keys: List[str], current_buffer: Dict[str, MessageBufferItem]) -> None:
         """Compare neighbor's summary vector with local buffer and request missing pieces."""
