@@ -12,6 +12,7 @@ import json
 import threading
 import time
 from dataclasses import asdict, dataclass
+from collections import defaultdict
 from statistics import mean
 from typing import Dict, List, Optional, Tuple
 from uuid import UUID
@@ -63,6 +64,11 @@ class MeshMetrics:
         # Per-transaction bookkeeping
         self._tx_start_time_s: Dict[UUID, float] = {}
         self._latency_samples_ms: List[float] = []
+
+        # Generic KPI bookkeeping
+        self._event_start_time_s: Dict[str, float] = {}
+        self._event_latency_samples_ms: Dict[str, List[float]] = defaultdict(list)
+        self._event_counts: Dict[str, int] = defaultdict(int)
 
         # Counters
         self._started = 0
@@ -126,6 +132,27 @@ class MeshMetrics:
             self._bytes_received += max(0, int(received))
 
     # ----------------------------------------------------------------------------------
+    # Generic event tracking for KPIs
+    # ----------------------------------------------------------------------------------
+    def record_event_start(self, event_key: str) -> None:
+        """Record start time for a specific named event key."""
+        with self._lock:
+            self._event_start_time_s[event_key] = time.time()
+
+    def record_event_success(self, event_key: str, category: str) -> None:
+        """Record success and compute latency for a specific category."""
+        now = time.time()
+        with self._lock:
+            t0 = self._event_start_time_s.pop(event_key, None)
+            if t0 is not None:
+                self._event_latency_samples_ms[category].append((now - t0) * 1000.0)
+
+    def record_event_count(self, category: str, count: int = 1) -> None:
+        """Increment a specific KPI counter."""
+        with self._lock:
+            self._event_counts[category] += count
+
+    # ----------------------------------------------------------------------------------
     # Computation and export
     # ----------------------------------------------------------------------------------
     @staticmethod
@@ -183,6 +210,23 @@ class MeshMetrics:
         tx_bps = (bytes_sent * 8.0 / duration_s) if duration_s > 0 else 0.0
         rx_bps = (bytes_received * 8.0 / duration_s) if duration_s > 0 else 0.0
         success_rate = (succeeded / started) * 100.0 if started > 0 else 0.0
+
+        with self._lock:
+            vote_rtt_samples = list(self._event_latency_samples_ms.get("vote_rtt", []))
+            handoff_samples = list(self._event_latency_samples_ms.get("handoff", []))
+            cert_attempt = self._event_counts.get("certificate_attempt", 0)
+            cert_built = self._event_counts.get("certificate_built", 0)
+            replay_drop = self._event_counts.get("replay_drop", 0)
+            dup_nonce = self._event_counts.get("duplicate_nonce_drop", 0)
+            bcb_loss_rate = self._event_counts.get("bcb_loss_rate", 0.0) # Usually reported externally
+
+        vote_rtt_p50 = self._percentile(sorted(vote_rtt_samples), 50) if vote_rtt_samples else 0.0
+        vote_rtt_p95 = self._percentile(sorted(vote_rtt_samples), 95) if vote_rtt_samples else 0.0
+        handoff_p50 = self._percentile(sorted(handoff_samples), 50) if handoff_samples else 0.0
+        handoff_p95 = self._percentile(sorted(handoff_samples), 95) if handoff_samples else 0.0
+
+        cert_assembly_rate = (cert_built / cert_attempt) if cert_attempt > 0 else 0.0
+
         return {
             "run_label": self._run_label,
             "duration_s": duration_s,
@@ -202,6 +246,14 @@ class MeshMetrics:
             "latency_samples": float(latency.count),
             "bytes_sent": float(bytes_sent),
             "bytes_received": float(bytes_received),
+            "vote_rtt_p50_ms": vote_rtt_p50,
+            "vote_rtt_p95_ms": vote_rtt_p95,
+            "cert_assembly_success_rate": cert_assembly_rate,
+            "replay_drop_count": float(replay_drop),
+            "duplicate_nonce_drop_count": float(dup_nonce),
+            "handoff_interruption_ms_p50": handoff_p50,
+            "handoff_interruption_ms_p95": handoff_p95,
+            "bcb_loss_rate": float(bcb_loss_rate)
         }
 
     def to_json(self, *, explicit_duration_s: Optional[float] = None) -> str:
@@ -230,6 +282,14 @@ class MeshMetrics:
             f"{snap['latency_samples']:.0f}",
             f"{snap['bytes_sent']:.0f}",
             f"{snap['bytes_received']:.0f}",
+            f"{snap['vote_rtt_p50_ms']:.2f}",
+            f"{snap['vote_rtt_p95_ms']:.2f}",
+            f"{snap['cert_assembly_success_rate']:.3f}",
+            f"{snap['replay_drop_count']:.0f}",
+            f"{snap['duplicate_nonce_drop_count']:.0f}",
+            f"{snap['handoff_interruption_ms_p50']:.2f}",
+            f"{snap['handoff_interruption_ms_p95']:.2f}",
+            f"{snap['bcb_loss_rate']:.4f}",
         )
 
     @staticmethod
@@ -254,6 +314,14 @@ class MeshMetrics:
             "latency_samples",
             "bytes_sent",
             "bytes_received",
+            "vote_rtt_p50_ms",
+            "vote_rtt_p95_ms",
+            "cert_assembly_success_rate",
+            "replay_drop_count",
+            "duplicate_nonce_drop_count",
+            "handoff_interruption_ms_p50",
+            "handoff_interruption_ms_p95",
+            "bcb_loss_rate"
         )
 
     def get_latency_samples_ms(self) -> List[float]:

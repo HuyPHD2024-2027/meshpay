@@ -1,15 +1,13 @@
 """WiFi Authority Node implementation for MeshPay simulation.
 
-This implementation was moved from ``mn_wifi.authority`` into the structured
-MeshPay namespace. Backward compatibility is preserved by a small shim in
-``mn_wifi.authority`` which re-exports this class.
+Inherits shared mesh networking behavior from :class:`MeshMixin`.
 """
 
 from __future__ import annotations
 
 import threading
 import time
-from queue import Queue
+
 from typing import Any, Dict, List, Optional, Set
 from uuid import uuid4
 from datetime import datetime
@@ -35,6 +33,8 @@ from meshpay.messages import (
     TransferResponseMessage,
 )
 
+from mn_wifi.services.core.config import DEFAULT_RELAY_TTL
+
 from meshpay.transport.transport import NetworkTransport, TransportKind
 from meshpay.transport.tcp import TCPTransport
 from meshpay.transport.udp import UDPTransport
@@ -43,6 +43,8 @@ from meshpay.transport.wifiDirect import WiFiDirectTransport
 from mn_wifi.metrics import MetricsCollector
 from meshpay.logger.authorityLogger import AuthorityLogger
 from mn_wifi.services.blockchain_client import BlockchainClient, TokenBalance
+
+from meshpay.nodes.mesh_mixin import MeshMixin
 
 
 DEFAULT_BALANCES = {
@@ -81,8 +83,12 @@ DEFAULT_BALANCES = {
 }
 
 
-class WiFiAuthority(Station):
-    """Authority node that runs on Mininet-WiFi host, inheriting from Station."""
+class WiFiAuthority(MeshMixin, Station):
+    """Authority node that runs on Mininet-WiFi host.
+
+    Inherits mesh networking (neighbor management, discovery, relay) from
+    :class:`MeshMixin`. 
+    """
 
     def __init__(
         self,
@@ -113,6 +119,8 @@ class WiFiAuthority(Station):
         }
         if position is not None:
              default_params['position'] = position
+        
+        # Override defaults with explicitly passed params
         default_params.update(params)
 
         super().__init__(name, **default_params)
@@ -138,14 +146,15 @@ class WiFiAuthority(Station):
             stake=0,
         )
 
-        self.p2p_connections: Dict[str, Address] = {}
-        self.message_queue: Queue[Message] = Queue()
         self.performance_metrics = MetricsCollector()
 
         self._running = False
         self._epoch: int = 1  # committee epoch for Flash-Mesh BCB
         self._message_handler_thread: Optional[threading.Thread] = None
         self._blockchain_sync_thread: Optional[threading.Thread] = None
+
+        # Init mesh mixin data structures
+        self._init_mesh()
 
         if transport is not None:
             self.transport = transport
@@ -158,6 +167,10 @@ class WiFiAuthority(Station):
                 self.transport = WiFiDirectTransport(self, self.address)
             else:
                 raise ValueError(f"Unsupported transport kind: {transport_kind}")
+
+    # ------------------------------------------------------------------
+    # Service lifecycle
+    # ------------------------------------------------------------------
 
     def start_fastpay_services(self, enable_internet: bool = False) -> bool:
         """Boot-strap background processing threads and ready the chosen transport."""
@@ -185,6 +198,8 @@ class WiFiAuthority(Station):
             )
             self._blockchain_sync_thread.start()
 
+        self._start_discovery_service()
+
         self.logger.info(f"Authority {self.name} started successfully")
         return True
 
@@ -202,6 +217,8 @@ class WiFiAuthority(Station):
         if self._blockchain_sync_thread:
             self._blockchain_sync_thread.join(timeout=5.0)
         self.logger.info(f"Authority {self.name} stopped")
+
+    # Discovery loops inherited from MeshMixin
 
     async def update_account_balance(self) -> None:
         """Update account balance.
@@ -280,12 +297,14 @@ class WiFiAuthority(Station):
 
     def handle_transfer_order(self, transfer_order: TransferOrder) -> TransferResponseMessage:
         """Handle transfer order from client."""
+        start_time = time.time()
         try:
-            if not self._validate_transfer_order(transfer_order):
+            is_valid, error = self._validate_transfer_order(transfer_order)
+            if not is_valid:
                 return TransferResponseMessage(
                     transfer_order=transfer_order,
                     success=False,
-                    error_message="Invalid transfer order",
+                    error_message=f"Invalid transfer: {error}",
                     authority_signature=self.state.authority_signature,
                 )
 
@@ -307,6 +326,8 @@ class WiFiAuthority(Station):
                 )
 
             self.performance_metrics.record_transaction()
+            validation_time = (time.time() - start_time) * 1000
+            self.performance_metrics.record_validation_time(validation_time)
 
             return TransferResponseMessage(
                 transfer_order=transfer_order,
@@ -367,7 +388,25 @@ class WiFiAuthority(Station):
             recipient.balances[transfer.token_address].meshpay_balance += transfer.amount
             recipient.last_update = time.time()
 
-            self.logger.info(f"Confirmation order {confirmation_order.order_id} processed")
+            #Clean up the Epidemic Message Buffer
+            order_id_str = str(confirmation_order.order_id)
+            # 1. Kill the original Transfer Request
+            if order_id_str in self.message_buffer:
+                self.message_buffer[order_id_str].ttl = 0
+                
+            # 2. Kill all the collected Transfer Responses
+            for key in list(self.message_buffer.keys()):
+                if key.startswith(f"{order_id_str}:resp:"):
+                    self.message_buffer[key].ttl = 0
+
+            finality_latency_ms = (time.time() - transfer.timestamp) * 1000
+            self.performance_metrics.record_e2e_latency(finality_latency_ms)
+
+            self.performance_metrics.record_success()
+            self.logger.info(
+                f"✅ Confirmation order {confirmation_order.order_id} processed successfully "
+                f"in {finality_latency_ms:.2f}ms"
+            )
             return True
 
         except Exception as e:
@@ -398,58 +437,93 @@ class WiFiAuthority(Station):
             self.logger.error(f"Error during manual blockchain sync: {e}")
         self.logger.info(f"Manual blockchain sync completed for {len(self.state.accounts)} accounts")
 
-    def _validate_transfer_order(self, transfer_order: TransferOrder) -> bool:
-        """Validate a transfer order."""
+    def _validate_transfer_order(self, transfer_order: TransferOrder) -> Tuple[bool, Optional[str]]:
+        """Validate a transfer order. Returns (is_valid, error_message)."""
         if transfer_order.amount <= 0:
-            return False
+            msg = f"amount <= 0 ({transfer_order.amount})"
+            self.logger.debug(f"Validation failed: {msg}")
+            return False, msg
         if transfer_order.sender == transfer_order.recipient:
-            return False
+            msg = "sender == recipient"
+            self.logger.debug(f"Validation failed: {msg}")
+            return False, msg
         if not transfer_order.sender or not transfer_order.recipient:
-            return False
+            msg = "empty sender or recipient"
+            self.logger.debug(f"Validation failed: {msg}")
+            return False, msg
 
         # Sender must exist in local state
         sender_account = self.state.accounts.get(transfer_order.sender)
         if sender_account is None:
-            return False
+            msg = f"sender '{transfer_order.sender}' not in accounts"
+            self.logger.debug(
+                f"Validation failed: {msg} (known: {list(self.state.accounts.keys())})"
+            )
+            return False, msg
 
-        # Sequence number must be monotonically increasing
+        # Sequence number must be strictly increasing
         try:
-            if int(transfer_order.sequence_number) < int(sender_account.sequence_number):
-                return False
+            if int(transfer_order.sequence_number) <= int(sender_account.sequence_number):
+                msg = f"seq {transfer_order.sequence_number} <= account seq {sender_account.sequence_number} (must be strictly increasing)"
+                self.logger.debug(f"Validation failed: {msg}")
+                self.performance_metrics.record_duplicate_nonce_drop()
+                return False, msg
         except Exception:
-            return False
+            msg = "sequence_number conversion error"
+            self.logger.debug(f"Validation failed: {msg}")
+            return False, msg
 
         # Sender must have a tracked balance for the token
         token_balance = sender_account.balances.get(transfer_order.token_address)
         if token_balance is None:
-            return False
+            msg = f"token '{transfer_order.token_address}' not in sender balances"
+            self.logger.debug(
+                f"Validation failed: {msg} (known assets for {transfer_order.sender}: {list(sender_account.balances.keys())})"
+            )
+            return False, msg
 
         try:
             meshpay_balance = float(token_balance.meshpay_balance)
         except Exception:
-            return False
+            msg = "meshpay_balance conversion error"
+            self.logger.debug(f"Validation failed: {msg}")
+            return False, msg
 
         if meshpay_balance < float(transfer_order.amount):
-            return False
-        return True
+            msg = f"insufficient balance ({meshpay_balance} < {transfer_order.amount})"
+            self.logger.debug(f"Validation failed: {msg}")
+            return False, msg
+
+        return True, None
 
     def _validate_confirmation_order(self, confirmation_order: ConfirmationOrder) -> bool:
         """Validate a confirmation order."""
+        # 1. Base transfer validation
         if not self._validate_transfer_order(confirmation_order.transfer_order):
             return False
 
+        # 2. Check for double-spend / replay
         account = self.state.accounts.get(confirmation_order.transfer_order.sender)
         if (
             account
             and account.confirmed_transfers
-            and confirmation_order.order_id in account.confirmed_transfers
+            and str(confirmation_order.order_id) in account.confirmed_transfers
         ):
+            self.performance_metrics.record_replay_drop()
+            self.logger.debug(f"Confirmation rejected: already confirmed {confirmation_order.order_id}")
             return False
 
-        if account.pending_confirmation and str(account.pending_confirmation.order_id) != str(
-            confirmation_order.transfer_order.order_id
-        ):
-            return False
+        # 3. Check pending transfer sequence
+        if account and account.pending_confirmation:
+            if str(account.pending_confirmation.order_id) != str(confirmation_order.transfer_order.order_id):
+                # We expect the confirmation to match our pending one for that sender
+                self.logger.debug(
+                    f"Confirmation rejected: order_id mismatch: "
+                    f"pending {account.pending_confirmation.order_id} vs "
+                    f"received {confirmation_order.transfer_order.order_id}"
+                )
+                return False
+
         return True
 
     def _message_handler_loop(self) -> None:
@@ -464,9 +538,25 @@ class WiFiAuthority(Station):
                 time.sleep(0.1)
 
     def _process_message(self, message: Message) -> None:
-        """Process incoming message."""
+        """Process incoming raw network packets directly from the transport layer.
+        
+        This handler catches two types of communication:
+        1. Pure DTN Routing (Mesh): The foundation of the mesh network. Summaries 
+           and bundles wrapped in ROUTING_MESSAGEs.
+        2. Direct Transport (Legacy/Internet): If a client is connected directly to 
+           this authority (e.g., via TCP/Internet), bypass the buffer and process 
+           immediately.
+        """
         try:
-            if message.message_type == MessageType.TRANSFER_REQUEST:
+            # ── 1. Pure DTN / Mesh Network Flow ──
+            if message.message_type == MessageType.ROUTING_MESSAGE:
+                # Hand this over to the DTN bridge (MeshMixin) which parses it.
+                # If it's data, the DTN bridge will eventually call `on_dtn_bundle_received`.
+                self._handle_routing_message(message)
+
+            # ── 2. Direct Internet / Legacy Flow ──
+            elif message.message_type == MessageType.TRANSFER_REQUEST:
+                # Received directly from a client. Process and instantly reply directly.
                 request = TransferRequestMessage.from_payload(message.payload)
                 response = self.handle_transfer_order(request.transfer_order)
                 response_message = Message(
@@ -480,6 +570,7 @@ class WiFiAuthority(Station):
                 self.transport.send_message(response_message, message.sender)
 
             elif message.message_type == MessageType.CONFIRMATION_REQUEST:
+                # Received directly
                 request = ConfirmationRequestMessage.from_payload(message.payload)
                 self.handle_confirmation_order(request.confirmation_order)
 
@@ -509,41 +600,47 @@ class WiFiAuthority(Station):
                 self.logger.error(f"Error in blockchain sync loop: {e}")
                 time.sleep(10)
 
-    # ── Flash-Mesh / D-SDN helpers ────────────────────────────────────
+    def on_dtn_bundle_received(self, item) -> None:
+        """Application hook triggered by the DTN layer when a new bundle arrives.
+        
+        Unlike `_process_message` which sees all raw packets, this is ONLY called 
+        when the Epidemic routing protocol successfully downloads a new transaction 
+        from a neighbor and saves it to the `message_buffer`.
 
-    def get_link_stats(self) -> Dict[str, Any]:
-        """Expose iw-based link metrics for the SDN controller layer.
-
-        Runs ``iw dev <intf> station dump`` inside the node namespace and
-        parses signal strength, tx/rx bytes, and expected throughput.
+        As an Authority, our job is to ACT on these buffered transactions:
+        - If it's a TRANSFER_REQUEST, we validate it, sign it, and inject the 
+          resulting TRANSFER_RESPONSE *back* into the buffer so the epidemic 
+          routing will carry it back to the client.
+        - If it's a CONFIRMATION_REQUEST, we finalize the transaction locally.
         """
-        try:
-            # Determine wireless interface name
-            intf = f"{self.name}-wlan0"
-            raw = self.cmd(f"iw dev {intf} station dump")
-            return self._parse_iw_station_dump(raw)
-        except Exception as e:
-            self.logger.error(f"get_link_stats failed: {e}")
-            return {}
+        from meshpay.messages import MessageType, TransferRequestMessage
+        from meshpay.types.transaction import MessageBufferItem
+        from mn_wifi.services.core.config import DEFAULT_RELAY_TTL
 
-    @staticmethod
-    def _parse_iw_station_dump(raw: str) -> Dict[str, Any]:
-        """Parse output of ``iw dev ... station dump`` into a dict."""
-        stats: Dict[str, Any] = {}
-        for line in raw.splitlines():
-            line = line.strip()
-            if ":" not in line:
-                continue
-            key, _, val = line.partition(":")
-            key = key.strip().lower().replace(" ", "_")
-            val = val.strip()
-            # Try to convert numeric values
-            for suffix in (" dBm", " MBit/s", " bytes", " packets", " ms"):
-                if val.endswith(suffix):
-                    val = val[: -len(suffix)]
-                    break
-            try:
-                stats[key] = float(val) if "." in val else int(val)
-            except (ValueError, TypeError):
-                stats[key] = val
-        return stats
+        if item.message_type == MessageType.TRANSFER_REQUEST.value:
+            request = TransferRequestMessage.from_payload(item.payload)
+            
+            # Process the transaction and generate our signature/response
+            response = self.handle_transfer_order(request.transfer_order)
+
+            # Important: Inject response back into message_buffer for epidemic spread
+            # We don't send it directly over the transport because we don't know where 
+            # the client is. Epidemic routing will spread it until it reaches them.
+            resp_msg_id = f"{request.transfer_order.order_id}:resp:{self.name}"
+            
+            if resp_msg_id not in self.message_buffer:
+                self.message_buffer[resp_msg_id] = MessageBufferItem(
+                    message_id=resp_msg_id,
+                    message_type=MessageType.TRANSFER_RESPONSE.value,
+                    payload=response.to_payload(),
+                    sender_id=self.name,
+                    ttl=DEFAULT_RELAY_TTL,
+                )
+                self.routing_protocol.on_message_added_to_buffer(
+                    resp_msg_id, self.message_buffer
+                )
+                self._flush_routing_outbox()
+
+        elif item.message_type == MessageType.CONFIRMATION_REQUEST.value:
+            request = ConfirmationRequestMessage.from_payload(item.payload)
+            self.handle_confirmation_order(request.confirmation_order)

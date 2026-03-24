@@ -17,4 +17,4 @@ trunk
 .env
 results/
 meshpay/analysis/
-sflow-rt/
+sflow-rt/*
