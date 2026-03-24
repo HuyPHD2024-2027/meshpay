@@ -332,14 +332,13 @@ class MeshPayCLI(CLI):  # pylint: disable=too-many-instance-attributes
         - Authority: full AuthorityState (accounts, committee, shards, stake …)
         - User/Client: full ClientState  (balance, certs, pending, committee …)
 
-        Usage: infor <station|all|authorities|users>
+        Usage: infor [station|all|authorities|users]
         """
         args = line.split()
-        if len(args) != 1:
-            print("Usage: infor <station|all|authorities|users>")
-            return
-
-        station_name = args[0]
+        if not args:
+            station_name = "all"
+        else:
+            station_name = args[0]
 
         if station_name.lower() in {"all", "*"}:
             for auth in self.authorities:
@@ -402,6 +401,10 @@ class MeshPayCLI(CLI):  # pylint: disable=too-many-instance-attributes
 
         print(f"   {'═' * W}")
         print()
+
+    def do_info(self, line: str) -> None:
+        """Alias for infor."""
+        self.do_infor(line)
 
     # ── Authority state helper ─────────────────────────────────────────
     def _print_authority_state(self, state, row, sep) -> None:

@@ -65,14 +65,15 @@ from mn_wifi.examples.demoCommon import (
 )
 
 
-def create_mesh_network_with_internet(
+def create_mesh_network(
     num_authorities: int = 5,
     num_clients: int = 3,
     mesh_id: str = "meshpay",
     enable_mobility: bool = True,
     enable_plot: bool = False,
     enable_internet: bool = False,
-    gateway_port: int = 8080
+    gateway_port: int = 8080,
+    wireless_range: int = 15
 ) -> Tuple[Mininet_wifi, List[WiFiAuthority], List[Client], Optional[Bridge]]:
     """Create IEEE 802.11s mesh network topology with optional internet gateway.
     
@@ -107,7 +108,7 @@ def create_mesh_network_with_internet(
             ip=f"10.0.0.{10 + i}/8",
             port=8000 + i,
             position=f'{40 + (i * 15)},100,0',
-            range=15,
+            range=wireless_range,
             txpower=10
         )
         authorities.append(auth)
@@ -122,7 +123,7 @@ def create_mesh_network_with_internet(
             ip=f"10.0.0.{20 + i}/8",
             port=9000 + i,
             min_x=0, max_x=200, min_y=0, max_y=150, min_v=1, max_v=3,    
-            range=15,
+            range=wireless_range,
             txpower=10,
         )
         clients.append(client)
@@ -311,6 +312,7 @@ def main() -> None:
     info(f"   Internet Gateway: {'Enabled' if args.internet else 'Disabled'}\n")
     info(f"   Gateway Port: {args.gateway_port}\n")
     info(f"   Mobility: {'Enabled' if args.mobility else 'Disabled'}\n")
+    info(f"   SDN Controller: {'Enabled' if args.flashmesh else 'Disabled'}\n")
     
     net = None
     bridge = None
@@ -319,7 +321,7 @@ def main() -> None:
     fallback = None
     try:
         # Create enhanced mesh network with internet gateway
-        net, authorities, clients, gateway, bridge = create_mesh_network_with_internet(
+        net, authorities, clients, gateway, bridge = create_mesh_network(
             num_authorities=args.authorities,
             num_clients=args.clients,
             mesh_id=args.mesh_id,
@@ -371,7 +373,7 @@ def main() -> None:
                 qos_mgr.install_priority(node)
             info(f"   ✅ QoS installed on {len(all_nodes)} nodes\n")
 
-            link_stats = LinkStatsCollector(all_nodes, interval_ms=500)
+            link_stats = LinkStatsCollector(all_nodes, interval_ms=500, qos_mgr=qos_mgr)
             link_stats.start()
             info("   ✅ Link stats collector started (500ms interval)\n")
 

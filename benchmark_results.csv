@@ -1,0 +1,8 @@
+node_type,node_name,tx_count,success_count,error_count,finality_latency_ms,vote_rtt_avg_ms,cert_assembly_success_rate,handoff_interruption_ms_avg,replay_drops,duplicate_nonce_drops,bcb_dropped,bcb_overlimits
+authority,auth1,5,2,0,320056.9796562195,,,,0,0,0,0
+authority,auth2,5,1,0,420047.44029045105,,,,0,0,0,0
+authority,auth3,2,0,0,0.0,,,,0,0,0,0
+authority,auth4,5,1,0,449236.97781562805,,,,0,0,0,0
+client,user1,2,0,0,,204472.59092330933,0.5,0.0,,,0,0
+client,user2,2,0,0,,221565.70663452148,0.5,0.0,,,0,0
+client,user3,3,0,0,,224172.95801639557,0.6666666666666666,0.0,,,0,0

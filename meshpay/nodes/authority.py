@@ -119,6 +119,8 @@ class WiFiAuthority(MeshMixin, Station):
         }
         if position is not None:
              default_params['position'] = position
+        
+        # Override defaults with explicitly passed params
         default_params.update(params)
 
         super().__init__(name, **default_params)
@@ -297,11 +299,12 @@ class WiFiAuthority(MeshMixin, Station):
         """Handle transfer order from client."""
         start_time = time.time()
         try:
-            if not self._validate_transfer_order(transfer_order):
+            is_valid, error = self._validate_transfer_order(transfer_order)
+            if not is_valid:
                 return TransferResponseMessage(
                     transfer_order=transfer_order,
                     success=False,
-                    error_message="Invalid transfer order",
+                    error_message=f"Invalid transfer: {error}",
                     authority_signature=self.state.authority_signature,
                 )
 
@@ -385,8 +388,25 @@ class WiFiAuthority(MeshMixin, Station):
             recipient.balances[transfer.token_address].meshpay_balance += transfer.amount
             recipient.last_update = time.time()
 
+            #Clean up the Epidemic Message Buffer
+            order_id_str = str(confirmation_order.order_id)
+            # 1. Kill the original Transfer Request
+            if order_id_str in self.message_buffer:
+                self.message_buffer[order_id_str].ttl = 0
+                
+            # 2. Kill all the collected Transfer Responses
+            for key in list(self.message_buffer.keys()):
+                if key.startswith(f"{order_id_str}:resp:"):
+                    self.message_buffer[key].ttl = 0
+
+            finality_latency_ms = (time.time() - transfer.timestamp) * 1000
+            self.performance_metrics.record_e2e_latency(finality_latency_ms)
+
             self.performance_metrics.record_success()
-            self.logger.info(f"Confirmation order {confirmation_order.order_id} processed")
+            self.logger.info(
+                f"✅ Confirmation order {confirmation_order.order_id} processed successfully "
+                f"in {finality_latency_ms:.2f}ms"
+            )
             return True
 
         except Exception as e:
@@ -417,79 +437,93 @@ class WiFiAuthority(MeshMixin, Station):
             self.logger.error(f"Error during manual blockchain sync: {e}")
         self.logger.info(f"Manual blockchain sync completed for {len(self.state.accounts)} accounts")
 
-    def _validate_transfer_order(self, transfer_order: TransferOrder) -> bool:
-        """Validate a transfer order."""
+    def _validate_transfer_order(self, transfer_order: TransferOrder) -> Tuple[bool, Optional[str]]:
+        """Validate a transfer order. Returns (is_valid, error_message)."""
         if transfer_order.amount <= 0:
-            self.logger.debug(f"Validation failed: amount <= 0 ({transfer_order.amount})")
-            return False
+            msg = f"amount <= 0 ({transfer_order.amount})"
+            self.logger.debug(f"Validation failed: {msg}")
+            return False, msg
         if transfer_order.sender == transfer_order.recipient:
-            self.logger.debug("Validation failed: sender == recipient")
-            return False
+            msg = "sender == recipient"
+            self.logger.debug(f"Validation failed: {msg}")
+            return False, msg
         if not transfer_order.sender or not transfer_order.recipient:
-            self.logger.debug("Validation failed: empty sender or recipient")
-            return False
+            msg = "empty sender or recipient"
+            self.logger.debug(f"Validation failed: {msg}")
+            return False, msg
 
         # Sender must exist in local state
         sender_account = self.state.accounts.get(transfer_order.sender)
         if sender_account is None:
+            msg = f"sender '{transfer_order.sender}' not in accounts"
             self.logger.debug(
-                f"Validation failed: sender '{transfer_order.sender}' not in accounts "
-                f"(known: {list(self.state.accounts.keys())})"
+                f"Validation failed: {msg} (known: {list(self.state.accounts.keys())})"
             )
-            return False
+            return False, msg
 
-        # Sequence number must be monotonically increasing
+        # Sequence number must be strictly increasing
         try:
-            if int(transfer_order.sequence_number) < int(sender_account.sequence_number):
-                self.logger.debug(
-                    f"Validation failed: seq {transfer_order.sequence_number} < "
-                    f"account seq {sender_account.sequence_number}"
-                )
-                return False
+            if int(transfer_order.sequence_number) <= int(sender_account.sequence_number):
+                msg = f"seq {transfer_order.sequence_number} <= account seq {sender_account.sequence_number} (must be strictly increasing)"
+                self.logger.debug(f"Validation failed: {msg}")
+                self.performance_metrics.record_duplicate_nonce_drop()
+                return False, msg
         except Exception:
-            self.logger.debug("Validation failed: sequence_number conversion error")
-            return False
+            msg = "sequence_number conversion error"
+            self.logger.debug(f"Validation failed: {msg}")
+            return False, msg
 
         # Sender must have a tracked balance for the token
         token_balance = sender_account.balances.get(transfer_order.token_address)
         if token_balance is None:
+            msg = f"token '{transfer_order.token_address}' not in sender balances"
             self.logger.debug(
-                f"Validation failed: token '{transfer_order.token_address}' not in "
-                f"sender balances (known: {list(sender_account.balances.keys())})"
+                f"Validation failed: {msg} (known assets for {transfer_order.sender}: {list(sender_account.balances.keys())})"
             )
-            return False
+            return False, msg
 
         try:
             meshpay_balance = float(token_balance.meshpay_balance)
         except Exception:
-            self.logger.debug("Validation failed: meshpay_balance conversion error")
-            return False
+            msg = "meshpay_balance conversion error"
+            self.logger.debug(f"Validation failed: {msg}")
+            return False, msg
 
         if meshpay_balance < float(transfer_order.amount):
-            self.logger.debug(
-                f"Validation failed: insufficient balance "
-                f"({meshpay_balance} < {transfer_order.amount})"
-            )
-            return False
-        return True
+            msg = f"insufficient balance ({meshpay_balance} < {transfer_order.amount})"
+            self.logger.debug(f"Validation failed: {msg}")
+            return False, msg
+
+        return True, None
 
     def _validate_confirmation_order(self, confirmation_order: ConfirmationOrder) -> bool:
         """Validate a confirmation order."""
+        # 1. Base transfer validation
         if not self._validate_transfer_order(confirmation_order.transfer_order):
             return False
 
+        # 2. Check for double-spend / replay
         account = self.state.accounts.get(confirmation_order.transfer_order.sender)
         if (
             account
             and account.confirmed_transfers
-            and confirmation_order.order_id in account.confirmed_transfers
+            and str(confirmation_order.order_id) in account.confirmed_transfers
         ):
+            self.performance_metrics.record_replay_drop()
+            self.logger.debug(f"Confirmation rejected: already confirmed {confirmation_order.order_id}")
             return False
 
-        if account.pending_confirmation and str(account.pending_confirmation.order_id) != str(
-            confirmation_order.transfer_order.order_id
-        ):
-            return False
+        # 3. Check pending transfer sequence
+        if account and account.pending_confirmation:
+            if str(account.pending_confirmation.order_id) != str(confirmation_order.transfer_order.order_id):
+                # We expect the confirmation to match our pending one for that sender
+                self.logger.debug(
+                    f"Confirmation rejected: order_id mismatch: "
+                    f"pending {account.pending_confirmation.order_id} vs "
+                    f"received {confirmation_order.transfer_order.order_id}"
+                )
+                return False
+
         return True
 
     def _message_handler_loop(self) -> None:

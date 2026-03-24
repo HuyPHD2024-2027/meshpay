@@ -46,6 +46,7 @@ from mn_wifi.services.core.config import (
     DISCOVERY_PORT,
     DISCOVERY_INTERVAL,
     NEIGHBOR_TIMEOUT,
+    SUPPORTED_TOKENS,
 )
 from meshpay.messages import TransferRequestMessage, MessageType
 from meshpay.types.transaction import MessageBufferItem
@@ -87,7 +88,6 @@ class Client(MeshMixin, Station):
             "antennaGain": 5,
         }
         default_params.update(params)
-
         super().__init__(name, **default_params)
 
         self.name = name
@@ -170,6 +170,11 @@ class Client(MeshMixin, Station):
         t = threading.Thread(target=self._message_handler_loop, daemon=True)
         t.start()
         self._threads.append(t)
+        
+        # Start handoff tracking loop
+        t_handoff = threading.Thread(target=self._track_handoff_loop, daemon=True)
+        t_handoff.start()
+        self._threads.append(t_handoff)
 
         self.logger.info(
             f"Client {self.name} started "
@@ -203,6 +208,10 @@ class Client(MeshMixin, Station):
         Returns:
             TransactionStatus: BUFFERED — queued for retry until quorum.
         """
+        # Resolve symbol to address if possible
+        if token_address in SUPPORTED_TOKENS:
+            token_address = SUPPORTED_TOKENS[token_address]['address']
+
         order = TransferOrder(
             order_id=uuid4(),
             sender=self.state.name,
@@ -234,6 +243,8 @@ class Client(MeshMixin, Station):
             f"Transfer {order.order_id} queued"
         )
         self.performance_metrics.record_transaction()
+        self._pending_tx_start_time = time.time()
+        self.performance_metrics.record_certificate_attempt()
         return TransactionStatus.BUFFERED
 
     # ------------------------------------------------------------------
@@ -275,10 +286,23 @@ class Client(MeshMixin, Station):
 
     def _on_quorum_reached(self, order_id) -> None:
         """Handle quorum reached: broadcast confirmation, purge from queue."""
+        self.performance_metrics.record_certificate_built()
+        if hasattr(self, "_pending_tx_start_time"):
+            e2e_latency = (time.time() - self._pending_tx_start_time) * 1000
+            self.performance_metrics.record_e2e_latency(e2e_latency)
+
         self.logger.info("Quorum reached – broadcasting confirmation via opportunistic mesh")
         self.broadcast_confirmation()
-        # Remove transfer request from buffer
-        self.message_buffer.pop(str(order_id), None)
+
+        order_id_str = str(order_id)
+        # 1. Kill the original Transfer Request
+        if order_id_str in self.message_buffer:
+            self.message_buffer[order_id_str].ttl = 0
+            
+        # 2. Kill all the collected Transfer Responses
+        for key in list(self.message_buffer.keys()):
+            if key.startswith(f"{order_id_str}:resp:"):
+                self.message_buffer[key].ttl = 0
 
     def handle_transfer_response(self, resp: TransferResponseMessage) -> bool:
         """Handle transfer response from authority (received via mesh relay)."""
@@ -292,6 +316,10 @@ class Client(MeshMixin, Station):
             if not self._validate_transfer_response(resp):
                 return False
             self._track_signature(resp)
+            if hasattr(self, "_pending_tx_start_time"):
+                vote_latency = (time.time() - self._pending_tx_start_time) * 1000
+                self.performance_metrics.record_vote_rtt(vote_latency)
+
             if self._check_quorum(resp.transfer_order.order_id) and self.state.pending_transfer:
                 self._on_quorum_reached(resp.transfer_order.order_id)
             return True
@@ -352,8 +380,7 @@ class Client(MeshMixin, Station):
             )
             return
 
-        transfer_signatures = [c.authority_signature for c in self.state.sent_certificates]
-        order = self.state.pending_transfer
+        transfer_signatures = [c.authority_signature for c in relevant_certs]
         confirmation = ConfirmationOrder(
             order_id=order.order_id,
             transfer_order=order,
@@ -378,6 +405,7 @@ class Client(MeshMixin, Station):
             )
             # Notify routing protocol locally
             self.routing_protocol.on_message_added_to_buffer(conf_msg_id, self.message_buffer)
+            self.logger.info(f"✅ Confirmation Order {order.order_id} injected into buffer")
 
         # Clear local state
         self.state.pending_transfer = None
@@ -438,6 +466,34 @@ class Client(MeshMixin, Station):
                 if hasattr(self, "logger"):
                     self.logger.error(f"Error in message handler loop: {exc}")
                 time.sleep(0.2)
+
+    def _track_handoff_loop(self) -> None:
+        """Background thread to estimate mobility handoff interruptions."""
+        connected_anchor = None
+        while self._running:
+            try:
+                active = self.get_neighbors()
+                # Find an authority in the neighbor list
+                new_anchor = None
+                for nid in active:
+                    # In mininet, authorities are often named 'authX'
+                    if "auth" in nid:
+                        new_anchor = nid
+                        break
+                
+                if connected_anchor != new_anchor:
+                    if connected_anchor is not None and new_anchor is None:
+                        # We just lost our connection to an anchor
+                        self._handoff_start_time = time.time()
+                    elif connected_anchor is None and new_anchor is not None:
+                        # We just reconnected to an anchor
+                        if hasattr(self, "_handoff_start_time"):
+                            interrupt_latency = (time.time() - self._handoff_start_time) * 1000
+                            self.performance_metrics.record_handoff_interruption(interrupt_latency)
+                    connected_anchor = new_anchor
+                time.sleep(0.5)
+            except Exception as exc:
+                time.sleep(0.5)
 
     def on_dtn_bundle_received(self, item) -> None:
         """Application hook triggered by the DTN layer when a new bundle arrives.
