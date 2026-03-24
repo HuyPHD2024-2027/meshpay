@@ -40,8 +40,8 @@ update_onchain_balance auth1
 
 ## 📞 Contact
 
-*Huy D. Q.*, Etherlink Hackathon Participant — [huydo21052000@gmail.com]
+*Huy D. Q.* — [huydo21052000@gmail.com]
 
 ---
 
-> © 2025 Huy D. Q. Built for Etherlink Hackathon. Licensed under Apache 2.0. Powered by Mininet-WiFi.
+> © 2025 Huy D. Q. Licensed under Apache 2.0. Powered by Mininet-WiFi.

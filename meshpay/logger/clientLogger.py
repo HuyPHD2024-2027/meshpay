@@ -81,11 +81,12 @@ class ClientLogger:
                     pass
             self.terminal_process = None
 
-    def log(self, message: str) -> None:
+    def log(self, message: str, print_to_console: bool = True) -> None:
         """Log a message with timestamp.
         
         Args:
             message: Message to log
+            print_to_console: If True, also prints to standard output
         """
         timestamp = time.strftime('%H:%M:%S.%f')[:-3]
         log_entry = f"[{timestamp}] {self.client_name}: {message}"
@@ -100,8 +101,9 @@ class ClientLogger:
             pass
         
         # Also print to console with authority color coding
-        color = self.colors.get(self.client_name, '')
-        print(f"{color}{log_entry}{self.reset_color}")
+        if print_to_console:
+            color = self.colors.get(self.client_name, '')
+            print(f"{color}{log_entry}{self.reset_color}")
     
     def error(self, message: str) -> None:
         """Log an error message."""
@@ -111,14 +113,14 @@ class ClientLogger:
         """Log an info message."""
         self.log(f"ℹ️  INFO: {message}")
     
-    def warning(self, message: str) -> None:
+    def warning(self, message: str, print_to_console: bool = False) -> None:
         """Log a warning message."""
-        self.log(f"⚠️  WARNING: {message}")
+        self.log(f"⚠️  WARNING: {message}", print_to_console=print_to_console)
     
-    def debug(self, message: Any) -> None:
-        """Log a debug message with intelligent formatting."""
-        formatted = format_message(message, max_length=150)
-        self.log(f"🐛 DEBUG: {formatted}")
+    def debug(self, message: Any, print_to_console: bool = False) -> None:
+        """Log a debug message to file but NOT to the main CLI terminal."""
+        # formatted = format_message(message, max_length=150)
+        self.log(f"🐛 DEBUG: {message}", print_to_console=print_to_console)
     
     def success(self, message: str) -> None:
         """Log a success message."""

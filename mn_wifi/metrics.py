@@ -72,13 +72,34 @@ class MetricsCollector:
 
         # Transaction-level counters --------------------------------------------
         self.transaction_count = 0
+        self.successful_transaction_count = 0
         self.error_count = 0
         self.sync_count = 0
+        self._validation_latency = RollingAverage()
+        self._e2e_latency = RollingAverage()
+        
+        # TPS calculation
+        self._last_tps_check = time.time()
+        self._tx_at_last_check = 0
+        self._rolling_tps = RollingAverage(capacity=10)
+
+        # Flash-Mesh KPIs -------------------------------------------------------
+        self._vote_rtt = RollingAverage()
+        self._handoff_interruption = RollingAverage()
+        self.certificate_attempts = 0
+        self.certificates_built = 0
+        self.replay_drops = 0
+        self.duplicate_nonce_drops = 0
         
     def record_transaction(self) -> None:
         """Record a transaction."""
         self.transaction_count += 1
+        self._update_tps()
         
+    def record_success(self) -> None:
+        """Record a successful transaction completion."""
+        self.successful_transaction_count += 1
+
     def record_error(self) -> None:
         """Record an error."""
         self.error_count += 1
@@ -86,6 +107,55 @@ class MetricsCollector:
     def record_sync(self) -> None:
         """Record a synchronization."""
         self.sync_count += 1
+        
+    def record_validation_time(self, latency_ms: float) -> None:
+        """Record the time spent validating a transaction/shard."""
+        self._validation_latency.add(latency_ms)
+
+    def record_e2e_latency(self, latency_ms: float) -> None:
+        """Record end-to-end transaction latency."""
+        self._e2e_latency.add(latency_ms)
+
+    def record_vote_rtt(self, latency_ms: float) -> None:
+        """Record vote RTT for a specific authority response."""
+        self._vote_rtt.add(latency_ms)
+
+    def record_handoff_interruption(self, latency_ms: float) -> None:
+        """Record handoff interruption time."""
+        self._handoff_interruption.add(latency_ms)
+
+    def record_certificate_attempt(self) -> None:
+        self.certificate_attempts += 1
+
+    def record_certificate_built(self) -> None:
+        self.certificates_built += 1
+
+    def record_replay_drop(self) -> None:
+        self.replay_drops += 1
+
+    def record_duplicate_nonce_drop(self) -> None:
+        self.duplicate_nonce_drops += 1
+
+    def _update_tps(self) -> None:
+        """Update rolling TPS estimation."""
+        now = time.time()
+        dt = now - self._last_tps_check
+        if dt >= 1.0:
+            current_tx = self.transaction_count
+            delta_tx = current_tx - self._tx_at_last_check
+            self._rolling_tps.add(delta_tx / dt)
+            self._last_tps_check = now
+            self._tx_at_last_check = current_tx
+
+    def get_tps(self) -> float:
+        """Return rolling average TPS."""
+        self._update_tps() # Ensure it's fresh if called between transactions
+        return self._rolling_tps.average
+
+    def get_reputation_score(self) -> float:
+        """Calculate the node's reputation score (success completion ratio)."""
+        tot = self.transaction_count + self.error_count
+        return self.transaction_count / tot if tot > 0 else 1.0
         
     def update_network_metrics(self, metrics: NetworkMetrics) -> None:
         """Update network metrics.
@@ -140,10 +210,24 @@ class MetricsCollector:
                 "connectivity_ratio": self._peer_connectivity.get(peer, RollingAverage()).average,
             }
 
+        cert_assembly_success_rate = (
+            self.certificates_built / self.certificate_attempts
+        ) if self.certificate_attempts > 0 else 0.0
+
         return {
             "transaction_count": self.transaction_count,
+            "successful_transaction_count": self.successful_transaction_count,
             "error_count": self.error_count,
             "sync_count": self.sync_count,
+            "validation_latency_ms": self._validation_latency.average,
+            "average_e2e_latency_ms": self._e2e_latency.average,
+            "vote_rtt_avg_ms": self._vote_rtt.average,
+            "cert_assembly_success_rate": cert_assembly_success_rate,
+            "replay_drop_count": self.replay_drops,
+            "duplicate_nonce_drop_count": self.duplicate_nonce_drops,
+            "handoff_interruption_ms_avg": self._handoff_interruption.average,
+            "tps": self.get_tps(),
+            "reputation_score": self.get_reputation_score(),
             "network_metrics": asdict(self.network_metrics),
             "peer_metrics": peer_stats,
-        } 
+        }

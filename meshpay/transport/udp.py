@@ -97,7 +97,15 @@ class UDPTransport:  # pylint: disable=too-few-public-methods
                 escaped_payload
             )
             
-            self.node.cmd(cmd)
+            import subprocess
+            cmd_list = ["python3", "-c", script, target.ip_address, str(target.port), payload]
+            
+            proc = self.node.popen(cmd_list, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            # For UDP, we can communicate with a short timeout or just let it fire
+            stdout, stderr = proc.communicate(timeout=2.0)
+            
+            if proc.returncode != 0:
+                self.logger.warning(f"UDP send returned error: {stderr.strip()}")
             return True
         except Exception as exc:  # pragma: no cover
             self.logger.error(f"UDP send failed: {exc}")
@@ -114,12 +122,13 @@ class UDPTransport:  # pylint: disable=too-few-public-methods
     # ------------------------------------------------------------------
 
     def _start_udp_server_in_node(self) -> bool:
+        """Start the UDP server inside the station namespace via popen."""
         server_script = self._create_server_script()
         if not server_script:
             return False
-        self.node.cmd(
-            f"python3 {server_script} 0.0.0.0 {self.address.port} {self.address.node_id} &"
-        )
+        import subprocess
+        cmd = ["python3", server_script, "0.0.0.0", str(self.address.port), self.address.node_id]
+        self._server_proc = self.node.popen(cmd)
         return True
 
     def _create_server_script(self) -> Optional[str]:

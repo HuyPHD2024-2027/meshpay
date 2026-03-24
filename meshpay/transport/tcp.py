@@ -72,14 +72,16 @@ class TCPTransport:
         self.node.logger.info("TCPTransport disconnected")
     
     def _start_tcp_server_in_node(self) -> bool:
-        """Run the tiny TCP server inside the station namespace."""
+        """Run the tiny TCP server inside the station namespace using popen."""
         server_script = self._create_tcp_server_script()
         if not server_script:
             return False
 
-        # run in the node's namespace
-        self.node.cmd(f"python3 {server_script} 0.0.0.0 {self.address.port} "
-                      f"{self.address.node_id} &")
+        # run in the node's namespace asynchronously via popen
+        import subprocess
+        cmd = ["python3", server_script, "0.0.0.0", str(self.address.port), self.address.node_id]
+        # Store process reference to avoid it being GCed too early
+        self._server_proc = self.node.popen(cmd)
         return True
 
     def _monitor_messages(self) -> None:
@@ -192,22 +194,12 @@ if __name__ == '__main__':
             return None
     
     def send_message(self, message: Message, target: Address) -> bool:
-        """Send *message* to *target* by executing a small Python script **inside** the
-        sender node's namespace using :pymeth:`mininet.node.Node.cmd`.
-
-        This mirrors the technique used in *send_transfer_order* under
-        ``mn_wifi/examples/authority.py`` so that the TCP connection is opened from
-        within the network namespace of the station rather than the host
-        running the simulation.  Doing so avoids connectivity issues when the
-        virtual IP addresses are not reachable from the outside.
-        """
-
-        # Serialise *message* to the JSON structure understood by the in-namespace
-        # servers (length-prefixed JSON, identical to the one used in the server
-        # script started by *connect()*).
-        import json  # local import to avoid bleeding into global namespace
+        """Send *message* to *target* using node.popen for thread safety."""
+        import json
         import textwrap
         import uuid
+        import subprocess
+        import os
 
         message_data = {
             "message_id": str(message.message_id),
@@ -224,9 +216,6 @@ if __name__ == '__main__':
 
         json_blob = json.dumps(message_data, default=str)
 
-        # ------------------------------------------------------------------
-        # Build tiny Python client script (runs inside node namespace)
-        # ------------------------------------------------------------------
         client_code = textwrap.dedent(
             f"""
             import socket, struct, json, sys
@@ -235,10 +224,9 @@ if __name__ == '__main__':
             msg = data.encode('utf-8')
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(5)
+                sock.settimeout(2)
                 sock.connect((ip, port))
                 sock.send(struct.pack('>I', len(msg)) + msg)
-                # Optional ACK parsing
                 try:
                     hdr = sock.recv(4, socket.MSG_WAITALL)
                     if len(hdr) == 4:
@@ -257,23 +245,33 @@ if __name__ == '__main__':
         script_path = f"/tmp/send_{uuid.uuid4().hex}.py"
 
         try:
-            # 1. Dump script inside the node's filesystem.
-            self.node.cmd(f"cat > {script_path} << 'PY'\n{client_code}\nPY")
+            # 1. Write script directly from host (namespaces share /tmp)
+            with open(script_path, "w") as f:
+                f.write(client_code)
+            os.chmod(script_path, 0o755)
 
-            # 2. Execute script from within the namespace.
-            output = self.node.cmd(f"python3 {script_path} | cat").strip()
+            # 2. Execute script via popen to avoid shell contention
+            proc = self.node.popen(
+                ["python3", script_path],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+            stdout, stderr = proc.communicate(timeout=10)
 
-            # 3. Clean-up temporary file.
-            self.node.cmd(f"rm -f {script_path}")
+            # 3. Clean-up
+            if os.path.exists(script_path):
+                os.remove(script_path)
 
-            if "SUCCESS" in output:
+            if "SUCCESS" in (stdout or ""):
                 return True
 
+            err = stderr or stdout or "<no output>"
             self.node.logger.warning(
-                f"Send failed to {target.ip_address}:{target.port}: {output or '<no output>'}")
+                f"Send failed to {target.ip_address}:{target.port}: {err.strip()}")
             return False
-        except Exception as exc:  # pragma: no cover
-            self.node.logger.error(f"Failed to send message in namespace: {exc}")
+        except Exception as exc:
+            self.node.logger.error(f"Failed to send message via popen: {exc}")
             return False
     
     def receive_message(self, timeout: float = 1.0) -> Optional[Message]:

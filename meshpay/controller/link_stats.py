@@ -29,6 +29,9 @@ class LinkSample:
     expected_throughput: float = 0.0  # Mbit/s
     rtt_ms: float = 0.0
     timestamp: float = 0.0
+    bcb_dropped: int = 0
+    bcb_sent_packets: int = 0
+    bcb_overlimits: int = 0
 
     def __post_init__(self) -> None:
         if self.timestamp == 0.0:
@@ -46,9 +49,10 @@ class LinkStatsCollector:
         Sampling interval in milliseconds (default 500).
     """
 
-    def __init__(self, nodes: list, interval_ms: int = 500) -> None:
+    def __init__(self, nodes: list, interval_ms: int = 500, qos_mgr: Optional[Any] = None) -> None:
         self._nodes = nodes
         self._interval = interval_ms / 1000.0
+        self._qos_mgr = qos_mgr
         self._samples: Dict[str, LinkSample] = {}
         self._lock = threading.Lock()
         self._running = False
@@ -90,7 +94,7 @@ class LinkStatsCollector:
         while self._running:
             for node in self._nodes:
                 try:
-                    sample = self._collect_sample(node)
+                    sample = self._collect_sample(node, self._qos_mgr)
                     with self._lock:
                         self._samples[node.name] = sample
                 except Exception as exc:
@@ -98,12 +102,23 @@ class LinkStatsCollector:
             time.sleep(self._interval)
 
     @staticmethod
-    def _collect_sample(node) -> LinkSample:
+    def _collect_sample(node, qos_mgr: Optional[Any] = None) -> LinkSample:
         """Run ``iw`` inside the node namespace and parse results."""
         intf = f"{node.name}-wlan0"
-        raw = node.cmd(f"iw dev {intf} station dump 2>/dev/null")
+        import subprocess
+        cmd = ["iw", "dev", intf, "station", "dump"]
+        proc = node.popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        raw, _ = proc.communicate(timeout=1.0)
 
         sample = LinkSample(node_name=node.name)
+
+        if qos_mgr:
+            stats = qos_mgr.get_queue_stats(node)
+            if 0 in stats: # Band 0 is BCB
+                sample.bcb_dropped = stats[0].dropped
+                sample.bcb_sent_packets = stats[0].sent_packets
+                sample.bcb_overlimits = stats[0].overlimits
+
         for line in raw.splitlines():
             line = line.strip()
             if "signal:" in line:
