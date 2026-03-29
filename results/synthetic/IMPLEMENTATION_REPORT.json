@@ -1,0 +1,44 @@
+{
+  "timestamp": "2025-10-09T00:00:00Z",
+  "options": [
+    {
+      "name": "Gaussian-peak throughput + U-shaped latency (chosen)",
+      "approach": "Parametric synthetic curves: log-growth with Gaussian decay for throughput; asymmetric quadratic for latency.",
+      "pros": ["Captures stated behavior succinctly", "Few parameters, easy to tune", "Smooth curves suitable for visualization"],
+      "cons": ["Not derived from a specific consensus model", "Normalization hides absolute units"]
+    },
+    {
+      "name": "Queueing-theory inspired (M/M/1+quorum)",
+      "approach": "Model service rate as function of authorities and quorum threshold; latency from Little's law.",
+      "pros": ["More theoretically grounded", "Can reflect saturation effects realistically"],
+      "cons": ["More parameters to estimate", "Harder to explain and tune for demos"]
+    },
+    {
+      "name": "Piecewise linear with peak and slopes",
+      "approach": "Growth segment up to peak then linear decay; latency mirrored with V-shape.",
+      "pros": ["Very simple, deterministic", "Easy to align with expectations"],
+      "cons": ["Visually harsh at the peak", "Less realistic than smooth functions"]
+    },
+    {
+      "name": "Simulation-driven stubs",
+      "approach": "Run a lightweight simulator to produce data; use placeholders when unavailable.",
+      "pros": ["Potentially more realistic", "Scales to extended scenarios"],
+      "cons": ["Complex to implement", "Non-deterministic runtime costs"]
+    }
+  ],
+  "chosen_solution": "Gaussian-peak throughput + U-shaped latency (chosen)",
+  "rationale": "Matches the user's qualitative description with tunable peak at ~50 authorities, minimal parameters, and smooth plots.",
+  "applied_changes": [
+    "Added src/goob_ai/synthetic.py for data generation",
+    "Added src/goob_ai/plotting.py for figure creation",
+    "Added src/goob_ai/cli.py as CLI entry point",
+    "Configured pyproject.toml with matplotlib, numpy, pytest, ruff",
+    "Added tests/test_synthetic_metrics.py covering shapes and CLI outputs"
+  ],
+  "status": "success",
+  "next_steps": [
+    "Expose knob for quorum threshold to shape curves",
+    "Add CSV export option",
+    "Integrate with CI to publish figures as artifacts"
+  ]
+}
