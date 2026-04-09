@@ -27,7 +27,7 @@ setup(
               'mn_wifi.sumo.sumolib.shapes', 'util', 
               'mn_wifi.services', 'mn_wifi.services.abis', 'mn_wifi.services.core',
               'meshpay', 'meshpay.api', 'meshpay.nodes', 'meshpay.transport', 'meshpay.logger', 'meshpay.controller', 
-              'meshpay.types', 'meshpay.routing', 'meshpay.mesh', 'meshpay.telemetry'
+              'meshpay.types', 'meshpay.routing', 'meshpay.mesh', 'meshpay.telemetry', 'sdn_frl'
               ],
     package_data={'util' : ['m'], 'mn_wifi.sumo.data': ['*.xml', '*.sumocfg'],
                   'mn_wifi.data': ['signal_table_ieee80211ax',
@@ -62,6 +62,8 @@ setup(
         'eth-utils>=2.3.1',
         'python-dotenv>=1.0.0',
         'pydantic>=2.5.0',
+        'flwr>=1.0.0',
+        'numpy',
     ],
     scripts=scripts,
 )

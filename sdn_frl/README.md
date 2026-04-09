@@ -1,70 +1,55 @@
-# SDN-FedRL Mesh Simulation
+# TEMPO: Partition-Tolerant Asynchronous SDN Architecture
 
-This project implements a resilient offline payment simulation over a Wireless Mesh Network (WMN) using Mininet-WiFi, SD-QoS Routing (Ryu), and Federated Reinforcement Learning (Flower).
+TEMPO is an experimental Mininet-WiFi emulation testbed evaluating a novel partition-tolerant, asynchronous Software-Defined Networking architecture in Wireless Mesh Networks (WMN).
 
-## Prerequisites
+## Architecture
 
-- **Mininet-WiFi**: Installed on the host system.
-- **Ryu Controller**: Using the specified book fork for compatibility.
-- **Flower (flwr)**: Python package for Federated Learning.
-- **wmediumd**: For realistic wireless medium emulation.
+In TEMPO, the physical network is partitioned. To maintain global state, TEMPO replaces traditional synchronous OpenFlow channels with a Conflict-Free Replicated Data Type (CRDT) synchronization model carried by physical mobile nodes ("Data Mules").
 
-## Installation
-
-### 1. Clone the Ryu Fork
-As recommended by the Mininet-WiFi eBook, clone the specific Ryu fork and branch into your project or Mininet-WiFi directory:
-
-```bash
-git clone https://github.com/ramonfontes/ryu -b book
+```text
+┌─────────────────────────┐                            ┌────────────────────────┐
+│  Area 1                 │    .... ferry ....         │ Area 2                 │
+│  [ap1 (Controller)]     │    <-- (sta1) -->          │ [ap2 (Controller)]     │
+│       | UDP :9000       │                            │       | UDP :9000      │
+└───────┼─────────────────┘                            └───────┼────────────────┘
+        │                                                      │
+[Merge CRDT locally]                                    [Merge CRDT locally]
+        │                                                      │
+        └────────────────────── Data Mules ────────────────────┘
 ```
 
-### 2. Install Dependencies
-```bash
-pip install flwr ryu
-```
+**Key Components:**
+- **Controllers (ap1, ap2):** Static Access Points acting as isolated SDN controllers. They maintain routing state using CRDTs and process updates asynchronously.
+- **Data Mules (sta1-sta10):** Mobile nodes that physically carry δ-CRDT payload between controllers.
+- **Density-aware Fallback:** In isolated domains, mules ping the local broadcast domain. If neighbor density falls below a critical threshold (< 3 peers), they increase a logical dissemination TTL.
+- **Security:** Mules process the CRDT dictionary dynamically, and Controllers independently evaluate Merkle-DAG signatures to prevent payload injection by malicious mules.
 
-## Running the Simulation
+## Getting Started
 
-Follow these steps in separate terminals:
+### Prerequisites
 
-### Step 1: Start the Ryu Remote Controller
-Run the Ryu controller with the SD-QoS application:
+You need `mininet-wifi` installed on a Linux host (with `wmediumd` for realistic wireless medium emulation). 
 
-```bash
-cd /meshpay/ryu
-sudo PYTHONPATH=. ./bin/ryu-manager /meshpay/sdn_frl/controller_app.py
-```
+### Running the Testbed
 
-### Step 2: Start the FRL Server (Flower)
-In another terminal, start the Federated Learning aggregator:
+The testbed automatically spawns the simulated APs, configures the trajectories/random mobility models, and launches the Python `controller_app.py` and `mule_app.py` in the background within the network namespaces of each respective node.
 
 ```bash
-python3 /meshpay/sdn_frl/frl_server.py
+cd /home/huydq/PHD2024-2027/meshpay/sdn_frl
+sudo python3 tempo_topology.py
 ```
 
-### Step 3: Launch the Mininet-WiFi Topology
-Run the topology script (requires sudo):
+### Viewing Output & Logs
 
+The script redirects the output of the node applications to the `/tmp` directory.
+
+To view the Controller CRDT state changes:
 ```bash
-sudo python3 /meshpay/sdn_frl/topology.py
+tail -f /tmp/ap1_tempo.log
+tail -f /tmp/ap2_tempo.log
 ```
 
-### Step 4: Start FRL Clients
-Once the Mininet-WiFi CLI is up, you can start the FRL clients on individual nodes. For example:
-
+To view a Data Mule's decision log (e.g., verifying density-awareness in isolated states vs connected states):
 ```bash
-mininet-wifi> sta1 python3 /meshpay/sdn_frl/frl_client.py --node sta1 &
-mininet-wifi> sta2 python3 /meshpay/sdn_frl/frl_client.py --node sta2 &
+tail -f /tmp/sta1_tempo.log
 ```
-
-## Project Structure
-
-- `topology.py`: Mininet-WiFi setup with mobility and wmediumd.
-- `controller_app.py`: Ryu application for SD-QoS telemetry and routing.
-- `frl_server.py`: Flower server for weight aggregation.
-- `frl_client.py`: Flower client with an RL agent and local telemetry polling.
-- `consensus_sim.py`: Simulation of weighted BFT consensus.
-- `performance_logger.py`: Utility for logging metrics to CSV.
-
-## Performance Analysis
-The simulation logs PDR, BER, Latency, and Overhead to `performance_metrics.csv` for post-simulation analysis.

@@ -90,7 +90,6 @@ mn_wifi/examples/active_scan.py
 mn_wifi/examples/adhoc.py
 mn_wifi/examples/associationControl.py
 mn_wifi/examples/authentication.py
-mn_wifi/examples/authority.py
 mn_wifi/examples/battery.py
 mn_wifi/examples/ble_gateway.py
 mn_wifi/examples/coherenceModel.py
@@ -211,6 +210,13 @@ mn_wifi/wwan/link.py
 mn_wifi/wwan/module.py
 mn_wifi/wwan/net.py
 mn_wifi/wwan/node.py
+sdn_frl/__init__.py
+sdn_frl/consensus_sim.py
+sdn_frl/controller_app.py
+sdn_frl/frl_client.py
+sdn_frl/frl_server.py
+sdn_frl/performance_logger.py
+sdn_frl/topology.py
 util/doxify.py
 util/m
 util/versioncheck.py
