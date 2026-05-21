@@ -27,6 +27,7 @@ meshpay/nodes/mesh_utils.py
 meshpay/routing/__init__.py
 meshpay/routing/dtn.py
 meshpay/routing/epidemic.py
+meshpay/routing/sdn.py
 meshpay/telemetry/__init__.py
 meshpay/telemetry/telemetry_agent.py
 meshpay/telemetry/telemetry_controller.py
@@ -210,13 +211,6 @@ mn_wifi/wwan/link.py
 mn_wifi/wwan/module.py
 mn_wifi/wwan/net.py
 mn_wifi/wwan/node.py
-sdn_frl/__init__.py
-sdn_frl/baseline_topology.py
-sdn_frl/metrics_collector.py
-sdn_frl/plot_results.py
-sdn_frl/sddtn_controller.py
-sdn_frl/sddtn_mule.py
-sdn_frl/sddtn_topology.py
 util/doxify.py
 util/m
 util/versioncheck.py

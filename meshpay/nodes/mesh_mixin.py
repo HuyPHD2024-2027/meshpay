@@ -55,7 +55,19 @@ class MeshMixin:
         
         # DTN Store-Carry-Forward buffer and Routing Protocol
         self.message_buffer = {}  # Dict[str, MessageBufferItem]
-        self.routing_protocol = EpidemicRouting(getattr(self, 'name', 'unknown'))
+        
+        routing_name = "epidemic"
+        if hasattr(self, 'params') and self.params:
+            routing_name = self.params.get('routing_protocol_name', 'epidemic')
+        
+        if routing_name == 'sdn':
+            from meshpay.routing.sdn import SDNDTNRouting
+            self.routing_protocol = SDNDTNRouting(getattr(self, 'name', 'unknown'))
+            self.routing_protocol.set_node(self)
+            self._log(f"Initialized SDN-DTN routing protocol with traffic prioritization.")
+        else:
+            self.routing_protocol = EpidemicRouting(getattr(self, 'name', 'unknown'))
+            
         self.telemetry_aggregator_ip: Optional[str] = None
 
         # Performance Evaluation Counters

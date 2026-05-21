@@ -73,6 +73,7 @@ class MetricsCollector:
         # Transaction-level counters --------------------------------------------
         self.transaction_count = 0
         self.successful_transaction_count = 0
+        self.successful_transaction_ids = set()
         self.error_count = 0
         self.sync_count = 0
         self._validation_latency = RollingAverage()
@@ -96,9 +97,20 @@ class MetricsCollector:
         self.transaction_count += 1
         self._update_tps()
         
-    def record_success(self) -> None:
-        """Record a successful transaction completion."""
+    def record_success(self, transaction_id: Optional[str] = None) -> bool:
+        """Record a successful transaction completion.
+
+        When a transaction id is supplied, duplicate completion events for the
+        same transfer are ignored. This keeps finality metrics bounded by the
+        number of unique orders submitted.
+        """
+        if transaction_id is not None:
+            tx_id = str(transaction_id)
+            if tx_id in self.successful_transaction_ids:
+                return False
+            self.successful_transaction_ids.add(tx_id)
         self.successful_transaction_count += 1
+        return True
 
     def record_error(self) -> None:
         """Record an error."""
@@ -217,6 +229,7 @@ class MetricsCollector:
         return {
             "transaction_count": self.transaction_count,
             "successful_transaction_count": self.successful_transaction_count,
+            "successful_transaction_ids": sorted(self.successful_transaction_ids),
             "error_count": self.error_count,
             "sync_count": self.sync_count,
             "validation_latency_ms": self._validation_latency.average,

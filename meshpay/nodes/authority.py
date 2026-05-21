@@ -499,7 +499,9 @@ class WiFiAuthority(MeshMixin, Station):
     def _validate_confirmation_order(self, confirmation_order: ConfirmationOrder) -> bool:
         """Validate a confirmation order."""
         # 1. Base transfer validation
-        if not self._validate_transfer_order(confirmation_order.transfer_order):
+        is_valid, error = self._validate_transfer_order(confirmation_order.transfer_order)
+        if not is_valid:
+            self.logger.debug(f"Confirmation rejected: transfer validation failed: {error}")
             return False
 
         # 2. Check for double-spend / replay
@@ -644,3 +646,16 @@ class WiFiAuthority(MeshMixin, Station):
         elif item.message_type == MessageType.CONFIRMATION_REQUEST.value:
             request = ConfirmationRequestMessage.from_payload(item.payload)
             self.handle_confirmation_order(request.confirmation_order)
+
+    def get_finalized_transaction_ids(self) -> List[str]:
+        """Query the ledger for all successfully finalized transaction UUID strings."""
+        finalized_ids = []
+        try:
+            if hasattr(self, 'state') and hasattr(self.state, 'accounts'):
+                for acc_addr, acc_state in self.state.accounts.items():
+                    if hasattr(acc_state, 'confirmed_transfers'):
+                        for tx_id in acc_state.confirmed_transfers.keys():
+                            finalized_ids.append(str(tx_id))
+        except Exception as e:
+            self.logger.error(f"Error querying finalized transaction IDs: {e}")
+        return finalized_ids

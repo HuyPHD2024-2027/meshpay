@@ -51,7 +51,7 @@ from mn_wifi.link import wmediumd, mesh
 from mn_wifi.wmediumdConnector import interference
 from mn_wifi.net import Mininet_wifi
 from meshpay.nodes.authority import WiFiAuthority
-from meshpay.nodes.client1 import Client
+from meshpay.nodes.client import Client
 from meshpay.cli_fastpay import MeshPayCLI
 from meshpay.transport import TransportKind
 from meshpay.types import KeyPair, AccountOffchainState, SignedTransferOrder
