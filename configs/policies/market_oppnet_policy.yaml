@@ -1,0 +1,65 @@
+{
+  "policy_id": "market-oppnet-policy-v1",
+  "epoch": 1,
+  "valid_from": 0,
+  "valid_until": 4102444800,
+  "committee": {
+    "authorities": ["auth1", "auth2", "auth3", "auth4", "auth5"],
+    "quorum": "two_thirds_plus_one"
+  },
+  "network": {
+    "mode": "oppnet",
+    "preferred_interfaces": ["mesh_80211s", "wifi_direct", "wwan_d2d"],
+    "fallback_interface": "mesh_80211s"
+  },
+  "routing": {
+    "algorithm": "sdn_dtn",
+    "fallback_algorithm": "epidemic",
+    "supported_algorithms": ["epidemic", "spray_and_wait", "prophet", "sdn_dtn"]
+  },
+  "traffic_classes": {
+    "high": {
+      "message_types": ["transfer_response", "confirmation_request"],
+      "priority": 1
+    },
+    "medium": {
+      "message_types": ["transfer_request"],
+      "priority": 2
+    },
+    "low": {
+      "message_types": ["sdn_summary", "sdn_request", "sdn_policy", "telemetry", "heartbeat", "peer_discovery"],
+      "priority": 3
+    }
+  },
+  "forwarding_rules": {
+    "transfer_request": {
+      "action": "push",
+      "target": "authority_neighbors",
+      "interface_preference": ["mesh_80211s", "wifi_direct", "wwan_d2d"],
+      "replication_limit": 5
+    },
+    "transfer_response": {
+      "action": "push",
+      "target": "sender_client",
+      "interface_preference": ["wifi_direct", "mesh_80211s", "wwan_d2d"],
+      "replication_limit": 3
+    },
+    "confirmation_request": {
+      "action": "push",
+      "target": "authorities_and_recipient",
+      "interface_preference": ["mesh_80211s", "wifi_direct", "wwan_d2d"],
+      "replication_limit": 5
+    }
+  },
+  "buffer_rules": {
+    "prune_finalized_transactions": true,
+    "max_buffer_items": 100,
+    "drop_policy": "low_priority_first"
+  },
+  "security": {
+    "reject_old_epoch": true,
+    "reject_expired": true,
+    "fallback_on_invalid_policy": "epidemic"
+  },
+  "signatures": {}
+}

@@ -47,27 +47,25 @@ class MeshMixin:
 
     def _init_mesh(self) -> None:
         """Initialise mesh-specific data structures (call from __init__)."""
-        from meshpay.routing.epidemic import EpidemicRouting
-        
+        from meshpay.routing.registry import create_routing_protocol, normalize_routing_name
+
         self.p2p_connections: Dict[str, PeerInfo] = {}
         # message_queue is used by TCPTransport as its receive buffer.
         self.message_queue: Queue[Message] = Queue()
-        
+
         # DTN Store-Carry-Forward buffer and Routing Protocol
         self.message_buffer = {}  # Dict[str, MessageBufferItem]
-        
+
         routing_name = "epidemic"
         if hasattr(self, 'params') and self.params:
-            routing_name = self.params.get('routing_protocol_name', 'epidemic')
-        
-        if routing_name == 'sdn':
-            from meshpay.routing.sdn import SDNDTNRouting
-            self.routing_protocol = SDNDTNRouting(getattr(self, 'name', 'unknown'))
+            routing_name = self.params.get('routing_protocol_name', self.params.get('routing', 'epidemic'))
+
+        normalized_routing = normalize_routing_name(routing_name)
+        self.routing_protocol = create_routing_protocol(getattr(self, 'name', 'unknown'), normalized_routing)
+        if hasattr(self.routing_protocol, "set_node"):
             self.routing_protocol.set_node(self)
-            self._log(f"Initialized SDN-DTN routing protocol with traffic prioritization.")
-        else:
-            self.routing_protocol = EpidemicRouting(getattr(self, 'name', 'unknown'))
-            
+        self._log(f"Initialized {normalized_routing} DTN routing protocol.")
+
         self.telemetry_aggregator_ip: Optional[str] = None
 
         # Performance Evaluation Counters
@@ -278,15 +276,18 @@ class MeshMixin:
                 msg_id = instr.get("msg_id")
                 item = self.message_buffer.get(msg_id)
                 if not item: continue
+                bundle_data = item.to_dict() if hasattr(item, 'to_dict') else {
+                    "message_id": item.message_id,
+                    "message_type": item.message_type,
+                    "payload": item.payload,
+                    "sender_id": item.sender_id,
+                    "ttl": item.ttl,
+                }
+                if instr.get("interface_preference"):
+                    bundle_data["interface_preference"] = list(instr["interface_preference"])
                 routing_msg = RoutingMessage(
                     protocol_type="dtn_bundle",
-                    data=item.to_dict() if hasattr(item, 'to_dict') else {
-                        "message_id": item.message_id,
-                        "message_type": item.message_type,
-                        "payload": item.payload,
-                        "sender_id": item.sender_id,
-                        "ttl": item.ttl,
-                    },
+                    data=bundle_data,
                     telemetry=telemetry_data
                 )
             else:

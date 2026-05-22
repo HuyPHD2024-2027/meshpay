@@ -26,7 +26,8 @@ setup(
               'mn_wifi.sumo.data', 'mn_wifi.sumo.sumolib.net', 'mn_wifi.sumo.sumolib.output',
               'mn_wifi.sumo.sumolib.shapes', 'util', 
               'mn_wifi.services', 'mn_wifi.services.abis', 'mn_wifi.services.core',
-              'meshpay', 'meshpay.api', 'meshpay.nodes', 'meshpay.transport', 'meshpay.logger', 'meshpay.controller', 
+              'meshpay', 'meshpay.api', 'meshpay.nodes', 'meshpay.transport', 'meshpay.logger', 'meshpay.controller',
+              'meshpay.examples', 'meshpay.examples.emulation', 'meshpay.oppnet', 'meshpay.policy',
               'meshpay.types', 'meshpay.routing', 'meshpay.mesh', 'meshpay.telemetry'
               ],
     package_data={'util' : ['m'], 'mn_wifi.sumo.data': ['*.xml', '*.sumocfg'],

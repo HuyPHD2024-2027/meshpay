@@ -88,11 +88,19 @@ class DTNRoutingProtocol(ABC):
             }
         })
         
-    def _queue_relay_transmission(self, recipient_id: str, msg_id: str) -> None:
+    def _queue_relay_transmission(
+        self,
+        recipient_id: str,
+        msg_id: str,
+        interface_preference: Optional[List[str]] = None,
+    ) -> None:
         """Helper to queue the transmission of an actual buffered relay message."""
-        self._outbox.append({
+        instruction = {
             'recipient_id': recipient_id,
             'type': 'relay',
             'msg_id': msg_id
-        })
+        }
+        if interface_preference:
+            instruction['interface_preference'] = interface_preference
+        self._outbox.append(instruction)
 
