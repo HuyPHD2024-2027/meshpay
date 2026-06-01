@@ -11,10 +11,14 @@ This package implements MeshPay/FastPay-style offline payment behavior over emul
 - `transport/`: TCP, UDP, Wi-Fi Direct, and transport abstractions.
 - `routing/`: DTN and epidemic routing logic.
 - `controller/`: QoS, fallback, and link statistics support.
-- `telemetry/`: telemetry agents, controller, and metrics.
 - `logger/`: authority, client, bridge, and formatting loggers.
 - `api/`: bridge and gateway integration.
+- `attack/`: adversarial emulation handlers (jamming, grayhole, stopping, etc.) for resilience testing.
+- `oppnet/`: Opportunistic Network abstractions and interfaces.
+- `policy/`: SDN policy enforcement, digital signatures, and quorum logic.
 - `examples/`: runnable Mininet-WiFi demos and benchmarks, including `meshpay_demo.py`.
+- `cli_fastpay.py`: interactive CLI environment for running MeshPay commands manually.
+- `messages.py`: definitions of networking messages exchanged between nodes.
 
 ## Mininet-WiFi References
 

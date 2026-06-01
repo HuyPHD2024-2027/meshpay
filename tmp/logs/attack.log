@@ -1,9 +1,0 @@
-=== MeshPay Emulation Interactive Attack Log ===
-Started at: 2026-05-29 15:04:33
-==================================================
-
-[15:06:27.000] [ATTACK_INJECT] Type: packet_loss, Intensity: 1.0, Target: user1
-[15:07:34.000] [ATTACK_STOP]
-[15:07:35.000] [ATTACK_INJECT] Type: stopping, Intensity: 1.0, Target: user1
-[15:07:54.000] [ATTACK_STOP]
-[15:08:57.000] [ATTACK_INJECT] Type: targeted_load, Intensity: 1.0, Target: auth1,auth2,auth3,auth4,auth5

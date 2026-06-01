@@ -285,6 +285,31 @@ def main() -> None:
     except Exception as e:
         info(f"*** Error: {e}\n")
     finally:
+        # Collect and export stats before cleanup
+        try:
+            from meshpay.examples.emulation.runner import collect_benchmark_stats
+            import json
+            stats = collect_benchmark_stats(
+                context.clients,
+                context.authorities,
+                network_mode=config.network_mode,
+                wireless_interface=config.wireless_interface,
+                routing=config.routing,
+                policy_file=config.policy_file,
+                submitted_payments=sum(
+                    c.performance_metrics.get_stats().get("transaction_count", 0) 
+                    for c in context.clients
+                ),
+                duration=config.duration,
+            )
+            out_file = config.output_file or "/home/huydq/PHD2024-2027/meshpay/meshpay/examples/stats/interactive_stats.json"
+            os.makedirs(os.path.dirname(out_file), exist_ok=True)
+            with open(out_file, "w") as f:
+                json.dump(stats.__dict__, f, indent=4)
+            info(f"*** Interactive stats saved to {out_file}\n")
+        except Exception as e:
+            info(f"*** Error saving interactive stats: {e}\n")
+
         cleanup_environment()
         info("*** Interactive Emulation testbed teardown completed successfully.\n")
 

@@ -286,7 +286,7 @@ class MeshPayCLI(CLI):  # pylint: disable=too-many-instance-attributes
     def do_transfer(self, line: str) -> None:
         """Broadcast a transfer order using :pymeth:`mn_wifi.client.Client.transfer`.
         
-        Usage: transfer <sender> <recipient> <amount>
+        Usage: transfer <sender> <recipient> <token> <amount>
         """
         args = line.split()
         if len(args) != 4:
