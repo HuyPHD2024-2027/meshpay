@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""Backward-compatible CLI wrapper for MeshPay emulation benchmarks."""
+"""Unified CLI wrapper for MeshPay emulation benchmarks and campaign sweeps."""
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
 from mininet.log import setLogLevel
 
-from meshpay.examples.emulation.arguments import parse_args
-from meshpay.examples.emulation.figures import generate_plots
-from meshpay.examples.emulation.campaign import run_campaign
-from meshpay.examples.emulation.research_figures import generate_research_figures
+from meshpay.examples.emulation.config import parse_args
+from meshpay.examples.emulation.campaign import run_campaign, generate_plots
 from meshpay.examples.emulation.runner import (
     format_comparison_report,
     run_comparison,
@@ -26,16 +27,22 @@ def main() -> None:
     if config.campaign:
         outputs = run_campaign(config)
         summary = f"{config.results_dir}/summary.csv"
-        generate_research_figures(summary, f"{config.results_dir}/figures", config.figure_format.split(","))
         print(f"Campaign completed: {len(outputs)} runs")
         print(f"Summary: {summary}")
         return
 
-    if config.routing == "both":
+    if config.routing in ("both", "all"):
         result = run_comparison(config)
         print(format_comparison_report(result))
-        print("\n🎨 Generating evaluation plots...")
-        generate_plots(result.epidemic_stats, result.sdn_stats, config.plot_output)
+        
+        plot_output = config.plot_output or "results/comparison_plot.png"
+        print(f"\n🎨 Generating evaluation plots to {plot_output}...")
+        generate_plots(
+            result.epidemic_stats,
+            result.sdn_stats,
+            plot_output,
+            all_stats=result.all_stats,
+        )
         if config.output_file:
             write_json_output(config.output_file, result.to_dict())
             print(f"💾 Saved comparison telemetry stats to: {config.output_file}")

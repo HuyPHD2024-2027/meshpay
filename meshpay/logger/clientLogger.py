@@ -20,8 +20,10 @@ class ClientLogger:
             client_name: Name of the client
             log_file: Optional log file path (defaults to /tmp/{client_name}_log.txt)
         """
+        import os
         self.client_name = client_name
-        self.log_file = log_file or f"/tmp/{client_name}_client.log"
+        log_dir = os.environ.get("MESHPAY_LOG_DIR", "/tmp")
+        self.log_file = log_file or os.path.join(log_dir, f"{client_name}_client.log")
         self.log_queue = queue.Queue()
         self.running = True
         self.terminal_process: Optional[subprocess.Popen] = None

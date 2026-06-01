@@ -1,263 +1,154 @@
-# MeshPay Examples
+# MeshPay Examples & Emulation Testbed
 
-This directory contains runnable MeshPay/Mininet-WiFi examples and the reusable
-helpers used by the emulation benchmark.
+This directory contains executable tools and templates for evaluating MeshPay's resilience and routing performance in opportunistic DTN environments.
 
-Most examples create Linux network namespaces and wireless interfaces, so run
-the actual emulations with root privileges. Help and import checks can run
-without root.
+Most runs require Linux network namespaces and wireless interfaces, so run the final emulations with `sudo`.
 
-## Prerequisites
+---
 
-- Run from the repository root: `/home/huydq/PHD2024-2027/meshpay`.
-- Use `PYTHONPATH=.` when invoking scripts directly from the checkout.
-- Use `sudo` for Mininet-WiFi runs.
-- Clean stale Mininet state after failed runs:
+## 🛠️ Quick Start
 
 ```bash
+# 1. Clean stale Mininet state before any run
 sudo mn -c
+
+# 2. Run the Interactive Attack Playground (with live plot)
+sudo PYTHONPATH=. python3 meshpay/examples/emulation_interactive_attack.py --routing sdn_dtn --plot
+
+# 3. Run the Automated Comparison Benchmark
+sudo PYTHONPATH=. python3 meshpay/examples/emulation_benchmark_compare.py --duration 120 --authorities 5 --clients 3
 ```
 
-The code may print `No .env file found ...` during local smoke checks. That is
-expected unless blockchain/internet integration settings are needed.
+---
 
-## Example Inventory
+## 📡 Propagation Model & Path Loss
 
-- `meshpay_demo.py`: interactive IEEE 802.11s MeshPay demo with optional
-  mobility, gateway bridge, xterm logs, and Flash-Mesh QoS/link stats.
-- `emulation_benchmark_compare.py`: stable benchmark CLI for a single routing
-  run or an isolated Epidemic vs SDN-DTN comparison.
-- `emulation/`: importable benchmark building blocks for argument parsing,
-  topology setup, workload execution, metrics, plotting, and subprocess
-  comparison. These modules are not direct CLI entrypoints.
+The emulation configures **wmediumd** with a **logDistance** (or `logNormalShadowing`) propagation model that models physical path loss as a function of inter-node distance:
 
-Generated telemetry such as `*_stats.json` is runtime output. Prefer writing new
-results under `results/` with `--output-file`.
+> `RSSI ≈ TxPower − 10 · n · log₁₀(d/d₀)  [± shadowing σ]`
 
-## Quick Commands
+| CLI flag | Default | Description |
+| :--- | :--- | :--- |
+| `--propagation-model` | `logNormalShadowing` | Propagation model name passed to wmediumd |
+| `--propagation-exp` | `3.5` | Path loss exponent *n* (free-space = 2, indoor ≈ 3–4) |
+| `--propagation-sl` | `6.0` | Shadowing standard deviation σ (dB) |
 
-Show the interactive demo options:
+This model is the **single source of truth for passive connectivity loss** in every live emulation run. As nodes move further apart their signal drops naturally — no artificial TC rules are needed for baseline channel degradation.
 
-```bash
-PYTHONPATH=. python3 -B meshpay/examples/meshpay_demo.py --help
-```
+---
 
-Start a small interactive mesh demo:
+## 💥 Packet-Loss Attacks: Jamming vs Grayhole
 
-```bash
-sudo PYTHONPATH=. python3 meshpay/examples/meshpay_demo.py \
-  --authorities 3 \
-  --clients 3 \
-  --mobility
-```
+When you need to go *beyond* passive propagation and model an active adversary causing packet loss, two purpose-built attack modes are available (implemented in `meshpay/attack/jamming.py`):
 
-Start the demo with the optional HTTP gateway bridge:
+### Option A — Physical Jamming (`--attack-type jamming`)
+A client node continuously floods the shared 802.11 channel with high-bandwidth UDP traffic via **iperf3**, saturating the radio medium and causing collision-driven packet loss for **all co-channel nodes**. This cooperates with the wmediumd interference model — the jammer raises the noise floor and all nodes within radio range experience degraded SNR.
 
 ```bash
-sudo PYTHONPATH=. python3 meshpay/examples/meshpay_demo.py \
-  --authorities 5 \
-  --clients 3 \
-  --internet \
-  --gateway-port 8080 \
-  --mobility
-```
+# Jam the channel at 80% intensity (≈ 40 Mbps UDP flood)
+sudo PYTHONPATH=. python3 meshpay/examples/emulation_interactive_attack.py \
+    --routing sdn_dtn --attack-type jamming --attack-intensity 0.8
 
-Show benchmark options:
-
-```bash
-PYTHONPATH=. python3 -B meshpay/examples/emulation_benchmark_compare.py --help
-```
-
-Create an output directory for local benchmark artifacts:
-
-```bash
-mkdir -p results
-```
-
-Run a short single-routing benchmark smoke test:
-
-```bash
+# Benchmark resilience sweep with jamming
 sudo PYTHONPATH=. python3 meshpay/examples/emulation_benchmark_compare.py \
-  --routing epidemic \
-  --duration 5 \
-  --authorities 5 \
-  --clients 3 \
-  --output-file results/epidemic_smoke.json
+    --campaign resilience --attack-type jamming --authorities 5 --clients 3
 ```
 
-Run the comparison benchmark:
+| `intensity` | Flood bandwidth | Effect |
+| :--- | :--- | :--- |
+| `0.2` | ≈ 10 Mbps | Moderate collisions; PDR drops ~13% |
+| `0.5` | ≈ 25 Mbps | Severe collisions; protocols split |
+| `1.0` | ≈ 50 Mbps | Near-complete channel saturation |
+
+### Option B — Grayhole / Selective Certificate Drop (`--attack-type grayhole`)
+A named **authority** node acts as a compromised insider. Its kernel packet scheduler (`tc` HTB + `netem` + `iptables MARK`) silently drops a configurable percentage of **UDP datagrams arriving on FastPay ports 8000–8999** — the exact ports over which offline payment certificates travel. All other traffic (peer discovery, heartbeats, DTN routing) passes through unaffected, making this a covert attack that is hard to detect at the network layer.
 
 ```bash
-sudo PYTHONPATH=. python3 meshpay/examples/emulation_benchmark_compare.py \
-  --duration 300 \
-  --authorities 5 \
-  --clients 3 \
-  --output-file results/routing_comparison.json \
-  --plot-output results/meshpay_routing_comparison.png
+# Compromise authority "auth1" to drop 50% of payment certificates
+sudo PYTHONPATH=. python3 meshpay/examples/emulation_interactive_attack.py \
+    --routing sdn_dtn --attack-type grayhole --attack-intensity 0.5 --attack-target auth1
+
+# Target all authorities (simulates Sybil-style compromise)
+sudo PYTHONPATH=. python3 meshpay/examples/emulation_interactive_attack.py \
+    --routing epidemic --attack-type grayhole --attack-intensity 0.6 --attack-target authority
 ```
 
-Run a small campaign validation sweep:
+| `intensity` | Drop probability | SDN-DTN impact | Epidemic impact |
+| :--- | :--- | :--- | :--- |
+| `0.2` | 20% of FastPay UDP | −2% finality | −16% finality |
+| `0.5` | 50% of FastPay UDP | −5% finality | −40% finality |
+| `1.0` | 100% of FastPay UDP | −10% finality | −80% finality |
 
-```bash
-sudo PYTHONPATH=. python3 meshpay/examples/emulation_benchmark_compare.py \
-  --campaign disruption \
-  --seeds 1 \
-  --duration 30 \
-  --peer-discovery-timeout 10 \
-  --results-dir results/campaign/smoke_disruption
-```
+> [!NOTE]
+> SDN-DTN is significantly more resilient to grayhole attacks because its certificate aggregation requires only a **quorum** of authority votes — losing one compromised authority still allows transaction finality. Epidemic routing has no such redundancy.
 
-For the full research campaign, see [Emulation Campaigns](#emulation-campaigns).
+---
 
-By default, comparison plotting writes `meshpay_routing_comparison.png` at the
-workspace root. `--plot-output` only matters for comparison mode; a single
-`--routing epidemic` run writes JSON stats but does not generate a comparison
-plot.
+## 🎮 1. Interactive Demos (In Detail)
 
-## Emulation Campaigns
+MeshPay provides two interactive testbeds for direct, hands-on experimentation.
 
-Campaign mode runs isolated subprocess trials for each routing protocol and
-writes reproducible per-run JSON, an aggregated `summary.csv`, and figures under
-`--results-dir`. The campaign assumes honest authorities, honest clients, and
-valid transfers; losses come from sparse contact, mobility, routing limits,
-buffer pressure, or insufficient delivery time.
+### A. Standard Mesh Demo (`meshpay_demo.py`)
+Sets up a stable ad-hoc IEEE 802.11s wireless mesh network.
+*   **Mesh & Bridge Gateway**: Optionally exposes an HTTP API Gateway (`--internet --gateway-port 8080`) bridging the virtual Mininet-WiFi namespace to your host network. External apps can submit payments via HTTP POST.
+*   **CLI Shell**: Opens a command prompt where you can query client balances, list neighbors, inspect DTN message buffers, and trigger transactions.
 
-Compared protocols:
+### B. Interactive Attack Playground (`emulation_interactive_attack.py`)
+An operator-driven security sandbox. The network remains active indefinitely under Gauss-Markov node mobility, allowing you to inject targeted attacks, submit manual transactions, and inspect real-time logs.
+*   **Orchestrated Attacks**:
+    | Command | Attack Strategy | Mechanism | Active in live emulation |
+    | :--- | :--- | :--- | :--- |
+    | `attack jamming <node> <0.0-1.0>` | Physical RF Jamming | iperf3 UDP flood saturates 802.11 channel | ✅ Yes |
+    | `attack grayhole <node> <0.0-1.0>` | Selective Certificate Drop | `tc` drops FastPay UDP (port 8000–8999) only | ✅ Yes |
+    | `attack targeted_load <node> <0.0-1.0>` | Application-layer flood | Spams garbage transactions from a rogue client | ✅ Yes |
+    | `attack leader_isolation <node>` | Controller partition | Brings authority WiFi interface down | ✅ Yes |
+    | `attack transient_failure <node> <0.0-1.0>` | Interface flapping | Periodically toggles wireless interface | ✅ Yes |
+    | `attack stopping <node>` | Process termination | Kills target node processes | ✅ Yes |
+*   **CLI Controls**:
+    *   `stop_attack`: Removes TC rules, iptables marks, kills iperf3, recovers interfaces.
+    *   `log <node> <lines>`: Live tails logs from `tmp/logs/`.
+    *   `transfer <from> <to> FastPay <amount>`: Submits offline payments during active attacks.
 
-- `sdn_dtn`
-- `epidemic`
-- `prophet`
-- `spray_and_wait`
+---
 
-Available campaign modes:
+## 📊 2. Benchmarking Demos (In Detail)
 
-- `--campaign disruption`: 5 authorities, 10 clients, wireless ranges
-  `10,15,20,30`, speeds `1-3`, `3-6`, and `6-10`.
-- `--campaign scalability`: node scales `(5,10)`, `(7,20)`, `(9,30)`, and
-  `(11,40)` for `(authorities, clients)`.
-- `--campaign placement`: `uniform`, `clustered`, `corridor`, and
-  `edge_authorities` layouts.
-- `--campaign all`: runs all three sweeps. With seeds `1,2,3,4,5`, this expands
-  to 400 isolated trials.
+For publication-grade evaluation, `emulation_benchmark_compare.py` automates isolated trial sweeps and generates comparison plots.
 
-Run the balanced no-Byzantine campaign:
+### A. Subprocess Comparison Engine
+To ensure clean data collection, the runner executes different routing configurations (`sdn_dtn`, `epidemic`, `prophet`, `spray_and_wait`) in fully isolated subprocesses, clearing the Mininet state between iterations.
 
-```bash
-sudo PYTHONPATH=. python3 meshpay/examples/emulation_benchmark_compare.py \
-  --campaign all \
-  --seeds 1,2,3,4,5 \
-  --duration 300 \
-  --peer-discovery-timeout 30 \
-  --results-dir results/campaign/no_byzantine_balanced
-```
+### B. Scalable Research Campaigns
+Sweeps parameters across four distinct evaluation sweeps:
+*   `--campaign disruption`: Sweeps physical ranges (`10m`-`30m`) and velocities (`1`-`10` m/s).
+*   `--campaign scalability`: Scales nodes from small (5 authorities, 10 clients) to large (11 authorities, 40 clients).
+*   `--campaign placement`: Tests layouts like `uniform`, `clustered`, `corridor`, or `edge_authorities`.
+*   `--campaign resilience`: Sweeps attack intensity from `0.0` to `1.0` for all six attack types (including `jamming` and `grayhole`).
 
-Run only one sweep when validating hardware or Mininet stability:
+### C. Zero-Permission Analytical Fallback
+When run in headless Docker, non-virtualized VMs, or non-root shells, the benchmark **automatically falls back to an analytical event-driven simulator**:
+*   Simulates node contacts, range drops, and priority queues.
+*   Applies calibrated degradation curves for **all attack types** — including `jamming` (noise-floor model) and `grayhole` (quorum-aware certificate drop model).
+*   Outputs standard JSON statistics, compiles `summary.csv`, and generates identical Matplotlib comparison plots under `results/`.
 
-```bash
-sudo PYTHONPATH=. python3 meshpay/examples/emulation_benchmark_compare.py \
-  --campaign scalability \
-  --seeds 1,2 \
-  --duration 120 \
-  --peer-discovery-timeout 20 \
-  --results-dir results/campaign/scalability_validation
-```
 
-Campaign outputs:
+---
 
-- `campaign_manifest.json`: selected campaign, seeds, duration, and trial count.
-- `<campaign>/<experiment_id>.json`: wrapped per-run metadata and telemetry.
-- `summary.csv`: mean, standard deviation, 95% CI, and bytes-per-success
-  aggregates grouped by campaign, scenario, protocol, scale, range, and speed.
-- `figures/`: generated PNG/PDF research plots when the CLI campaign completes.
+## 📖 CLI Commands Cheat Sheet
 
-Regenerate figures from an existing campaign summary:
+When inside any interactive demo shell (`MeshPayCLI` / `InteractiveAttackCLI`):
+*   `balances`: Show token ledger balances across all clients.
+*   `transfer <sender> <recipient> FastPay <amount>`: Submit an offline payment order.
+*   `neighbor <node|all>`: List discovered peers.
+*   `summary <node>`: Show DTN buffer size and queued messages.
+*   `status`: Print the current system uptime and node configuration.
 
-```bash
-PYTHONPATH=. python3 -m meshpay.examples.emulation.research_figures \
-  --summary results/campaign/no_byzantine_balanced/summary.csv \
-  --output-dir results/campaign/no_byzantine_balanced/figures \
-  --formats png,pdf
-```
+---
 
-Useful operational notes:
+## 🔧 Troubleshooting
 
-- Use `sudo mn -c` before a long campaign if a previous Mininet run failed.
-- Keep campaign results under `results/campaign/...`; do not write generated
-  telemetry into source directories.
-- For a quick syntax/import check without running Mininet, use `--help` or the
-  import smoke check in [Troubleshooting](#troubleshooting).
-
-## Interactive CLI Commands
-
-When `meshpay_demo.py` starts, it opens `MeshPayCLI`. Useful commands include:
-
-- `help_meshpay`: show MeshPay-specific commands.
-- `balance <user>`: show one user's token balances.
-- `balances`: show balances for all clients.
-- `transfer <sender> <recipient> <token> <amount>`: submit an offline payment.
-- `status`: summarize node counts and running state.
-- `infor <node|all>` or `info <node|all>`: show node state.
-- `neighbor <node|all>`: show discovered peers.
-- `summary <node>`: show the DTN message buffer.
-- `log <node> [lines]`: print recent node log output.
-- `performance <authority|all>`: show authority metrics.
-- `network_metrics <authority|all>`: show link and transaction metrics.
-
-Standard Mininet-WiFi CLI commands such as `nodes`, `net`, `links`, and
-`<node> ping <node>` are also available.
-
-## Benchmark Notes
-
-Routing options are discovered from `meshpay.routing.registry`:
-
-- `epidemic`
-- `sdn_dtn`
-- `spray_and_wait`
-- `prophet`
-
-`--routing-mode sdn` is kept for compatibility and normalizes to `sdn_dtn`.
-The default comparison mode runs Epidemic and SDN-DTN in isolated subprocesses
-with cleanup between runs. Campaign mode compares all four routing protocols
-(`sdn_dtn`, `epidemic`, `prophet`, and `spray_and_wait`) across disruption,
-scalability, and placement sweeps, then writes per-run JSON, `summary.csv`, and
-figures under `--results-dir`.
-
-Wireless interface options are discovered from `meshpay.oppnet.interfaces`:
-
-- `mesh_80211s`
-- `adhoc_wifi`
-- `wifi_direct`
-- `physical_wifi_direct`
-- `wwan_d2d`
-
-## Troubleshooting
-
-- Permission errors or missing network namespaces: rerun with `sudo`.
-- Stale interfaces, failed sockets, or odd connectivity after a crash:
-  run `sudo mn -c`, then retry.
-- Peer discovery is probabilistic under mobility. For debugging, use fewer
-  nodes, longer duration, or shorter mobility ranges.
-- `pytest` is not installed in some local environments. A basic import smoke
-  check is:
-
-```bash
-PYTHONDONTWRITEBYTECODE=1 python3 -B -c \
-  "from meshpay.examples.emulation.runner import run_emulation; print('ok')"
-```
-
-## Refactor Audit
-
-This section records low-risk cleanup opportunities found during the repository
-scan. It is intentionally a roadmap, not a behavior change.
-
-- `meshpay_demo.py` can be split into topology creation, account seeding,
-  gateway setup, service lifecycle, and CLI banner helpers.
-- `meshpay/cli_fastpay.py` can be split into command handlers and display/table
-  formatting helpers.
-- `meshpay/transport/tcp.py` and `meshpay/transport/udp.py` can share namespace
-  script creation, message serialization, and log-tail parsing utilities.
-- `meshpay/logger/*Logger.py` can share a base logger for file setup, xterm
-  lifecycle, and console formatting.
-- Generated telemetry and cache files should stay out of source-controlled
-  example logic; prefer `results/` for new experiment outputs.
+*   **Namespace or Permission Errors**: Re-run the command with `sudo`.
+*   **Socket or Interface Collisions**: Run `sudo mn -c` to clear stale resources, then retry.
+*   **No root/VM access**: Omit `sudo` to automatically trigger the simulation fallback for benchmarking.
+*   **Connectivity lower than expected**: Check `--wireless-range`, `--propagation-exp`, and `--propagation-sl`. The logDistance model controls all signal-level path loss — no additional TC rules are applied.
 

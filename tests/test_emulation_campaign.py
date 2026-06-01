@@ -1,18 +1,16 @@
 import csv
 import json
 
-from meshpay.examples.emulation.aggregation import aggregate_records, load_run_records, write_summary_csv
-from meshpay.examples.emulation.campaign import expand_campaign, parse_seed_list
-from meshpay.examples.emulation.config import EmulationConfig
-from meshpay.examples.emulation.scenarios import deterministic_positions
-from meshpay.examples.emulation.workload import generate_deterministic_workload
+from meshpay.examples.emulation.campaign import expand_campaign, parse_seed_list, aggregate_records, load_run_records, write_summary_csv
+from meshpay.examples.emulation.config import EmulationConfig, generate_deterministic_workload
+from meshpay.examples.emulation.topology import deterministic_positions
 
 
 def test_campaign_expansion_counts_are_balanced():
     config = EmulationConfig(campaign="all", seeds="1,2,3,4,5")
     trials = expand_campaign(config)
 
-    assert len(trials) == 400
+    assert len(trials) == 1000
     assert {trial.routing for trial in trials} == {"sdn_dtn", "epidemic", "prophet", "spray_and_wait"}
 
 

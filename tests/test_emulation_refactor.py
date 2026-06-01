@@ -1,5 +1,4 @@
-from meshpay.examples.emulation.arguments import parse_args
-from meshpay.examples.emulation.config import BenchmarkStats, DEFAULT_WORKLOAD, EmulationConfig
+from meshpay.examples.emulation.config import parse_args, BenchmarkStats, DEFAULT_WORKLOAD, EmulationConfig
 from meshpay.examples.emulation.runner import build_subprocess_command
 
 
@@ -95,4 +94,8 @@ def test_comparison_subprocess_command_forwards_cli_options():
     assert cmd[cmd.index("--output-file") + 1] == "/tmp/sdn_stats.json"
     assert cmd[cmd.index("--scenario-name") + 1] == "single"
     assert cmd[cmd.index("--workload-size") + 1] == str(len(config.workload))
+    assert cmd[cmd.index("--propagation-model") + 1] == "logNormalShadowing"
+    assert cmd[cmd.index("--propagation-exp") + 1] == "3.5"
+    assert cmd[cmd.index("--propagation-sl") + 1] == "6.0"
+    assert cmd[cmd.index("--mobility-model") + 1] == "GaussMarkov"
 

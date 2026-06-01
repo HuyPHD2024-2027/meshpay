@@ -45,7 +45,7 @@ class SDNDTNRouting(DTNRoutingProtocol):
         self._replication_counts: Dict[str, int] = {}
         self._last_summary_sent: Dict[str, float] = {}
         self._last_policy_marker_sent: Dict[str, str] = {}
-        self.summary_cooldown = 2.0
+        self.summary_cooldown = 3.0
         self.default_limits = {
             "transfer_request": 5,
             "transfer_response": 5,
@@ -75,14 +75,35 @@ class SDNDTNRouting(DTNRoutingProtocol):
         if not self.node:
             return
 
-        if self._is_authority():
-            self._send_policy_fragment(neighbor_id)
+        self._send_policy_fragment(neighbor_id)
 
         active_policy = self._active_policy()
         if not active_policy:
             self._fallback.on_neighbor_discovered(neighbor_id, current_buffer)
             self._drain_fallback_outbox()
             return
+
+        # Proactively push any matching "push" messages in the buffer to the neighbor if eligible
+        for msg_id, item in list(current_buffer.items()):
+            if item.is_expired:
+                continue
+            msg_type = item.message_type
+            rule = get_forwarding_rule(active_policy, msg_type)
+            if rule.get("action") == "push":
+                candidates = self._policy_targets(msg_type, item, active_policy)
+                if neighbor_id in candidates:
+                    limit = get_replication_limit(active_policy, msg_type, self.default_limits.get(msg_type, len(candidates)))
+                    rep_count = self._replication_counts.get(msg_id, 0)
+                    count_key = f"{msg_id}->{neighbor_id}"
+                    if rep_count < limit and self._replication_counts.get(count_key, 0) == 0:
+                        self._queue_relay_transmission(
+                            recipient_id=neighbor_id,
+                            msg_id=msg_id,
+                            interface_preference=get_interface_preference(active_policy, msg_type),
+                        )
+                        self._replication_counts[count_key] = 1
+                        self._replication_counts[msg_id] = rep_count + 1
+                        logger.debug("[%s] SDN proactive discovery-push %s to neighbor %s", self.node_id, msg_id, neighbor_id)
 
         now = time.time()
         last_sent = self._last_summary_sent.get(neighbor_id, 0.0)
@@ -111,10 +132,16 @@ class SDNDTNRouting(DTNRoutingProtocol):
 
         if p_type == "sdn_policy":
             self._handle_policy(sender_id, data, current_buffer)
-        elif p_type == "sdn_summary" and self._active_policy():
-            self._handle_summary(sender_id, data.get("keys", []), current_buffer)
-        elif p_type == "sdn_request" and self._active_policy():
-            self._handle_request(sender_id, data.get("requested_keys", []), current_buffer)
+        elif p_type == "sdn_summary":
+            if self._active_policy():
+                self._handle_summary(sender_id, data.get("keys", []), current_buffer)
+            else:
+                logger.debug("[%s] Ignoring sdn_summary from %s: active policy not yet reached quorum", self.node_id, sender_id)
+        elif p_type == "sdn_request":
+            if self._active_policy():
+                self._handle_request(sender_id, data.get("requested_keys", []), current_buffer)
+            else:
+                logger.debug("[%s] Ignoring sdn_request from %s: active policy not yet reached quorum", self.node_id, sender_id)
         elif str(p_type or "").startswith("epidemic_"):
             self._fallback.on_routing_message_received(sender_id, payload, current_buffer)
             self._drain_fallback_outbox()
@@ -145,10 +172,8 @@ class SDNDTNRouting(DTNRoutingProtocol):
             return
 
         now = time.time()
-        neighbor_ids = set(self._last_summary_sent.keys())
         neighbors = getattr(getattr(self.node, "state", None), "neighbors", {})
-        neighbor_ids.update(neighbors.keys())
-        for neighbor_id in neighbor_ids:
+        for neighbor_id in neighbors:
             self._queue_routing_message(
                 recipient_id=neighbor_id,
                 protocol_type="sdn_summary",
@@ -206,18 +231,31 @@ class SDNDTNRouting(DTNRoutingProtocol):
             authorities.add(self.node_id)
         return sorted(authorities)
 
+    def _best_policy(self) -> Optional[Dict[str, Any]]:
+        if self.policy_store.active_policy:
+            return copy.deepcopy(self.policy_store.active_policy)
+        if self.policy_store.pending:
+            from meshpay.policy.model import policy_signatures
+            best_hash = max(
+                self.policy_store.pending.keys(),
+                key=lambda h: len(policy_signatures(self.policy_store.pending[h])),
+            )
+            return copy.deepcopy(self.policy_store.pending[best_hash])
+        return None
+
     def _base_policy(self) -> Dict[str, Any]:
         if self._policy_template:
             policy = copy.deepcopy(self._policy_template)
         else:
             now = time.time()
-            epoch = int(now / 15)
-            epoch_start = epoch * 15
+            epoch_duration = 3600
+            epoch = int(now / epoch_duration)
+            epoch_start = epoch * epoch_duration
             policy = build_default_policy(
                 self._known_authorities(),
                 epoch=epoch,
                 valid_from=epoch_start,
-                valid_until=epoch_start + 60,
+                valid_until=epoch_start + 7200,
             )
 
         policy.setdefault("signatures", {})
@@ -226,17 +264,30 @@ class SDNDTNRouting(DTNRoutingProtocol):
         return policy
 
     def _send_policy_fragment(self, neighbor_id: str) -> None:
-        policy = self._base_policy()
-        authorities = committee_authorities(policy)
-        if self.node_id not in authorities:
-            authorities.append(self.node_id)
-            policy.setdefault("committee", {})["authorities"] = sorted(authorities)
+        policy = self._best_policy()
+        if not policy:
+            if self._is_authority():
+                policy = self._base_policy()
+            else:
+                return
 
-        key = self.policy_store.authority_keys.get(self.node_id, default_authority_key(self.node_id))
-        from meshpay.policy import sign_policy
+        if self._is_authority():
+            authorities = committee_authorities(policy)
+            if self.node_id not in authorities:
+                authorities.append(self.node_id)
+                policy.setdefault("committee", {})["authorities"] = sorted(authorities)
 
-        fragment = sign_policy(policy, self.node_id, key)
-        self._queue_policy_for_neighbor(neighbor_id, fragment)
+            from meshpay.policy.model import policy_signatures
+            signatures = policy_signatures(policy)
+            if self.node_id not in signatures:
+                key = self.policy_store.authority_keys.get(self.node_id, default_authority_key(self.node_id))
+                from meshpay.policy import sign_policy
+                policy = sign_policy(policy, self.node_id, key)
+                self.policy_store.add_policy_fragment(policy)
+                # Re-read best policy to ensure we have the updated/merged signatures
+                policy = self._best_policy() or policy
+
+        self._queue_policy_for_neighbor(neighbor_id, policy)
 
     def _queue_policy_for_neighbor(self, neighbor_id: str, policy: Dict[str, Any]) -> None:
         marker = f"{canonical_policy_hash(policy)}:{len(policy_signatures(policy))}"
@@ -341,8 +392,19 @@ class SDNDTNRouting(DTNRoutingProtocol):
             logger.debug("[%s] Rejected SDN policy from %s: %s", self.node_id, sender_id, result.reason)
             return
 
+        if self._is_authority() and result.policy:
+            from meshpay.policy.model import policy_signatures
+            signatures = policy_signatures(result.policy)
+            if self.node_id not in signatures:
+                key = self.policy_store.authority_keys.get(self.node_id, default_authority_key(self.node_id))
+                from meshpay.policy import sign_policy
+                signed_frag = sign_policy(result.policy, self.node_id, key)
+                result = self.policy_store.add_policy_fragment(signed_frag)
+
         if result.policy:
-            self._gossip_policy(result.policy, exclude=sender_id)
+            best_p = self.policy_store.get_pending_policy(result.policy_hash) or self.policy_store.active_policy
+            if best_p:
+                self._gossip_policy(best_p, exclude=sender_id)
 
         if result.active and result.policy:
             self._cached_policy = result.policy

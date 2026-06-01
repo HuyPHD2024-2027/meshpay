@@ -1,3 +1,0 @@
-meshpay
-mn_wifi
-util

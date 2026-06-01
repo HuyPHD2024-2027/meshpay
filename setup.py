@@ -28,7 +28,7 @@ setup(
               'mn_wifi.services', 'mn_wifi.services.abis', 'mn_wifi.services.core',
               'meshpay', 'meshpay.api', 'meshpay.nodes', 'meshpay.transport', 'meshpay.logger', 'meshpay.controller',
               'meshpay.examples', 'meshpay.examples.emulation', 'meshpay.oppnet', 'meshpay.policy',
-              'meshpay.types', 'meshpay.routing', 'meshpay.mesh', 'meshpay.telemetry'
+              'meshpay.types', 'meshpay.routing', 'meshpay.mesh'
               ],
     package_data={'util' : ['m'], 'mn_wifi.sumo.data': ['*.xml', '*.sumocfg'],
                   'mn_wifi.data': ['signal_table_ieee80211ax',

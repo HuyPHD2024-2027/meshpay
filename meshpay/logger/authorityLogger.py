@@ -20,8 +20,10 @@ class AuthorityLogger:
             authority_name: Name of the authority
             log_file: Optional log file path (defaults to /tmp/{authority_name}_log.txt)
         """
+        import os
         self.authority_name = authority_name
-        self.log_file = log_file or f"/tmp/{authority_name}_authority.log"
+        log_dir = os.environ.get("MESHPAY_LOG_DIR", "/tmp")
+        self.log_file = log_file or os.path.join(log_dir, f"{authority_name}_authority.log")
         self.log_queue = queue.Queue()
         self.running = True
         self.terminal_process: Optional[subprocess.Popen] = None

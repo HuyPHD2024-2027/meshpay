@@ -147,13 +147,8 @@ class MeshMixin:
                 except (IndexError, TypeError, ValueError):
                     pos_tuple = (0.0, 0.0, 0.0)
 
-                # Piggyback latest telemetry if daemon is available
+                # Piggyback latest telemetry if available
                 telemetry_data = None
-                daemon = getattr(self, "telemetry_daemon", None)
-                if daemon:
-                    state = daemon.get_latest_state()
-                    if state:
-                        telemetry_data = state.to_dict()
 
                 discovery = PeerDiscoveryMessage(
                     node_info=self.address,
@@ -259,11 +254,6 @@ class MeshMixin:
                 continue
 
             telemetry_data = None
-            daemon = getattr(self, "telemetry_daemon", None)
-            if daemon:
-                state = daemon.get_latest_state()
-                if state:
-                    telemetry_data = state.to_dict()
 
             msg_type = instr.get("type")
             if msg_type == "routing":
