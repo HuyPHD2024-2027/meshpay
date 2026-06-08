@@ -1,1 +1,0 @@
-# MeshPay examples package.

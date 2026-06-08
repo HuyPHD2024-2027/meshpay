@@ -19,3 +19,4 @@ results/
 meshpay/analysis/
 sflow-rt/*
 tmp/
+logs/
