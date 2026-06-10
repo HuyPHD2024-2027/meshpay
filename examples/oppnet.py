@@ -255,19 +255,6 @@ def configure_mobility(net: Mininet_wifi, args: argparse.Namespace) -> None:
     )
 
 
-def peer_args_for_station(stations, current_station) -> str:
-    peer_args = []
-
-    for peer in stations:
-        if peer.name == current_station.name:
-            continue
-
-        ip = peer.IP()
-        peer_args.append(f"--peer {shlex.quote(peer.name + '=' + ip)}")
-
-    return " ".join(peer_args)
-
-
 def start_dtn_routers(
     stations,
     routing: str,
@@ -286,15 +273,12 @@ def start_dtn_routers(
         sta.cmd(f"rm -rf {shlex.quote(str(store))}")
         sta.cmd(f"mkdir -p {shlex.quote(str(store))}")
 
-        peer_args = peer_args_for_station(stations, sta)
-
         cmd = (
             f"PYTHONPATH={shlex.quote(str(ROOT_DIR))} "
             f"python3 {shlex.quote(str(router_file))} "
             f"--node {shlex.quote(sta.name)} "
             f"--store {shlex.quote(str(store))} "
             f"--discovery-interval 0.5 "
-            f"{peer_args} "
             f"> {shlex.quote(str(log_file))} 2>&1"
         )
 
@@ -304,7 +288,6 @@ def start_dtn_routers(
         info(f"*** {sta.name}: daemon started\n")
         info(f"***     store={store}\n")
         info(f"***     log={log_file}\n")
-        info(f"***     peers={peer_args}\n")
 
     time.sleep(2)
 
