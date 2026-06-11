@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import heapq
 import json
 import os
 import threading
@@ -72,7 +73,7 @@ class BundleStore:
                 isinstance(bundle.payload, dict)
                 and bundle.payload.get("type") == "confirmation_order"
             ):
-                order_id = bundle.payload.get("data", {}).get("order_id")
+                order_id = (bundle.payload.get("data", {}).get("order_id") or bundle.payload.get("data", {}).get("i"))
 
                 if order_id:
                     self.confirmed_order_ids.add(order_id)
@@ -93,7 +94,7 @@ class BundleStore:
                 if payload_type not in {"transfer_order", "signed_transfer_order"}:
                     continue
 
-                candidate_order_id = bundle.payload.get("data", {}).get("order_id")
+                candidate_order_id = (bundle.payload.get("data", {}).get("order_id") or bundle.payload.get("data", {}).get("i"))
 
                 if candidate_order_id == order_id:
                     to_delete.append(bundle_id)
@@ -142,14 +143,43 @@ class BundleStore:
     def ids(self) -> set[str]:
         return {bundle.bundle_id for bundle in self.all()}
 
-    def unknown_to_peer(self, peer_ids: Iterable[str]) -> List[Bundle]:
+    def unknown_to_peer(
+        self,
+        peer_ids: Iterable[str],
+        peer_node: str | None = None,
+        limit: Optional[int] = None,
+    ) -> List[Bundle]:
+        if limit is not None and limit <= 0:
+            return []
+
         known = set(peer_ids)
 
-        return [
+        bundles = [
             bundle
             for bundle in self.all()
             if bundle.bundle_id not in known and not bundle.expired()
         ]
+
+        def priority(bundle: Bundle) -> tuple[int, int, float]:
+            payload_type = None
+
+            if isinstance(bundle.payload, dict):
+                payload_type = bundle.payload.get("type")
+
+            type_priority = {
+                "confirmation_order": 0,
+                "signed_transfer_order": 1,
+                "transfer_order": 2,
+            }.get(payload_type, 3)
+
+            destination_priority = 0 if peer_node and bundle.dst == peer_node else 1
+
+            return (type_priority, destination_priority, bundle.created_at)
+
+        if limit is None or len(bundles) <= limit:
+            return sorted(bundles, key=priority)
+
+        return heapq.nsmallest(limit, bundles, key=priority)
 
     def record_event(self, event: dict) -> None:
         event = dict(event)
@@ -279,7 +309,7 @@ class BundleStore:
             if bundle.payload.get("type") != "confirmation_order":
                 continue
 
-            order_id = bundle.payload.get("data", {}).get("order_id")
+            order_id = (bundle.payload.get("data", {}).get("order_id") or bundle.payload.get("data", {}).get("i"))
 
             if order_id:
                 confirmed.add(order_id)

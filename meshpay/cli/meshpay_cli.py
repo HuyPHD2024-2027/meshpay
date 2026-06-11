@@ -13,6 +13,7 @@ from typing import Iterable, List, Optional
 
 from mininet.log import error, info
 from mn_wifi.cli import CLI
+from dtn import config as dtn_config
 from meshpay.offline.virtual_accounts import account_host
 
 from meshpay.offline.dtn_adapter import DTNAdapter
@@ -43,7 +44,7 @@ class MeshPayRuntime:
         router_file: str | Path,
         log_dir: str | Path,
         root_dir: str | Path,
-        discovery_interval: float = 2.0,
+        discovery_interval: float = dtn_config.DEFAULT_DISCOVERY_INTERVAL,
         payment_poll_interval: float = 0.5,
     ) -> None:
         self.net = net
@@ -93,12 +94,12 @@ class MeshPayRuntime:
                 f"--node {shlex.quote(node.name)} "
                 f"--store {shlex.quote(str(store))} "
                 f"--discovery-interval {self.discovery_interval} "
-                f"--connect-timeout 5.0 "
-                f"--socket-timeout 10.0 "
-                f"--max-backoff 30.0 "
-                f"--max-parallel-exchanges 4 "
-                f"--contact-miss-log-interval 30.0 "
-                f"--success-cooldown 15.0 "
+                f"--connect-timeout {dtn_config.DEFAULT_CONNECT_TIMEOUT} "
+                f"--socket-timeout {dtn_config.DEFAULT_SOCKET_TIMEOUT} "
+                f"--max-backoff {dtn_config.DEFAULT_MAX_BACKOFF} "
+                f"--max-parallel-exchanges {dtn_config.DEFAULT_MAX_PARALLEL_EXCHANGES} "
+                f"--contact-miss-log-interval {dtn_config.DEFAULT_CONTACT_MISS_LOG_INTERVAL} "
+                f"--success-cooldown {dtn_config.DEFAULT_SUCCESS_COOLDOWN} "
                 f"> {shlex.quote(str(log_file))} 2>&1 &"
             )
 
@@ -188,7 +189,7 @@ class MeshPayRuntime:
             sender_account=sender_account,
         )
 
-        payload = order.to_dtn_payload()
+        payload = DTNAdapter.to_payload(order)
 
         self.record_event(
             {
@@ -256,7 +257,11 @@ class MeshPayRuntime:
         recipient = None
         amount = None
         try:
-            obj = DTNAdapter.from_payload(payload)
+            source_node = self.net.get(src_name)
+            obj = DTNAdapter.from_payload(
+                payload,
+                order_lookup=self.order_lookup_for_node(source_node),
+            )
             if isinstance(obj, TransferOrder):
                 sender = obj.sender
                 recipient = obj.recipient
@@ -348,9 +353,53 @@ class MeshPayRuntime:
 
             self.handle_payment_payload(node, payload)
         
+    def order_lookup_for_node(self, node):
+        return lambda order_id: self.lookup_order(node, order_id)
+
+    def lookup_order(self, node, order_id: str):
+        order_id = str(order_id)
+
+        pending_transfers = getattr(node, "pending_transfers", None)
+        if isinstance(pending_transfers, dict):
+            order = pending_transfers.get(order_id)
+            if order is not None:
+                return order
+
+        confirmation_orders = getattr(node, "confirmation_orders", None)
+        if isinstance(confirmation_orders, dict):
+            confirmation = confirmation_orders.get(order_id)
+            if confirmation is not None:
+                return confirmation.transfer_order
+
+        signed_transfer_orders = getattr(node, "signed_transfer_orders", None)
+        if isinstance(signed_transfer_orders, dict):
+            signatures_for_order = signed_transfer_orders.get(order_id)
+            if isinstance(signatures_for_order, dict):
+                for signed in signatures_for_order.values():
+                    return signed.transfer_order
+
+        state = getattr(node, "state", None)
+        accounts = getattr(state, "accounts", None)
+        if isinstance(accounts, dict):
+            for account in accounts.values():
+                pending = getattr(account, "pending_confirmation", None)
+                if pending is not None and str(pending.order_id) == order_id:
+                    return pending.transfer_order
+
+                confirmed = getattr(account, "confirmed_transfers", None)
+                if isinstance(confirmed, dict):
+                    confirmation = confirmed.get(order_id)
+                    if confirmation is not None:
+                        return confirmation.transfer_order
+
+        return None
+
     def handle_payment_payload(self, node, payload: dict) -> None:
         try:
-            obj = DTNAdapter.from_payload(payload)
+            obj = DTNAdapter.from_payload(
+                payload,
+                order_lookup=self.order_lookup_for_node(node),
+            )
         except ValueError:
             return
 

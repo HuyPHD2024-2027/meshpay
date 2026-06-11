@@ -47,6 +47,7 @@ class MeshPayBenchmarkConfig:
     accounts_per_station: int
     
     payments: int
+    payment_rate: float
     amount: int
     initial_balance: int
 
@@ -90,6 +91,9 @@ class MeshPayBenchmarkConfig:
 
         if self.payments < 1:
             raise ValueError("--payments must be at least 1")
+
+        if self.payment_rate <= 0:
+            raise ValueError("--payment-rate must be greater than 0")
 
         if self.amount <= 0:
             raise ValueError("--amount must be greater than 0")
@@ -160,6 +164,13 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=20,
         help="Number of payments to submit.",
+    )
+
+    parser.add_argument(
+        "--payment-rate",
+        type=float,
+        default=1.0,
+        help="Maximum payment submission rate in payments per second.",
     )
 
     parser.add_argument(
@@ -281,6 +292,7 @@ def build_config(args: argparse.Namespace) -> MeshPayBenchmarkConfig:
         authorities=args.authorities,
         accounts_per_station=args.accounts_per_station,
         payments=args.payments,
+        payment_rate=args.payment_rate,
         amount=args.amount,
         initial_balance=args.initial_balance,
         duration=args.duration,
@@ -521,6 +533,8 @@ def run_payment_traffic(
     submitted_success = 0
     submitted_total = 0
     last_backpressure_log = 0.0
+    next_submit_at = started_at
+    submit_interval = 1.0 / config.payment_rate
 
     def worker_task(sender, recipient):
         nonlocal submitted_success, submitted_total
@@ -567,6 +581,11 @@ def run_payment_traffic(
                 time.sleep(0.01)
                 continue
 
+            now = time.time()
+            if now < next_submit_at:
+                time.sleep(min(next_submit_at - now, 0.05))
+                continue
+
             eligible_senders = []
             for account_id in all_accounts:
                 with traffic_lock:
@@ -602,6 +621,10 @@ def run_payment_traffic(
 
                 currently_submitting.add(sender_account)
                 submitted_total += 1
+                next_submit_at = max(
+                    next_submit_at + submit_interval,
+                    time.time() + submit_interval,
+                )
 
             executor.submit(worker_task, sender_account, recipient_account)
 
@@ -679,7 +702,7 @@ def topology(config: MeshPayBenchmarkConfig) -> None:
     nodes = clients + authorities
 
     info("*** Configuring propagation model\n")
-    net.setPropagationModel(model="logDistance", exp=4)
+    net.setPropagationModel(model="logNormalShadowing", exp=3.2, variance=2.0)
 
     info("*** Configuring nodes\n")
     net.configureNodes()
@@ -706,7 +729,6 @@ def topology(config: MeshPayBenchmarkConfig) -> None:
         router_file=router_file,
         log_dir=config.log_dir,
         root_dir=ROOT_DIR,
-        discovery_interval=2.0,
         payment_poll_interval=0.5,
     )
 

@@ -318,7 +318,7 @@ def topology(args: argparse.Namespace) -> None:
     stations = create_stations(net, args)
 
     info("*** Configuring propagation model\n")
-    net.setPropagationModel(model="logDistance", exp=4)
+    net.setPropagationModel(model="logNormalShadowing", exp=3.2, variance=2.0)
 
     info("*** Configuring nodes\n")
     net.configureNodes()

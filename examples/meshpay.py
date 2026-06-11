@@ -374,7 +374,7 @@ def topology(args: argparse.Namespace) -> None:
     nodes = clients + authorities
 
     info("*** Configuring propagation model\n")
-    net.setPropagationModel(model="logDistance", exp=4)
+    net.setPropagationModel(model="logNormalShadowing", exp=3.2, variance=2.0)
 
     info("*** Configuring nodes\n")
     net.configureNodes()
@@ -401,7 +401,6 @@ def topology(args: argparse.Namespace) -> None:
         router_file=router_file,
         log_dir=log_dir,
         root_dir=ROOT_DIR,
-        discovery_interval=2.0,
         payment_poll_interval=0.5,
     )
 

@@ -6,7 +6,6 @@ import argparse
 import base64
 import ipaddress
 import json
-import os
 import random
 import socket
 import subprocess
@@ -24,6 +23,7 @@ from dtn.store import BundleStore
 
 DEFAULT_DISCOVERY_PORT = config.DEFAULT_DISCOVERY_PORT
 DEFAULT_EXCHANGE_PORT = config.DEFAULT_EXCHANGE_PORT
+MAX_BUNDLES_PER_EXCHANGE = 64
 
 
 class EpidemicRouter:
@@ -159,7 +159,7 @@ class EpidemicRouter:
             payload_type = bundle.payload.get("type")
 
             if payload_type in {"transfer_order", "signed_transfer_order"}:
-                order_id = bundle.payload.get("data", {}).get("order_id")
+                order_id = (bundle.payload.get("data", {}).get("order_id") or bundle.payload.get("data", {}).get("i"))
 
                 if order_id and order_id in self.store.confirmed_order_ids:
                     return False
@@ -253,7 +253,11 @@ class EpidemicRouter:
 
             self.log(f"contact from peer={peer_node} ip={addr[0]}")
 
-            bundles_for_peer = self.store.unknown_to_peer(peer_ids)
+            bundles_for_peer = self.store.unknown_to_peer(
+                peer_ids,
+                peer_node=peer_node,
+                limit=MAX_BUNDLES_PER_EXCHANGE,
+            )
 
             response = {
                 "type": "summary",
@@ -469,7 +473,11 @@ class EpidemicRouter:
                     self.log(f"error decoding incoming bundle from peer: {exc!r}")
                     break
 
-            bundles_for_peer = self.store.unknown_to_peer(peer_ids)
+            bundles_for_peer = self.store.unknown_to_peer(
+                peer_ids,
+                peer_node=peer_node,
+                limit=MAX_BUNDLES_PER_EXCHANGE,
+            )
 
             final = {
                 "type": "bundles",
@@ -577,6 +585,21 @@ class EpidemicRouter:
             f"contact_missed peer={peer_node} "
             f"ip={peer_ip} error={exc!r}"
         )
+
+    def start_exchange_thread(
+        self,
+        peer_node: str,
+        peer_ip: str,
+        peer_port: int,
+        force: bool = True,
+    ) -> None:
+        thread = threading.Thread(
+            target=self.exchange_with_peer,
+            args=(peer_node, peer_ip, peer_port),
+            kwargs={"force": force},
+            daemon=True,
+        )
+        thread.start()
 
     # ------------------------------------------------------------------
     # UDP neighbour discovery: discover / peer
@@ -765,14 +788,10 @@ class EpidemicRouter:
                 }
             )
 
-            # Remember the peer.
+            # Remember the peer. Keep one-sided initiation on discovery replies
+            # to avoid redundant TCP storms in dense benchmarks.
             self.peers[peer_node] = peer_ip
 
-            # Important:
-            # A unicast peer reply is a stronger signal than a broadcast
-            # discover request, so we attempt exactly one exchange.
-            # To break symmetry and avoid redundant concurrent connections,
-            # only the lexicographically smaller node initiates the exchange.
             if self.node < peer_node:
                 self.record_event(
                     {
@@ -782,13 +801,7 @@ class EpidemicRouter:
                         "peer_port": peer_port,
                     }
                 )
-                thread = threading.Thread(
-                    target=self.exchange_with_peer,
-                    args=(peer_node, peer_ip, peer_port),
-                    kwargs={"force": True},
-                    daemon=True,
-                )
-                thread.start()
+                self.start_exchange_thread(peer_node, peer_ip, peer_port, force=True)
             else:
                 self.record_event(
                     {
