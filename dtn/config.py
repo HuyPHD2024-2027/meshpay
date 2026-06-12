@@ -1,5 +1,10 @@
 """Centralized configuration parameters for the MeshPay Epidemic DTN router."""
 
+# Maximum number of bundles to send in a single TCP exchange.
+# Increased from 64 to 5000 to drastically reduce propagation latency 
+# and the number of exchange rounds needed for synchronization.
+DEFAULT_MAX_BUNDLES_PER_EXCHANGE = 5000
+
 # Default UDP port used for neighbor discovery broadcasts/requests
 DEFAULT_DISCOVERY_PORT = 45555
 
@@ -17,7 +22,7 @@ DEFAULT_SUCCESS_COOLDOWN = 2.0
 DEFAULT_CONNECT_TIMEOUT = 5.0
 
 # Timeout (in seconds) for active socket read/write operations during bundle exchange.
-DEFAULT_SOCKET_TIMEOUT = 10.0
+DEFAULT_SOCKET_TIMEOUT = 30.0
 
 # Maximum backoff interval (in seconds) for retry attempts after connection failure.
 DEFAULT_MAX_BACKOFF = 10.0

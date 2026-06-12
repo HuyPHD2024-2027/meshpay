@@ -79,7 +79,11 @@ class BundleStore:
                     self.confirmed_order_ids.add(order_id)
                     self.prune_by_order_id(order_id)
 
-            self._refresh_mtime_unlocked()
+            # DO NOT call _refresh_mtime_unlocked() here.
+            # save() already updates the in-memory _cache directly.
+            # Updating _cached_mtime would hide external disk changes
+            # (e.g. bundles written by inject_payload in meshpay_cli.py)
+            # from _refresh_cache_if_needed_unlocked().
 
     def prune_by_order_id(self, order_id: str) -> None:
         with self._lock:
@@ -102,8 +106,6 @@ class BundleStore:
             for bundle_id in to_delete:
                 self._delete_bundle_files_unlocked(bundle_id)
                 self._cache.pop(bundle_id, None)
-
-            self._refresh_mtime_unlocked()
 
     def load(self, bundle_id: str) -> Optional[Bundle]:
         with self._lock:
@@ -330,8 +332,6 @@ class BundleStore:
         for bundle_id in expired_ids:
             self._delete_bundle_files_unlocked(bundle_id)
             self._cache.pop(bundle_id, None)
-
-        self._refresh_mtime_unlocked()
 
     def _delete_bundle_files_unlocked(self, bundle_id: str) -> None:
         try:

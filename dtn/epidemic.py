@@ -23,7 +23,6 @@ from dtn.store import BundleStore
 
 DEFAULT_DISCOVERY_PORT = config.DEFAULT_DISCOVERY_PORT
 DEFAULT_EXCHANGE_PORT = config.DEFAULT_EXCHANGE_PORT
-MAX_BUNDLES_PER_EXCHANGE = 64
 
 
 class EpidemicRouter:
@@ -256,7 +255,7 @@ class EpidemicRouter:
             bundles_for_peer = self.store.unknown_to_peer(
                 peer_ids,
                 peer_node=peer_node,
-                limit=MAX_BUNDLES_PER_EXCHANGE,
+                limit=config.DEFAULT_MAX_BUNDLES_PER_EXCHANGE,
             )
 
             response = {
@@ -476,7 +475,7 @@ class EpidemicRouter:
             bundles_for_peer = self.store.unknown_to_peer(
                 peer_ids,
                 peer_node=peer_node,
-                limit=MAX_BUNDLES_PER_EXCHANGE,
+                limit=config.DEFAULT_MAX_BUNDLES_PER_EXCHANGE,
             )
 
             final = {

@@ -6,6 +6,7 @@ import argparse
 import csv
 import itertools
 import json
+import math
 import os
 import shlex
 import subprocess
@@ -52,23 +53,35 @@ class RunSpec:
     area_height: float
     mobility_start: float
     no_mobility: bool
+    attack: str
+    attack_loss_probability: float
+    attack_tpre: float
+    attack_tatk: float
+    attack_tpost: float
+    attack_target_count: str
+    attack_load_rate: float
     run_index: int
 
     @property
     def run_id(self) -> str:
-        mobility = "static" if self.no_mobility else f"s{self.speed.label}"
         return (
             f"{self.run_index:03d}_"
             f"c{self.clients}_"
             f"a{self.authorities}_"
             f"r{fmt(self.node_range)}_"
-            f"v{self.accounts_per_station}_"
-            f"tv{self.total_virtual_accounts}_"
-            f"{mobility}_"
             f"p{self.payments}_"
-            f"rate{fmt(self.payment_rate)}_"
-            f"seed{self.seed}"
+            f"m{self.medium}_"
+            f"att{attack_label(self.attack)}"
         )
+
+
+def attack_label(attack: str) -> str:
+    return {
+        "none": "None",
+        "packetloss": "PL",
+        "load": "Load",
+        "packetloss-load": "PLLoad",
+    }.get(attack, attack)
 
 
 def fmt(value: float | int) -> str:
@@ -90,7 +103,9 @@ def parse_int_list(value: str, name: str) -> list[int]:
         try:
             item = int(raw)
         except ValueError as exc:
-            raise argparse.ArgumentTypeError(f"{name} must be comma-separated integers") from exc
+            raise argparse.ArgumentTypeError(
+                f"{name} must be comma-separated integers"
+            ) from exc
         if item <= 0:
             raise argparse.ArgumentTypeError(f"{name} values must be positive")
         result.append(item)
@@ -109,7 +124,9 @@ def parse_float_list(value: str, name: str) -> list[float]:
         try:
             item = float(raw)
         except ValueError as exc:
-            raise argparse.ArgumentTypeError(f"{name} must be comma-separated numbers") from exc
+            raise argparse.ArgumentTypeError(
+                f"{name} must be comma-separated numbers"
+            ) from exc
         if item <= 0:
             raise argparse.ArgumentTypeError(f"{name} values must be positive")
         result.append(item)
@@ -151,15 +168,45 @@ def parse_args() -> argparse.Namespace:
         description="Run a matrix of MeshPay offline payment benchmarks."
     )
 
-    parser.add_argument("--execute", action="store_true", help="Run commands. Default only prints them.")
-    parser.add_argument("--sudo", action="store_true", default=True, help="Prefix benchmark commands with sudo.")
-    parser.add_argument("--no-sudo", dest="sudo", action="store_false", help="Do not prefix benchmark commands with sudo.")
-    parser.add_argument("--continue-on-error", action="store_true", help="Continue remaining runs after a failure.")
+    parser.add_argument(
+        "--execute",
+        action="store_true",
+        help="Run commands. Default only prints them.",
+    )
+    parser.add_argument(
+        "--sudo",
+        action="store_true",
+        default=True,
+        help="Prefix benchmark commands with sudo.",
+    )
+    parser.add_argument(
+        "--no-sudo",
+        dest="sudo",
+        action="store_false",
+        help="Do not prefix benchmark commands with sudo.",
+    )
+    parser.add_argument(
+        "--continue-on-error",
+        action="store_true",
+        help="Continue remaining runs after a failure.",
+    )
 
     parser.add_argument("--clients", default="4,6", help="Comma-separated client counts.")
-    parser.add_argument("--authorities", default="4", help="Comma-separated authority counts.")
-    parser.add_argument("--ranges", default="100,300", help="Comma-separated transmission ranges.")
-    parser.add_argument("--accounts", default="10,20", help="Comma-separated virtual accounts per station.")
+    parser.add_argument(
+        "--authorities",
+        default="4",
+        help="Comma-separated authority counts.",
+    )
+    parser.add_argument(
+        "--ranges",
+        default="100,300",
+        help="Comma-separated transmission ranges.",
+    )
+    parser.add_argument(
+        "--accounts",
+        default="10,20",
+        help="Comma-separated virtual accounts per station.",
+    )
     parser.add_argument(
         "--total-virtual-accounts",
         default=None,
@@ -169,15 +216,36 @@ def parse_args() -> argparse.Namespace:
             "payments is set to the same total, so each virtual account sends one tx."
         ),
     )
-    parser.add_argument("--speeds", default="0.5:2.0", help="Comma-separated mobility speed ranges as min:max.")
+    parser.add_argument(
+        "--speeds",
+        default="0.5:2.0",
+        help="Comma-separated mobility speed ranges as min:max.",
+    )
 
-    parser.add_argument("--payments", default="100", help="Comma-separated payment counts. Ignored when --total-virtual-accounts is set.")
+    parser.add_argument(
+        "--payments",
+        default="100",
+        help=(
+            "Comma-separated payment counts. Ignored when "
+            "--total-virtual-accounts is set."
+        ),
+    )
     parser.add_argument(
         "--payment-rate",
         default="0.5",
-        help="Comma-separated payment rates, or 'match' to use one-second bursts matching each payment count.",
+        help=(
+            "Comma-separated payment rates, or 'match' to use one-second bursts "
+            "matching each payment count."
+        ),
     )
-    parser.add_argument("--duration", type=float, default=300.0)
+    parser.add_argument(
+        "--duration",
+        default="auto",
+        help=(
+            "Total benchmark duration in seconds. Use 'auto' (default) to "
+            "compute per-run duration based on payment count and attack timing."
+        ),
+    )
     parser.add_argument("--warmup", type=float, default=5.0)
     parser.add_argument("--amount", type=int, default=1)
     parser.add_argument("--initial-balance", type=int, default=10000)
@@ -190,7 +258,39 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-mobility", action="store_true", help="Disable mobility for all runs.")
     parser.add_argument("--output-root", default=str(DEFAULT_OUTPUT_ROOT))
 
+    parser.add_argument(
+        "--attack",
+        choices=["none", "packetloss", "load", "packetloss-load"],
+        default="none",
+    )
+    parser.add_argument("--attack-loss-probability", type=float, default=0.1)
+    parser.add_argument("--attack-tpre", type=float, default=60.0)
+    parser.add_argument("--attack-tatk", type=float, default=180.0)
+    parser.add_argument("--attack-tpost", type=float, default=60.0)
+    parser.add_argument("--attack-target-count", default="auto")
+    parser.add_argument("--attack-load-rate", type=float, default=0.0)
+
     args = parser.parse_args()
+
+    attack_option_flags = {
+        "--attack-loss-probability",
+        "--attack-tpre",
+        "--attack-tatk",
+        "--attack-tpost",
+        "--attack-target-count",
+        "--attack-load-rate",
+    }
+    attack_options_used = any(
+        arg == flag or arg.startswith(f"{flag}=")
+        for arg in sys.argv[1:]
+        for flag in attack_option_flags
+    )
+
+    if args.attack == "none" and attack_options_used:
+        parser.error(
+            "attack parameters were provided, but --attack is none; "
+            "pass --attack packetloss, --attack load, or --attack packetloss-load"
+        )
 
     args.clients = parse_int_list(args.clients, "--clients")
     args.authorities = parse_int_list(args.authorities, "--authorities")
@@ -208,14 +308,44 @@ def parse_args() -> argparse.Namespace:
     else:
         args.payment_rate = parse_float_list(args.payment_rate, "--payment-rate")
 
-    if args.duration <= 0:
-        parser.error("--duration must be positive")
+    # Parse --duration: 'auto' or a positive float.
+    if str(args.duration).strip().lower() == "auto":
+        args.duration = "auto"
+    else:
+        try:
+            args.duration = float(args.duration)
+        except ValueError:
+            parser.error("--duration must be 'auto' or a positive number")
+        if args.duration <= 0:
+            parser.error("--duration must be positive")
+
     if args.warmup < 0:
         parser.error("--warmup must be >= 0")
     if args.amount <= 0:
         parser.error("--amount must be positive")
     if args.initial_balance < 0:
         parser.error("--initial-balance must be >= 0")
+    if not 0.0 <= args.attack_loss_probability <= 1.0:
+        parser.error("--attack-loss-probability must be between 0.0 and 1.0")
+    if args.attack_tpre < 0 or args.attack_tatk < 0 or args.attack_tpost < 0:
+        parser.error("attack timing values must be >= 0")
+    if args.attack != "none" and args.attack_tatk <= 0:
+        parser.error("--attack-tatk must be greater than 0 when attack is enabled")
+    if (
+        args.attack != "none"
+        and args.duration != "auto"
+        and (args.attack_tpre + args.attack_tatk + args.attack_tpost) > args.duration
+    ):
+        parser.error("--duration must be at least attack tpre + tatk + tpost")
+    if args.attack_load_rate < 0:
+        parser.error("--attack-load-rate must be >= 0")
+    if args.attack_target_count != "auto":
+        try:
+            target_count = int(args.attack_target_count)
+        except ValueError:
+            parser.error("--attack-target-count must be auto or a non-negative integer")
+        if target_count < 0:
+            parser.error("--attack-target-count must be auto or a non-negative integer")
 
     return args
 
@@ -224,6 +354,51 @@ def payment_rates_for(args: argparse.Namespace, payments: int) -> list[float]:
     if args.payment_rate == "match":
         return [float(payments)]
     return list(args.payment_rate)
+
+
+def compute_auto_duration(
+    payments: int,
+    payment_rate: float,
+    attack: str,
+    attack_tpre: float,
+    attack_tatk: float,
+    attack_tpost: float,
+) -> float:
+    """Compute a reasonable benchmark duration for the given parameters.
+
+    The duration must be long enough for:
+      1. All payments to be submitted:  payments / payment_rate
+      2. The attack lifecycle to complete:  tpre + tatk + tpost
+      3. A propagation margin for DTN epidemic routing to finish
+         delivering all confirmations after submission and attack end.
+
+    Formula:
+        base = max(submission_time, attack_lifecycle)
+        duration = base + propagation_margin
+
+    The propagation margin scales with payment count because more bundles
+    need more exchange rounds to fully propagate through the mesh.
+    """
+    submission_time = payments / max(payment_rate, 0.01)
+    attack_lifecycle = attack_tpre + attack_tatk + attack_tpost
+
+    base = max(submission_time, attack_lifecycle)
+
+    # Propagation margin: at least 120s, plus 0.1s per payment for
+    # larger workloads where epidemic routing needs more rounds.
+    propagation_margin = max(120.0, payments * 0.1)
+
+    # If there is an attack, ensure the post-attack observation window
+    # has at least 60s extra beyond the base.
+    if attack != "none":
+        propagation_margin = max(propagation_margin, attack_tpost + 60.0)
+
+    duration = base + propagation_margin
+
+    # Round up to nearest 10s for clean boundaries.
+    duration = math.ceil(duration / 10.0) * 10.0
+
+    return duration
 
 
 def build_specs(args: argparse.Namespace) -> list[RunSpec]:
@@ -242,7 +417,8 @@ def build_specs(args: argparse.Namespace) -> list[RunSpec]:
         for clients, authorities, node_range, total_accounts, speed in matrix:
             if total_accounts % clients != 0:
                 raise SystemExit(
-                    f"total virtual accounts {total_accounts} must be divisible by clients {clients}"
+                    f"total virtual accounts {total_accounts} must be divisible by "
+                    f"clients {clients}"
                 )
 
             accounts = total_accounts // clients
@@ -259,7 +435,18 @@ def build_specs(args: argparse.Namespace) -> list[RunSpec]:
                         speed=speed,
                         payments=payments,
                         payment_rate=payment_rate,
-                        duration=args.duration,
+                        duration=(
+                            compute_auto_duration(
+                                payments=payments,
+                                payment_rate=payment_rate,
+                                attack=args.attack,
+                                attack_tpre=args.attack_tpre,
+                                attack_tatk=args.attack_tatk,
+                                attack_tpost=args.attack_tpost,
+                            )
+                            if args.duration == "auto"
+                            else args.duration
+                        ),
                         warmup=args.warmup,
                         amount=args.amount,
                         initial_balance=args.initial_balance,
@@ -270,6 +457,13 @@ def build_specs(args: argparse.Namespace) -> list[RunSpec]:
                         area_height=args.area_height,
                         mobility_start=args.mobility_start,
                         no_mobility=args.no_mobility,
+                        attack=args.attack,
+                        attack_loss_probability=args.attack_loss_probability,
+                        attack_tpre=args.attack_tpre,
+                        attack_tatk=args.attack_tatk,
+                        attack_tpost=args.attack_tpost,
+                        attack_target_count=args.attack_target_count,
+                        attack_load_rate=args.attack_load_rate,
                         run_index=run_index,
                     )
                 )
@@ -299,7 +493,18 @@ def build_specs(args: argparse.Namespace) -> list[RunSpec]:
                     speed=speed,
                     payments=payments,
                     payment_rate=payment_rate,
-                    duration=args.duration,
+                    duration=(
+                        compute_auto_duration(
+                            payments=payments,
+                            payment_rate=payment_rate,
+                            attack=args.attack,
+                            attack_tpre=args.attack_tpre,
+                            attack_tatk=args.attack_tatk,
+                            attack_tpost=args.attack_tpost,
+                        )
+                        if args.duration == "auto"
+                        else args.duration
+                    ),
                     warmup=args.warmup,
                     amount=args.amount,
                     initial_balance=args.initial_balance,
@@ -310,6 +515,13 @@ def build_specs(args: argparse.Namespace) -> list[RunSpec]:
                     area_height=args.area_height,
                     mobility_start=args.mobility_start,
                     no_mobility=args.no_mobility,
+                    attack=args.attack,
+                    attack_loss_probability=args.attack_loss_probability,
+                    attack_tpre=args.attack_tpre,
+                    attack_tatk=args.attack_tatk,
+                    attack_tpost=args.attack_tpost,
+                    attack_target_count=args.attack_target_count,
+                    attack_load_rate=args.attack_load_rate,
                     run_index=run_index,
                 )
             )
@@ -371,6 +583,26 @@ def command_for(spec: RunSpec, run_dir: Path, use_sudo: bool) -> list[str]:
     if spec.no_mobility:
         command.append("--no-mobility")
 
+    if spec.attack != "none":
+        command.extend(
+            [
+                "--attack",
+                spec.attack,
+                "--attack-loss-probability",
+                str(spec.attack_loss_probability),
+                "--attack-tpre",
+                str(spec.attack_tpre),
+                "--attack-tatk",
+                str(spec.attack_tatk),
+                "--attack-tpost",
+                str(spec.attack_tpost),
+                "--attack-target-count",
+                str(spec.attack_target_count),
+                "--attack-load-rate",
+                str(spec.attack_load_rate),
+            ]
+        )
+
     return command
 
 
@@ -407,7 +639,11 @@ def summarize_result(
         "command": shell_join(command),
         "exit_code": exit_code,
         "wall_time_s": (ended_at - started_at) if started_at and ended_at else None,
-        **{f"param.{key}": value for key, value in asdict(spec).items() if key != "speed"},
+        **{
+            f"param.{key}": value
+            for key, value in asdict(spec).items()
+            if key != "speed"
+        },
         "param.min_velocity": spec.speed.min_velocity,
         "param.max_velocity": spec.speed.max_velocity,
     }
@@ -438,6 +674,14 @@ def summarize_result(
         "raw_counts.payment_accepted_events": "raw_payment_accepted_events",
         "raw_counts.tx_events": "raw_tx_events",
         "raw_counts.rx_events": "raw_rx_events",
+        "attack.attack": "attack",
+        "attack.loss_probability": "attack_loss_probability",
+        "attack.selected_target_count": "attack_selected_target_count",
+        "attack.targets": "attack_targets",
+        "attack.tpre": "attack_tpre",
+        "attack.tatk": "attack_tatk",
+        "attack.tpost": "attack_tpost",
+        "attack.load_rate": "attack_load_rate",
     }
 
     for path, name in fields.items():

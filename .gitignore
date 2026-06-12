@@ -20,3 +20,5 @@ meshpay/analysis/
 sflow-rt/*
 tmp/
 logs/
+dummy_logs/
+dummy_figures/

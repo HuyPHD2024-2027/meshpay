@@ -24,6 +24,7 @@ from mn_wifi.link import adhoc, mesh, wmediumd
 from mn_wifi.net import Mininet_wifi
 from mn_wifi.wmediumdConnector import interference
 
+from attacks.controller import BenchmarkAttack
 from meshpay.benchmark.payment_metrics import collect_payment_metrics
 from meshpay.benchmark.report import write_reports
 from meshpay.cli.meshpay_cli import MeshPayRuntime
@@ -67,6 +68,14 @@ class MeshPayBenchmarkConfig:
     no_mobility: bool
 
     plot: bool
+
+    attack: str
+    attack_loss_probability: float
+    attack_tpre: float
+    attack_tatk: float
+    attack_tpost: float
+    attack_target_count: str
+    attack_load_rate: float
 
     def to_dict(self) -> Dict[str, Any]:
         data = asdict(self)
@@ -124,6 +133,43 @@ class MeshPayBenchmarkConfig:
 
         if self.mobility_start < 0:
             raise ValueError("--mobility-start must be >= 0")
+
+        if self.attack not in {"none", "packetloss", "load", "packetloss-load"}:
+            raise ValueError("--attack must be one of: none, packetloss, load, packetloss-load")
+
+        if not 0.0 <= self.attack_loss_probability <= 1.0:
+            raise ValueError("--attack-loss-probability must be between 0.0 and 1.0")
+
+        if self.attack_tpre < 0:
+            raise ValueError("--attack-tpre must be >= 0")
+
+        if self.attack_tatk < 0:
+            raise ValueError("--attack-tatk must be >= 0")
+
+        if self.attack_tpost < 0:
+            raise ValueError("--attack-tpost must be >= 0")
+
+        if self.attack != "none" and self.attack_tatk <= 0:
+            raise ValueError("--attack-tatk must be greater than 0 when attack is enabled")
+
+        if self.attack != "none" and (
+            self.attack_tpre + self.attack_tatk + self.attack_tpost
+        ) > self.duration:
+            raise ValueError(
+                "--duration must be at least --attack-tpre + --attack-tatk + --attack-tpost"
+            )
+
+        if self.attack_load_rate < 0:
+            raise ValueError("--attack-load-rate must be >= 0")
+
+        if self.attack_target_count != "auto":
+            try:
+                target_count = int(self.attack_target_count)
+            except ValueError as exc:
+                raise ValueError("--attack-target-count must be auto or a non-negative integer") from exc
+
+            if target_count < 0:
+                raise ValueError("--attack-target-count must be auto or a non-negative integer")
 
 
 def parse_args() -> argparse.Namespace:
@@ -280,7 +326,55 @@ def parse_args() -> argparse.Namespace:
         default=100,
         help="Number of virtual logical accounts hosted by each client station.",
     )
-    
+
+    parser.add_argument(
+        "--attack",
+        default="none",
+        choices=["none", "packetloss", "load", "packetloss-load"],
+        help="Attack mode to run during the benchmark.",
+    )
+
+    parser.add_argument(
+        "--attack-loss-probability",
+        type=float,
+        default=0.1,
+        help="Random packet-loss probability for packetloss attacks.",
+    )
+
+    parser.add_argument(
+        "--attack-tpre",
+        type=float,
+        default=60.0,
+        help="Seconds before attack starts, relative to payment traffic start.",
+    )
+
+    parser.add_argument(
+        "--attack-tatk",
+        type=float,
+        default=180.0,
+        help="Seconds to keep the attack active.",
+    )
+
+    parser.add_argument(
+        "--attack-tpost",
+        type=float,
+        default=60.0,
+        help="Seconds to observe after attack stops.",
+    )
+
+    parser.add_argument(
+        "--attack-target-count",
+        default="auto",
+        help="Number of random nodes to attack, capped at floor(total_nodes / 3), or auto.",
+    )
+
+    parser.add_argument(
+        "--attack-load-rate",
+        type=float,
+        default=0.0,
+        help="Synthetic DTN load bundles per second during load attacks. 0 means use payment rate.",
+    )
+
     return parser.parse_args()
 
 
@@ -308,6 +402,13 @@ def build_config(args: argparse.Namespace) -> MeshPayBenchmarkConfig:
         mobility_start=args.mobility_start,
         no_mobility=args.no_mobility,
         plot=args.plot,
+        attack=args.attack,
+        attack_loss_probability=args.attack_loss_probability,
+        attack_tpre=args.attack_tpre,
+        attack_tatk=args.attack_tatk,
+        attack_tpost=args.attack_tpost,
+        attack_target_count=args.attack_target_count,
+        attack_load_rate=args.attack_load_rate,
     )
 
     config.validate()
@@ -494,6 +595,7 @@ def run_payment_traffic(
     runtime: MeshPayRuntime,
     clients,
     config: MeshPayBenchmarkConfig,
+    attack_controller: BenchmarkAttack | None = None,
 ) -> tuple[float, float]:
     """Generate payments between virtual accounts.
 
@@ -527,6 +629,9 @@ def run_payment_traffic(
 
     started_at = time.time()
     deadline = started_at + config.duration
+
+    if attack_controller is not None:
+        attack_controller.start(started_at)
 
     traffic_lock = threading.Lock()
     currently_submitting = set()
@@ -732,6 +837,29 @@ def topology(config: MeshPayBenchmarkConfig) -> None:
         payment_poll_interval=0.5,
     )
 
+    attack_controller = None
+
+    if config.attack != "none":
+        attack_load_rate = (
+            config.attack_load_rate
+            if config.attack_load_rate > 0
+            else config.payment_rate
+        )
+        attack_controller = BenchmarkAttack(
+            runtime=runtime,
+            all_nodes=nodes,
+            client_nodes=clients,
+            log_dir=config.log_dir,
+            attack_type=config.attack,
+            loss_probability=config.attack_loss_probability,
+            tpre=config.attack_tpre,
+            tatk=config.attack_tatk,
+            tpost=config.attack_tpost,
+            target_count=config.attack_target_count,
+            load_rate=attack_load_rate,
+            seed=config.seed,
+        )
+
     started_at = time.time()
     ended_at = started_at
 
@@ -746,6 +874,7 @@ def topology(config: MeshPayBenchmarkConfig) -> None:
             runtime=runtime,
             clients=clients,
             config=config,
+            attack_controller=attack_controller,
         )
 
         report = collect_payment_metrics(
@@ -760,6 +889,9 @@ def topology(config: MeshPayBenchmarkConfig) -> None:
             "ended_at": ended_at,
         }
 
+        if attack_controller is not None:
+            report["attack"] = attack_controller.metadata()
+
         write_reports(report, config.log_dir)
         print_summary(report)
 
@@ -768,6 +900,9 @@ def topology(config: MeshPayBenchmarkConfig) -> None:
         info(f"*** CSV:  {config.log_dir / 'benchmark.csv'}\n")
 
     finally:
+        if attack_controller is not None:
+            attack_controller.cleanup()
+
         runtime.stop()
         info("*** Stopping network\n")
         net.stop()
