@@ -16,8 +16,14 @@ from typing import Any, Dict
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 
-if str(ROOT_DIR) not in sys.path:
-    sys.path.insert(0, str(ROOT_DIR))
+if str(ROOT_DIR) in sys.path:
+    sys.path.remove(str(ROOT_DIR))
+sys.path.insert(0, str(ROOT_DIR))
+
+examples_dir = str(ROOT_DIR / "examples")
+if examples_dir in sys.path:
+    sys.path.remove(examples_dir)
+
 
 from mininet.log import info, setLogLevel
 from mn_wifi.link import adhoc, mesh, wmediumd
@@ -36,6 +42,8 @@ DEFAULT_LOG_DIR = ROOT_DIR / "logs" / "benchmarks" / "meshpay_offline"
 
 ROUTER_FILES = {
     "epidemic": ROOT_DIR / "dtn" / "epidemic.py",
+    "spray-and-wait": ROOT_DIR / "dtn" / "spray_and_wait.py",
+    "prophet": ROOT_DIR / "dtn" / "prophet.py",
 }
 
 @dataclass(frozen=True)
@@ -76,6 +84,7 @@ class MeshPayBenchmarkConfig:
     attack_tpost: float
     attack_target_count: str
     attack_load_rate: float
+    keep_debug_logs: bool
 
     def to_dict(self) -> Dict[str, Any]:
         data = asdict(self)
@@ -180,7 +189,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--routing",
         required=True,
-        choices=["epidemic"],
+        choices=sorted(ROUTER_FILES),
         help="DTN routing protocol.",
     )
 
@@ -264,6 +273,12 @@ def parse_args() -> argparse.Namespace:
         "--no-clean",
         action="store_true",
         help="Do not delete old benchmark logs.",
+    )
+
+    parser.add_argument(
+        "--keep-debug-logs",
+        action="store_true",
+        help="Keep daemon logs and all bundle/delivered logs (default: False/clean up to save storage).",
     )
 
     parser.add_argument(
@@ -409,6 +424,7 @@ def build_config(args: argparse.Namespace) -> MeshPayBenchmarkConfig:
         attack_tpost=args.attack_tpost,
         attack_target_count=args.attack_target_count,
         attack_load_rate=args.attack_load_rate,
+        keep_debug_logs=args.keep_debug_logs,
     )
 
     config.validate()
@@ -906,6 +922,37 @@ def topology(config: MeshPayBenchmarkConfig) -> None:
         runtime.stop()
         info("*** Stopping network\n")
         net.stop()
+        cleanup_logs(config)
+
+
+def cleanup_logs(config: MeshPayBenchmarkConfig) -> None:
+    if config.keep_debug_logs:
+        return
+
+    info("*** Cleaning up debug logs to save storage\n")
+    log_dir = config.log_dir
+
+    # 1. Delete all daemon logs in log_dir (except payment.log)
+    for p in log_dir.glob("*.log"):
+        if p.name != "payment.log":
+            try:
+                p.unlink()
+            except Exception as e:
+                info(f"Failed to delete daemon log {p}: {e}\n")
+
+    # 2. Delete all bundle stores files (.json, .txt, .log) except events.jsonl
+    stores_dir = log_dir / "stores"
+    if stores_dir.exists():
+        for p in stores_dir.rglob("*"):
+            if p.is_file():
+                suffix = p.suffix.lower()
+                if suffix == ".jsonl":
+                    continue
+                if suffix in (".json", ".txt", ".log"):
+                    try:
+                        p.unlink()
+                    except Exception as e:
+                        info(f"Failed to delete stores file {p}: {e}\n")
 
 
 def main() -> None:

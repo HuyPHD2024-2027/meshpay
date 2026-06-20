@@ -7,9 +7,9 @@ benchmark output directories, computes per-second time-series for three
 key metrics, and produces a publication-quality 3-panel stacked figure.
 
 Metrics:
-    1. Confirmation Latency (ms)  — rolling-window average
-    2. Network Throughput (TX+RX KB/s)
-    3. Finality Rate (%)          — cumulative confirmed / created
+    1. Time to quorum (s)         — payment_created to confirmation_created
+    2. Network Throughput (KB/s)  — DTN exchange bytes when available
+    3. Quorum Finality Rate (%)   — cumulative confirmed / created
 
 Usage:
     # Single run:
@@ -32,13 +32,12 @@ import math
 import sys
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import matplotlib
 matplotlib.use("Agg")  # Non-interactive backend for headless environments.
 
 import matplotlib.pyplot as plt
-import matplotlib.ticker as ticker
 import numpy as np
 
 
@@ -87,112 +86,60 @@ def compute_time_series(
     events: List[Dict[str, Any]],
     config: Dict[str, Any],
     window_size: int = 10,
+    log_dir: Optional[Path] = None,
 ) -> Dict[str, Any]:
-    """Compute per-second time-series from raw payment.log events.
+    """Compute quorum-only attack-impact time-series from payment.log."""
 
-    Returns a dict with:
-        t_seconds:       np.array of relative time values (seconds)
-        latency_ms:      np.array of rolling-avg confirmation latency
-        throughput_kbps:  np.array of TX+RX KB/s per second
-        finality_pct:    np.array of cumulative finality rate (%)
-        attack_start_s:  float or None — relative second attack started
-        attack_stop_s:   float or None — relative second attack stopped
-        duration_s:      total duration in seconds
-    """
-
-    # Determine t=0 as the time of the first payment_created event.
     created_events = [e for e in events if e.get("event") == "payment_created"]
     if not created_events:
         return _empty_series()
 
     t0 = min(float(e["time"]) for e in created_events)
-
-    # Determine total duration from config or from event span.
     cfg_duration = float(config.get("duration", 0))
     last_event_time = max(float(e["time"]) for e in events)
-    total_seconds = max(cfg_duration, last_event_time - t0)
-    total_seconds = int(math.ceil(total_seconds)) + 1
+    total_seconds = int(math.ceil(max(cfg_duration, last_event_time - t0))) + 1
 
-    # ---- Index events by order_id ----
     created_by_order: Dict[str, float] = {}
+    confirmed_by_order: Dict[str, float] = {}
+
     for e in events:
         if e.get("event") == "payment_created" and "order_id" in e:
             created_by_order[e["order_id"]] = float(e["time"])
+        elif e.get("event") == "confirmation_created" and "order_id" in e:
+            order_id = e["order_id"]
+            confirmed_at = float(e["time"])
+            previous = confirmed_by_order.get(order_id)
+            if previous is None or confirmed_at < previous:
+                confirmed_by_order[order_id] = confirmed_at
 
-    # ---- Per-second bins ----
-    # Latency: collect confirmation latencies falling in each second bin.
-    latency_bins: Dict[int, List[float]] = defaultdict(list)
-    for e in events:
-        if e.get("event") != "confirmation_created":
-            continue
-        order_id = e.get("order_id")
-        if order_id is None or order_id not in created_by_order:
-            continue
-        t_confirm = float(e["time"])
-        t_created = created_by_order[order_id]
-        latency_s = (t_confirm - t_created)
-        second_bin = int(t_created - t0)
-        if 0 <= second_bin < total_seconds:
-            latency_bins[second_bin].append(latency_s)
-
-    # Throughput: sum payload bytes per second (TX + RX).
-    throughput_bytes: Dict[int, int] = defaultdict(int)
-    for e in events:
-        ev = e.get("event")
-        if ev not in ("payload_injected", "payment_payload_delivered"):
-            continue
-        t = float(e["time"])
-        second_bin = int(t - t0)
-        size = int(e.get("payload_size_bytes", 0))
-        if 0 <= second_bin < total_seconds:
-            throughput_bytes[second_bin] += size
-
-    # Finality: cumulative created and confirmed counts.
-    created_cumulative = np.zeros(total_seconds, dtype=float)
-    confirmed_cumulative = np.zeros(total_seconds, dtype=float)
-
-    for e in events:
-        if e.get("event") == "payment_created":
-            second_bin = int(float(e["time"]) - t0)
-            if 0 <= second_bin < total_seconds:
-                created_cumulative[second_bin] += 1
-
-        elif e.get("event") == "confirmation_created":
-            second_bin = int(float(e["time"]) - t0)
-            if 0 <= second_bin < total_seconds:
-                confirmed_cumulative[second_bin] += 1
-
-    # Convert to cumulative sums.
-    created_cumulative = np.cumsum(created_cumulative)
-    confirmed_cumulative = np.cumsum(confirmed_cumulative)
-
-    # Finality rate (%) = confirmed / created, avoiding division by zero.
-    finality_pct = np.where(
-        created_cumulative > 0,
-        (confirmed_cumulative / created_cumulative) * 100.0,
-        0.0,
+    quorum_latency = _latency_series(
+        completed_by_order=confirmed_by_order,
+        created_by_order=created_by_order,
+        t0=t0,
+        total_seconds=total_seconds,
+        window_size=window_size,
+    )
+    finality_quorum_pct = _cumulative_finality(
+        created_by_order=created_by_order,
+        completed_by_order=confirmed_by_order,
+        t0=t0,
+        total_seconds=total_seconds,
     )
 
-    # ---- Build arrays ----
-    t_seconds = np.arange(total_seconds, dtype=float)
+    throughput_kbps, throughput_source = _router_exchange_rate_kbps(
+        log_dir=log_dir,
+        config=config,
+        t0=t0,
+        total_seconds=total_seconds,
+    )
+    if throughput_kbps is None:
+        throughput_kbps = _application_activity_rate_kbps(
+            events=events,
+            t0=t0,
+            total_seconds=total_seconds,
+        )
+        throughput_source = "Application activity"
 
-    # Raw per-second mean latency (forward-filled to prevent dropping to 0 in sparse regions).
-    raw_latency = np.zeros(total_seconds, dtype=float)
-    last_val = 0.0
-    for s in range(total_seconds):
-        if s in latency_bins and latency_bins[s]:
-            last_val = np.mean(latency_bins[s])
-        raw_latency[s] = last_val
-
-    # Rolling-window average for latency.
-    latency_smoothed = _rolling_mean(raw_latency, window_size)
-
-    # Throughput in KB/s (bytes per second -> KB/s).
-    throughput_kbps = np.zeros(total_seconds, dtype=float)
-    for s, total_bytes in throughput_bytes.items():
-        throughput_kbps[s] = total_bytes / 1024.0
-
-    # ---- Attack window ----
     attack_start_s = None
     attack_stop_s = None
     for e in events:
@@ -201,7 +148,6 @@ def compute_time_series(
         elif e.get("event") == "attack_stopped":
             attack_stop_s = float(e["time"]) - t0
 
-    # Fallback: derive from config if events are missing.
     if attack_start_s is None and config.get("attack", "none") != "none":
         tpre = float(config.get("attack_tpre", 60))
         tatk = float(config.get("attack_tatk", 180))
@@ -209,33 +155,161 @@ def compute_time_series(
         attack_stop_s = tpre + tatk
 
     return {
-        "t_seconds": t_seconds,
-        "latency_ms": latency_smoothed,
+        "t_seconds": np.arange(total_seconds, dtype=float),
+        "latency_quorum_s": quorum_latency,
+        "latency_ms": quorum_latency,
         "throughput_kbps": throughput_kbps,
-        "finality_pct": finality_pct,
+        "throughput_source": throughput_source,
+        "finality_quorum_pct": finality_quorum_pct,
+        "finality_pct": finality_quorum_pct,
         "attack_start_s": attack_start_s,
         "attack_stop_s": attack_stop_s,
         "duration_s": total_seconds,
     }
 
 
-def _rolling_mean(data: np.ndarray, window: int) -> np.ndarray:
-    """Compute a centered rolling mean with edge handling."""
-    if window <= 1:
-        return data.copy()
-    kernel = np.ones(window) / window
-    # Use 'same' mode for centered window; pad edges with nearest values.
-    padded = np.pad(data, (window // 2, window // 2), mode="edge")
-    smoothed = np.convolve(padded, kernel, mode="valid")
-    return smoothed[: len(data)]
+def _latency_series(
+    completed_by_order: Dict[str, float],
+    created_by_order: Dict[str, float],
+    t0: float,
+    total_seconds: int,
+    window_size: int,
+) -> np.ndarray:
+    latency_bins: Dict[int, List[float]] = defaultdict(list)
+
+    for order_id, completed_at in completed_by_order.items():
+        created_at = created_by_order.get(order_id)
+        if created_at is None:
+            continue
+        second_bin = int(completed_at - t0)
+        if 0 <= second_bin < total_seconds:
+            latency_bins[second_bin].append(completed_at - created_at)
+
+    raw_latency = np.full(total_seconds, np.nan, dtype=float)
+    for second, values in latency_bins.items():
+        if values:
+            raw_latency[second] = float(np.mean(values))
+
+    return _rolling_mean_ignore_nan(raw_latency, window_size)
+
+
+def _cumulative_finality(
+    created_by_order: Dict[str, float],
+    completed_by_order: Dict[str, float],
+    t0: float,
+    total_seconds: int,
+) -> np.ndarray:
+    created_times = sorted(created_at - t0 for created_at in created_by_order.values())
+    completed_times = sorted(
+        completed_at - t0
+        for order_id, completed_at in completed_by_order.items()
+        if order_id in created_by_order
+    )
+
+    result = np.zeros(total_seconds, dtype=float)
+    created_idx = 0
+    completed_idx = 0
+
+    for second in range(total_seconds):
+        while created_idx < len(created_times) and created_times[created_idx] <= second:
+            created_idx += 1
+
+        while completed_idx < len(completed_times) and completed_times[completed_idx] <= second:
+            completed_idx += 1
+
+        if created_idx > 0:
+            result[second] = (completed_idx / created_idx) * 100.0
+        elif second > 0:
+            result[second] = result[second - 1]
+
+    return np.clip(result, 0.0, 100.0)
+
+def _router_exchange_rate_kbps(
+    log_dir: Optional[Path],
+    config: Dict[str, Any],
+    t0: float,
+    total_seconds: int,
+) -> Tuple[Optional[np.ndarray], str]:
+    if log_dir is None:
+        return None, ""
+
+    routing = str(config.get("routing", "epidemic"))
+    stores_dir = log_dir / "stores" / routing
+    if not stores_dir.exists():
+        return None, ""
+
+    throughput_bytes = np.zeros(total_seconds, dtype=float)
+    found_byte_events = False
+
+    for events_path in stores_dir.glob("*/events.jsonl"):
+        for event in load_jsonl(events_path):
+            if event.get("event") != "exchange":
+                continue
+            sent = event.get("sent_bytes")
+            received = event.get("received_bytes")
+            if sent is None and received is None:
+                continue
+            found_byte_events = True
+            second_bin = int(float(event.get("time", 0.0)) - t0)
+            if 0 <= second_bin < total_seconds:
+                throughput_bytes[second_bin] += int(sent or 0) + int(received or 0)
+
+    if not found_byte_events:
+        return None, ""
+
+    return throughput_bytes / 1024.0, "DTN exchange"
+
+
+def _application_activity_rate_kbps(
+    events: List[Dict[str, Any]],
+    t0: float,
+    total_seconds: int,
+) -> np.ndarray:
+    throughput_bytes = np.zeros(total_seconds, dtype=float)
+    for e in events:
+        ev = e.get("event")
+        if ev not in ("payload_injected", "payment_payload_delivered"):
+            continue
+        second_bin = int(float(e["time"]) - t0)
+        if 0 <= second_bin < total_seconds:
+            throughput_bytes[second_bin] += int(e.get("payload_size_bytes", 0))
+    return throughput_bytes / 1024.0
+
+
+def _rolling_mean_ignore_nan(data: np.ndarray, window: int) -> np.ndarray:
+    window = max(int(window), 1)
+    valid = ~np.isnan(data)
+    values = np.where(valid, data, 0.0)
+    kernel = np.ones(window, dtype=float)
+    sums = np.convolve(values, kernel, mode="same")
+    counts = np.convolve(valid.astype(float), kernel, mode="same")
+
+    result = np.full(len(data), np.nan, dtype=float)
+    np.divide(sums, counts, out=result, where=counts > 0)
+    return _fill_missing(result, fill=0.0)
+
+
+def _fill_missing(data: np.ndarray, fill: float = 0.0) -> np.ndarray:
+    result = data.copy()
+    last = fill
+    for i, value in enumerate(result):
+        if np.isnan(value):
+            result[i] = last
+        else:
+            last = float(value)
+    return result
 
 
 def _empty_series() -> Dict[str, Any]:
+    empty = np.array([])
     return {
-        "t_seconds": np.array([]),
-        "latency_ms": np.array([]),
-        "throughput_kbps": np.array([]),
-        "finality_pct": np.array([]),
+        "t_seconds": empty,
+        "latency_quorum_s": empty,
+        "latency_ms": empty,
+        "throughput_kbps": empty,
+        "throughput_source": "",
+        "finality_quorum_pct": empty,
+        "finality_pct": empty,
         "attack_start_s": None,
         "attack_stop_s": None,
         "duration_s": 0,
@@ -267,7 +341,7 @@ def plot_attack_impact(
     title: str = "Impact of RF Jamming Attack (loss=80%)\non Offline Payment Performance",
     window_size: int = 10,
 ) -> Path:
-    """Draw a 3-panel stacked figure and save to output_dir."""
+    """Draw a quorum-only 3-panel stacked figure and save to output_dir."""
 
     fig, axes = plt.subplots(
         3, 1,
@@ -281,77 +355,44 @@ def plot_attack_impact(
     ax_throughput: plt.Axes = axes[1]
     ax_finality: plt.Axes = axes[2]
 
-    # ---- Draw attack window from the first series that has one ----
-    attack_start = None
-    attack_stop = None
-    for series in series_list:
-        if series["attack_start_s"] is not None:
-            attack_start = series["attack_start_s"]
-            attack_stop = series["attack_stop_s"]
-            break
+    attack_start, attack_stop = _series_attack_window(series_list)
+    _draw_attack_window(axes, attack_start, attack_stop, ax_latency)
 
-    if attack_start is not None and attack_stop is not None:
-        for ax in axes:
-            ax.axvspan(
-                attack_start, attack_stop,
-                color="#BDBDBD", alpha=0.35,
-                label=None,
-            )
-            ax.axvline(attack_start, color="#757575", linestyle="--", linewidth=0.8, alpha=0.6)
-            ax.axvline(attack_stop, color="#757575", linestyle="--", linewidth=0.8, alpha=0.6)
-
-        # Label the attack window at the top of the first subplot.
-        mid = (attack_start + attack_stop) / 2.0
-        ax_latency.text(
-            mid, 0.95,
-            f"Attack ({int(attack_stop - attack_start)}s)",
-            transform=ax_latency.get_xaxis_transform(),
-            ha="center", va="top",
-            fontsize=10, fontweight="bold",
-            color="#424242",
-            bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="#9E9E9E", alpha=0.85),
-        )
-
-    # ---- Plot each series ----
     for idx, (series, label) in enumerate(zip(series_list, labels)):
         color = LINE_COLORS[idx % len(LINE_COLORS)]
         style = LINE_STYLES[idx % len(LINE_STYLES)]
+        marker = LINE_MARKERS[idx % len(LINE_MARKERS)]
         t = series["t_seconds"]
-
         if len(t) == 0:
             continue
 
-        # Downsample markers to avoid clutter.
-        marker = LINE_MARKERS[idx % len(LINE_MARKERS)]
         markevery = max(1, len(t) // 20)
+        line_args = {
+            "color": color,
+            "linestyle": style,
+            "linewidth": 1.8,
+            "marker": marker,
+            "markersize": 4,
+            "markevery": markevery,
+            "label": label,
+            "alpha": 0.9,
+        }
 
-        ax_latency.plot(
-            t, series["latency_ms"],
-            color=color, linestyle=style, linewidth=1.8,
-            marker=marker, markersize=4, markevery=markevery,
-            label=label, alpha=0.9,
-        )
+        ax_latency.plot(t, series["latency_quorum_s"], **line_args)
+        ax_throughput.plot(t, series["throughput_kbps"], **line_args)
+        ax_finality.plot(t, series["finality_quorum_pct"], **line_args)
 
-        ax_throughput.plot(
-            t, series["throughput_kbps"],
-            color=color, linestyle=style, linewidth=1.8,
-            marker=marker, markersize=4, markevery=markevery,
-            label=label, alpha=0.9,
-        )
+    throughput_sources = {s.get("throughput_source", "") for s in series_list if s.get("throughput_source")}
+    throughput_label = "Network Rate\n(TX+RX KB/s)"
+    if len(throughput_sources) == 1:
+        source = next(iter(throughput_sources))
+        if source:
+            throughput_label = f"Network Rate\n({source} KB/s)"
 
-        ax_finality.plot(
-            t, series["finality_pct"],
-            color=color, linestyle=style, linewidth=1.8,
-            marker=marker, markersize=4, markevery=markevery,
-            label=label, alpha=0.9,
-        )
-
-    # ---- Axis formatting ----
-    ax_latency.set_ylabel("Latency (s)", fontsize=11, fontweight="bold")
-    ax_throughput.set_ylabel("Network Rate\n(TX+RX B/s)", fontsize=11, fontweight="bold")
-    ax_finality.set_ylabel("Finality Rate (%)", fontsize=11, fontweight="bold")
+    ax_latency.set_ylabel(f"Time to Quorum (s)\n{window_size}s smoothed", fontsize=11, fontweight="bold")
+    ax_throughput.set_ylabel(throughput_label, fontsize=11, fontweight="bold")
+    ax_finality.set_ylabel("Cumulative Finality (%)", fontsize=11, fontweight="bold")
     ax_finality.set_xlabel("Time (s)", fontsize=11, fontweight="bold")
-
     ax_finality.set_ylim(-5, 105)
 
     for ax in axes:
@@ -360,30 +401,9 @@ def plot_attack_impact(
         ax.spines["top"].set_visible(False)
         ax.spines["right"].set_visible(False)
 
-    # Legend in the top subplot.
-    handles, legend_labels = ax_latency.get_legend_handles_labels()
-    if handles:
-        # Add a dummy entry for the attack window if present.
-        if attack_start is not None:
-            from matplotlib.patches import Patch
-            attack_patch = Patch(
-                facecolor="#BDBDBD", edgecolor="#757575",
-                alpha=0.5, label="Attack Window",
-            )
-            handles.append(attack_patch)
-            legend_labels.append("Attack Window")
-
-        ax_latency.legend(
-            handles, legend_labels,
-            loc="upper right",
-            fontsize=9,
-            framealpha=0.9,
-            edgecolor="#BDBDBD",
-        )
-
+    _add_legend(ax_latency, attack_start is not None)
     fig.suptitle(title, fontsize=13, fontweight="bold")
 
-    # ---- Save ----
     output_dir.mkdir(parents=True, exist_ok=True)
     pdf_path = output_dir / "attack_impact.pdf"
     png_path = output_dir / "attack_impact.png"
@@ -395,50 +415,16 @@ def plot_attack_impact(
     print(f"Saved: {pdf_path}")
     print(f"Saved: {png_path}")
 
-    # ---- Save 3 separate figures ----
-    metrics = [
-        ("latency_ms", "Latency (s)", "latency"),
-        ("throughput_kbps", "Network Rate (TX+RX B/s)", "throughput"),
-        ("finality_pct", "Finality Rate (%)", "finality"),
+    single_metrics = [
+        ("latency_quorum_s", f"Time to Quorum (s) - {window_size}s smoothed", "latency"),
+        ("throughput_kbps", throughput_label.replace("\n", " "), "throughput"),
+        ("finality_quorum_pct", "Cumulative Finality (%)", "finality"),
     ]
 
-    for key, ylabel, name in metrics:
+    for key, ylabel, name in single_metrics:
         fig_single, ax_single = plt.subplots(figsize=(10, 4), constrained_layout=True)
-        
-        if attack_start is not None and attack_stop is not None:
-            ax_single.axvspan(
-                attack_start, attack_stop,
-                color="#BDBDBD", alpha=0.35,
-                label=None,
-            )
-            ax_single.axvline(attack_start, color="#757575", linestyle="--", linewidth=0.8, alpha=0.6)
-            ax_single.axvline(attack_stop, color="#757575", linestyle="--", linewidth=0.8, alpha=0.6)
-
-            mid = (attack_start + attack_stop) / 2.0
-            ax_single.text(
-                mid, 0.95,
-                f"Attack ({int(attack_stop - attack_start)}s)",
-                transform=ax_single.get_xaxis_transform(),
-                ha="center", va="top",
-                fontsize=10, fontweight="bold",
-                color="#424242",
-                bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="#9E9E9E", alpha=0.85),
-            )
-
-        for idx, (series, label) in enumerate(zip(series_list, labels)):
-            color = LINE_COLORS[idx % len(LINE_COLORS)]
-            style = LINE_STYLES[idx % len(LINE_STYLES)]
-            t = series["t_seconds"]
-            if len(t) == 0: continue
-            marker = LINE_MARKERS[idx % len(LINE_MARKERS)]
-            markevery = max(1, len(t) // 20)
-
-            ax_single.plot(
-                t, series[key],
-                color=color, linestyle=style, linewidth=1.8,
-                marker=marker, markersize=4, markevery=markevery,
-                label=label, alpha=0.9,
-            )
+        _draw_attack_window([ax_single], attack_start, attack_stop, ax_single)
+        _plot_single_metric(ax_single, series_list, labels, key)
 
         ax_single.set_ylabel(ylabel, fontsize=11, fontweight="bold")
         ax_single.set_xlabel("Time (s)", fontsize=11, fontweight="bold")
@@ -449,31 +435,94 @@ def plot_attack_impact(
         ax_single.tick_params(labelsize=10)
         ax_single.spines["top"].set_visible(False)
         ax_single.spines["right"].set_visible(False)
-
-        handles, legend_labels = ax_single.get_legend_handles_labels()
-        if handles:
-            if attack_start is not None:
-                from matplotlib.patches import Patch
-                attack_patch = Patch(
-                    facecolor="#BDBDBD", edgecolor="#757575",
-                    alpha=0.5, label="Attack Window",
-                )
-                handles.append(attack_patch)
-                legend_labels.append("Attack Window")
-            ax_single.legend(handles, legend_labels, loc="upper right", fontsize=9, framealpha=0.9, edgecolor="#BDBDBD")
+        _add_legend(ax_single, attack_start is not None)
 
         fig_single.suptitle(f"{title} - {name.capitalize()}", fontsize=13, fontweight="bold")
-        
+
         single_pdf = output_dir / f"{name}_impact.pdf"
         single_png = output_dir / f"{name}_impact.png"
         fig_single.savefig(str(single_pdf), dpi=150, bbox_inches="tight")
         fig_single.savefig(str(single_png), dpi=150, bbox_inches="tight")
         plt.close(fig_single)
-        
+
         print(f"Saved: {single_pdf}")
         print(f"Saved: {single_png}")
 
     return png_path
+
+
+def _series_attack_window(series_list: List[Dict[str, Any]]) -> Tuple[Optional[float], Optional[float]]:
+    for series in series_list:
+        if series["attack_start_s"] is not None:
+            return series["attack_start_s"], series["attack_stop_s"]
+    return None, None
+
+
+def _draw_attack_window(
+    axes: Iterable[plt.Axes],
+    attack_start: Optional[float],
+    attack_stop: Optional[float],
+    label_axis: plt.Axes,
+) -> None:
+    if attack_start is None or attack_stop is None:
+        return
+
+    for ax in axes:
+        ax.axvspan(attack_start, attack_stop, color="#BDBDBD", alpha=0.35, label=None)
+        ax.axvline(attack_start, color="#757575", linestyle="--", linewidth=0.8, alpha=0.6)
+        ax.axvline(attack_stop, color="#757575", linestyle="--", linewidth=0.8, alpha=0.6)
+
+    mid = (attack_start + attack_stop) / 2.0
+    label_axis.text(
+        mid, 0.95,
+        f"Attack ({int(attack_stop - attack_start)}s)",
+        transform=label_axis.get_xaxis_transform(),
+        ha="center", va="top",
+        fontsize=10, fontweight="bold",
+        color="#424242",
+        bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="#9E9E9E", alpha=0.85),
+    )
+
+
+def _plot_single_metric(
+    ax: plt.Axes,
+    series_list: List[Dict[str, Any]],
+    labels: List[str],
+    key: str,
+) -> None:
+    for idx, (series, label) in enumerate(zip(series_list, labels)):
+        color = LINE_COLORS[idx % len(LINE_COLORS)]
+        style = LINE_STYLES[idx % len(LINE_STYLES)]
+        marker = LINE_MARKERS[idx % len(LINE_MARKERS)]
+        t = series["t_seconds"]
+        if len(t) == 0:
+            continue
+
+        ax.plot(
+            t, series[key],
+            color=color, linestyle=style, linewidth=1.8,
+            marker=marker, markersize=4, markevery=max(1, len(t) // 20),
+            label=label, alpha=0.9,
+        )
+
+
+def _add_legend(ax: plt.Axes, include_attack: bool) -> None:
+    handles, legend_labels = ax.get_legend_handles_labels()
+    if not handles:
+        return
+
+    if include_attack:
+        from matplotlib.patches import Patch
+        handles.append(Patch(facecolor="#BDBDBD", edgecolor="#757575", alpha=0.5, label="Attack Window"))
+        legend_labels.append("Attack Window")
+
+    ax.legend(
+        handles, legend_labels,
+        loc="upper right",
+        fontsize=9,
+        framealpha=0.9,
+        edgecolor="#BDBDBD",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -515,7 +564,7 @@ def parse_args() -> argparse.Namespace:
         "--window",
         type=int,
         default=10,
-        help="Rolling-window size in seconds for latency smoothing (default: 10).",
+        help="Smoothing window in seconds for time-to-quorum latency only (default: 10).",
     )
 
     parser.add_argument(
@@ -524,6 +573,8 @@ def parse_args() -> argparse.Namespace:
         help="Figure title. Auto-generated if not provided.",
     )
 
+    if hasattr(parser, "parse_intermixed_args"):
+        return parser.parse_intermixed_args()
     return parser.parse_args()
 
 
@@ -570,9 +621,18 @@ def main() -> int:
         events = load_jsonl(payment_log)
         config = load_config(log_dir)
 
-        series = compute_time_series(events, config, window_size=args.window)
+        series = compute_time_series(
+            events,
+            config,
+            window_size=args.window,
+            log_dir=log_dir,
+        )
         series_list.append(series)
-        print(f"Loaded {label}: {len(events)} events, {series['duration_s']}s duration")
+        print(
+            f"Loaded {label}: {len(events)} events, "
+            f"{series['duration_s']}s duration, "
+            f"rate_source={series.get('throughput_source', 'unknown')}"
+        )
 
     if not series_list:
         print("Error: no valid benchmark data found.", file=sys.stderr)

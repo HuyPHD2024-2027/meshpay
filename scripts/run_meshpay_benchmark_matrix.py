@@ -40,7 +40,6 @@ class RunSpec:
     accounts_per_station: int
     total_virtual_accounts: int
     speed: SpeedRange
-    payments: int
     payment_rate: float
     duration: float
     warmup: float
@@ -60,6 +59,7 @@ class RunSpec:
     attack_tpost: float
     attack_target_count: str
     attack_load_rate: float
+    keep_debug_logs: bool
     run_index: int
 
     @property
@@ -69,9 +69,11 @@ class RunSpec:
             f"c{self.clients}_"
             f"a{self.authorities}_"
             f"r{fmt(self.node_range)}_"
-            f"p{self.payments}_"
+            f"rate{fmt(self.payment_rate)}_"
             f"m{self.medium}_"
-            f"att{attack_label(self.attack)}"
+            f"rt{routing_label(self.routing)}_"
+            f"att{attack_label(self.attack)}_"
+            f"loss{fmt(self.attack_loss_probability)}"
         )
 
 
@@ -82,6 +84,14 @@ def attack_label(attack: str) -> str:
         "load": "Load",
         "packetloss-load": "PLLoad",
     }.get(attack, attack)
+
+
+def routing_label(routing: str) -> str:
+    return {
+        "epidemic": "Epi",
+        "spray-and-wait": "SnW",
+        "prophet": "Prophet",
+    }.get(routing, routing.replace("-", ""))
 
 
 def fmt(value: float | int) -> str:
@@ -133,6 +143,45 @@ def parse_float_list(value: str, name: str) -> list[float]:
 
     if not result:
         raise argparse.ArgumentTypeError(f"{name} cannot be empty")
+    return result
+
+
+def parse_probability_list(value: str, name: str) -> list[float]:
+    result = []
+    for raw in value.split(","):
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            item = float(raw)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(
+                f"{name} must be comma-separated numbers"
+            ) from exc
+        if not 0.0 <= item <= 1.0:
+            raise argparse.ArgumentTypeError(f"{name} values must be between 0.0 and 1.0")
+        result.append(item)
+
+    if not result:
+        raise argparse.ArgumentTypeError(f"{name} cannot be empty")
+    return result
+
+
+def parse_routing_list(value: str) -> list[str]:
+    allowed = {"epidemic", "spray-and-wait", "prophet"}
+    result = []
+    for raw in value.split(","):
+        item = raw.strip()
+        if not item:
+            continue
+        if item not in allowed:
+            raise argparse.ArgumentTypeError(
+                f"--routing values must be one of {sorted(allowed)}"
+            )
+        result.append(item)
+
+    if not result:
+        raise argparse.ArgumentTypeError("--routing cannot be empty")
     return result
 
 
@@ -212,8 +261,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Comma-separated total virtual account counts. When set, "
-            "accounts per station is derived as total/client count and "
-            "payments is set to the same total, so each virtual account sends one tx."
+            "accounts per station is derived as total/client count."
         ),
     )
     parser.add_argument(
@@ -223,34 +271,27 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
-        "--payments",
-        default="100",
-        help=(
-            "Comma-separated payment counts. Ignored when "
-            "--total-virtual-accounts is set."
-        ),
-    )
-    parser.add_argument(
         "--payment-rate",
         default="0.5",
-        help=(
-            "Comma-separated payment rates, or 'match' to use one-second bursts "
-            "matching each payment count."
-        ),
+        help="Comma-separated open-loop payment rates in payments per second.",
     )
     parser.add_argument(
         "--duration",
         default="auto",
         help=(
             "Total benchmark duration in seconds. Use 'auto' (default) to "
-            "compute per-run duration based on payment count and attack timing."
+            "compute per-run duration based on payment rate and attack timing."
         ),
     )
     parser.add_argument("--warmup", type=float, default=5.0)
     parser.add_argument("--amount", type=int, default=1)
     parser.add_argument("--initial-balance", type=int, default=10000)
     parser.add_argument("--medium", choices=["adhoc", "mesh"], default="adhoc")
-    parser.add_argument("--routing", choices=["epidemic"], default="epidemic")
+    parser.add_argument(
+        "--routing",
+        default="epidemic",
+        help="Comma-separated routing protocols: epidemic,spray-and-wait,prophet.",
+    )
     parser.add_argument("--seed", type=int, default=20)
     parser.add_argument("--area-width", type=float, default=200.0)
     parser.add_argument("--area-height", type=float, default=200.0)
@@ -263,12 +304,21 @@ def parse_args() -> argparse.Namespace:
         choices=["none", "packetloss", "load", "packetloss-load"],
         default="none",
     )
-    parser.add_argument("--attack-loss-probability", type=float, default=0.1)
+    parser.add_argument(
+        "--attack-loss-probability",
+        default="0.1",
+        help="Comma-separated packet loss probabilities.",
+    )
     parser.add_argument("--attack-tpre", type=float, default=60.0)
     parser.add_argument("--attack-tatk", type=float, default=180.0)
     parser.add_argument("--attack-tpost", type=float, default=60.0)
     parser.add_argument("--attack-target-count", default="auto")
     parser.add_argument("--attack-load-rate", type=float, default=0.0)
+    parser.add_argument(
+        "--keep-debug-logs",
+        action="store_true",
+        help="Keep daemon and store debug logs instead of minimizing them.",
+    )
 
     args = parser.parse_args()
 
@@ -302,11 +352,15 @@ def parse_args() -> argparse.Namespace:
             "--total-virtual-accounts",
         )
     args.speeds = parse_speeds(args.speeds)
-    args.payments = parse_int_list(args.payments, "--payments")
-    if str(args.payment_rate).strip().lower() == "match":
-        args.payment_rate = "match"
-    else:
-        args.payment_rate = parse_float_list(args.payment_rate, "--payment-rate")
+    args.payment_rate = parse_float_list(args.payment_rate, "--payment-rate")
+    try:
+        args.routing = parse_routing_list(args.routing)
+        args.attack_loss_probability = parse_probability_list(
+            args.attack_loss_probability,
+            "--attack-loss-probability",
+        )
+    except argparse.ArgumentTypeError as exc:
+        parser.error(str(exc))
 
     # Parse --duration: 'auto' or a positive float.
     if str(args.duration).strip().lower() == "auto":
@@ -325,8 +379,9 @@ def parse_args() -> argparse.Namespace:
         parser.error("--amount must be positive")
     if args.initial_balance < 0:
         parser.error("--initial-balance must be >= 0")
-    if not 0.0 <= args.attack_loss_probability <= 1.0:
-        parser.error("--attack-loss-probability must be between 0.0 and 1.0")
+    for loss_probability in args.attack_loss_probability:
+        if not 0.0 <= loss_probability <= 1.0:
+            parser.error("--attack-loss-probability must be between 0.0 and 1.0")
     if args.attack_tpre < 0 or args.attack_tatk < 0 or args.attack_tpost < 0:
         parser.error("attack timing values must be >= 0")
     if args.attack != "none" and args.attack_tatk <= 0:
@@ -350,182 +405,137 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def payment_rates_for(args: argparse.Namespace, payments: int) -> list[float]:
-    if args.payment_rate == "match":
-        return [float(payments)]
-    return list(args.payment_rate)
+def traffic_generation_duration(
+    *,
+    duration: float,
+    attack: str,
+    attack_tpre: float,
+    attack_tatk: float,
+    attack_tpost: float,
+) -> float:
+    if attack == "none":
+        return duration
+    return min(duration, attack_tpre + attack_tatk + attack_tpost)
+
+
+def derive_payment_count(payment_rate: float, traffic_duration: float) -> int:
+    return max(1, math.ceil(payment_rate * traffic_duration))
 
 
 def compute_auto_duration(
-    payments: int,
     payment_rate: float,
     attack: str,
     attack_tpre: float,
     attack_tatk: float,
     attack_tpost: float,
 ) -> float:
-    """Compute a reasonable benchmark duration for the given parameters.
+    """Compute duration without a separate payment-count control."""
+    if attack == "none":
+        base = 60.0
+        propagation_margin = 120.0
+    else:
+        base = attack_tpre + attack_tatk + attack_tpost
+        propagation_margin = max(120.0, attack_tpost + 60.0)
 
-    The duration must be long enough for:
-      1. All payments to be submitted:  payments / payment_rate
-      2. The attack lifecycle to complete:  tpre + tatk + tpost
-      3. A propagation margin for DTN epidemic routing to finish
-         delivering all confirmations after submission and attack end.
-
-    Formula:
-        base = max(submission_time, attack_lifecycle)
-        duration = base + propagation_margin
-
-    The propagation margin scales with payment count because more bundles
-    need more exchange rounds to fully propagate through the mesh.
-    """
-    submission_time = payments / max(payment_rate, 0.01)
-    attack_lifecycle = attack_tpre + attack_tatk + attack_tpost
-
-    base = max(submission_time, attack_lifecycle)
-
-    # Propagation margin: at least 120s, plus 0.1s per payment for
-    # larger workloads where epidemic routing needs more rounds.
-    propagation_margin = max(120.0, payments * 0.1)
-
-    # If there is an attack, ensure the post-attack observation window
-    # has at least 60s extra beyond the base.
-    if attack != "none":
-        propagation_margin = max(propagation_margin, attack_tpost + 60.0)
-
-    duration = base + propagation_margin
-
-    # Round up to nearest 10s for clean boundaries.
-    duration = math.ceil(duration / 10.0) * 10.0
-
-    return duration
+    # Higher offered rates create more bundles, so leave a modest extra
+    # observation tail for epidemic exchanges without changing injection rate.
+    propagation_margin = max(propagation_margin, min(300.0, payment_rate * 0.5))
+    return math.ceil((base + propagation_margin) / 10.0) * 10.0
 
 
 def build_specs(args: argparse.Namespace) -> list[RunSpec]:
     specs = []
     run_index = 1
 
-    if args.total_virtual_accounts is not None:
-        matrix = itertools.product(
-            args.clients,
-            args.authorities,
-            args.ranges,
-            args.total_virtual_accounts,
-            args.speeds,
-        )
-
-        for clients, authorities, node_range, total_accounts, speed in matrix:
-            if total_accounts % clients != 0:
-                raise SystemExit(
-                    f"total virtual accounts {total_accounts} must be divisible by "
-                    f"clients {clients}"
-                )
-
-            accounts = total_accounts // clients
-            payments = total_accounts
-
-            for payment_rate in payment_rates_for(args, payments):
-                specs.append(
-                    RunSpec(
-                        clients=clients,
-                        authorities=authorities,
-                        node_range=node_range,
-                        accounts_per_station=accounts,
-                        total_virtual_accounts=total_accounts,
-                        speed=speed,
-                        payments=payments,
-                        payment_rate=payment_rate,
-                        duration=(
-                            compute_auto_duration(
-                                payments=payments,
-                                payment_rate=payment_rate,
-                                attack=args.attack,
-                                attack_tpre=args.attack_tpre,
-                                attack_tatk=args.attack_tatk,
-                                attack_tpost=args.attack_tpost,
-                            )
-                            if args.duration == "auto"
-                            else args.duration
-                        ),
-                        warmup=args.warmup,
-                        amount=args.amount,
-                        initial_balance=args.initial_balance,
-                        medium=args.medium,
-                        routing=args.routing,
-                        seed=args.seed,
-                        area_width=args.area_width,
-                        area_height=args.area_height,
-                        mobility_start=args.mobility_start,
-                        no_mobility=args.no_mobility,
-                        attack=args.attack,
-                        attack_loss_probability=args.attack_loss_probability,
-                        attack_tpre=args.attack_tpre,
-                        attack_tatk=args.attack_tatk,
-                        attack_tpost=args.attack_tpost,
-                        attack_target_count=args.attack_target_count,
-                        attack_load_rate=args.attack_load_rate,
-                        run_index=run_index,
-                    )
-                )
-                run_index += 1
-
-        return specs
-
+    account_values = args.total_virtual_accounts or args.accounts
     matrix = itertools.product(
         args.clients,
         args.authorities,
         args.ranges,
-        args.accounts,
+        account_values,
         args.speeds,
-        args.payments,
+        args.payment_rate,
+        args.routing,
+        args.attack_loss_probability,
     )
 
-    for clients, authorities, node_range, accounts, speed, payments in matrix:
-        total_accounts = clients * accounts
-        for payment_rate in payment_rates_for(args, payments):
-            specs.append(
-                RunSpec(
-                    clients=clients,
-                    authorities=authorities,
-                    node_range=node_range,
-                    accounts_per_station=accounts,
-                    total_virtual_accounts=total_accounts,
-                    speed=speed,
-                    payments=payments,
-                    payment_rate=payment_rate,
-                    duration=(
-                        compute_auto_duration(
-                            payments=payments,
-                            payment_rate=payment_rate,
-                            attack=args.attack,
-                            attack_tpre=args.attack_tpre,
-                            attack_tatk=args.attack_tatk,
-                            attack_tpost=args.attack_tpost,
-                        )
-                        if args.duration == "auto"
-                        else args.duration
-                    ),
-                    warmup=args.warmup,
-                    amount=args.amount,
-                    initial_balance=args.initial_balance,
-                    medium=args.medium,
-                    routing=args.routing,
-                    seed=args.seed,
-                    area_width=args.area_width,
-                    area_height=args.area_height,
-                    mobility_start=args.mobility_start,
-                    no_mobility=args.no_mobility,
-                    attack=args.attack,
-                    attack_loss_probability=args.attack_loss_probability,
-                    attack_tpre=args.attack_tpre,
-                    attack_tatk=args.attack_tatk,
-                    attack_tpost=args.attack_tpost,
-                    attack_target_count=args.attack_target_count,
-                    attack_load_rate=args.attack_load_rate,
-                    run_index=run_index,
+    for (
+        clients,
+        authorities,
+        node_range,
+        account_value,
+        speed,
+        payment_rate,
+        routing,
+        attack_loss_probability,
+    ) in matrix:
+        if args.total_virtual_accounts is not None:
+            if account_value % clients != 0:
+                raise SystemExit(
+                    f"total virtual accounts {account_value} must be divisible by "
+                    f"clients {clients}"
                 )
+            requested_accounts_per_station = account_value // clients
+        else:
+            requested_accounts_per_station = account_value
+
+        duration = (
+            compute_auto_duration(
+                payment_rate=payment_rate,
+                attack=args.attack,
+                attack_tpre=args.attack_tpre,
+                attack_tatk=args.attack_tatk,
+                attack_tpost=args.attack_tpost,
             )
-            run_index += 1
+            if args.duration == "auto"
+            else args.duration
+        )
+        traffic_duration = traffic_generation_duration(
+            duration=duration,
+            attack=args.attack,
+            attack_tpre=args.attack_tpre,
+            attack_tatk=args.attack_tatk,
+            attack_tpost=args.attack_tpost,
+        )
+        derived_payments = derive_payment_count(payment_rate, traffic_duration)
+        accounts_per_station = max(
+            requested_accounts_per_station,
+            math.ceil(derived_payments / clients),
+        )
+        total_accounts = clients * accounts_per_station
+
+        specs.append(
+            RunSpec(
+                clients=clients,
+                authorities=authorities,
+                node_range=node_range,
+                accounts_per_station=accounts_per_station,
+                total_virtual_accounts=total_accounts,
+                speed=speed,
+                payment_rate=payment_rate,
+                duration=duration,
+                warmup=args.warmup,
+                amount=args.amount,
+                initial_balance=args.initial_balance,
+                medium=args.medium,
+                routing=routing,
+                seed=args.seed,
+                area_width=args.area_width,
+                area_height=args.area_height,
+                mobility_start=args.mobility_start,
+                no_mobility=args.no_mobility,
+                attack=args.attack,
+                attack_loss_probability=attack_loss_probability,
+                attack_tpre=args.attack_tpre,
+                attack_tatk=args.attack_tatk,
+                attack_tpost=args.attack_tpost,
+                attack_target_count=args.attack_target_count,
+                attack_load_rate=args.attack_load_rate,
+                keep_debug_logs=args.keep_debug_logs,
+                run_index=run_index,
+            )
+        )
+        run_index += 1
 
     return specs
 
@@ -549,8 +559,6 @@ def command_for(spec: RunSpec, run_dir: Path, use_sudo: bool) -> list[str]:
             str(spec.authorities),
             "--accounts-per-station",
             str(spec.accounts_per_station),
-            "--payments",
-            str(spec.payments),
             "--payment-rate",
             str(spec.payment_rate),
             "--amount",
@@ -582,6 +590,9 @@ def command_for(spec: RunSpec, run_dir: Path, use_sudo: bool) -> list[str]:
 
     if spec.no_mobility:
         command.append("--no-mobility")
+
+    if spec.keep_debug_logs:
+        command.append("--keep-debug-logs")
 
     if spec.attack != "none":
         command.extend(

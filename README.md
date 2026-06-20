@@ -355,7 +355,6 @@ sudo python3 examples/meshpay_benchmark.py \
   --clients 6 \
   --authorities 4 \
   --accounts-per-station 20 \
-  --payments 100 \
   --payment-rate 2 \
   --amount 1 \
   --initial-balance 10000 \
@@ -373,7 +372,6 @@ sudo python3 examples/meshpay_benchmark.py \
   --clients 12 \
   --authorities 4 \
   --accounts-per-station 100 \
-  --payments 10000 \
   --payment-rate 10 \
   --amount 1 \
   --initial-balance 10000 \
@@ -392,7 +390,6 @@ sudo python3 examples/meshpay_benchmark.py \
   --clients 12 \
   --authorities 4 \
   --accounts-per-station 100 \
-  --payments 10000 \
   --payment-rate 50 \
   --amount 1 \
   --initial-balance 10000 \
@@ -502,7 +499,6 @@ sudo python3 examples/meshpay_benchmark.py \
   --clients 12 \
   --authorities 4 \
   --accounts-per-station 100 \
-  --payments 10000 \
   --payment-rate 50 \
   --amount 1 \
   --initial-balance 10000 \
@@ -520,7 +516,6 @@ sudo python3 examples/meshpay_benchmark.py \
   --clients 12 \
   --authorities 4 \
   --accounts-per-station 100 \
-  --payments 10000 \
   --payment-rate 20 \
   --amount 1 \
   --initial-balance 10000 \
@@ -541,7 +536,6 @@ sudo python3 examples/meshpay_benchmark.py \
   --clients 12 \
   --authorities 4 \
   --accounts-per-station 100 \
-  --payments 10000 \
   --payment-rate 5 \
   --amount 1 \
   --initial-balance 10000 \

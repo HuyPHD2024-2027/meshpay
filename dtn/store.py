@@ -39,10 +39,14 @@ class BundleStore:
         self._cache: Dict[str, Bundle] = {}
         self._cached_mtime: float = -1.0
         self._last_refresh_time: float = 0.0
-        self._refresh_interval: float = 1.0
+        self._refresh_interval: float = 0.05  # 50 ms — faster injection awareness
 
         # order_id values with confirmation_order in this store.
         self.confirmed_order_ids: set[str] = set()
+
+        # Signalled whenever a new bundle is saved — lets exchange loops
+        # wake immediately instead of waiting for the next discovery cycle.
+        self.new_bundle_event: threading.Event = threading.Event()
 
     def bundle_path(self, bundle_id: str) -> Path:
         return self.path / f"{bundle_id}.json"
@@ -84,6 +88,9 @@ class BundleStore:
             # Updating _cached_mtime would hide external disk changes
             # (e.g. bundles written by inject_payload in meshpay_cli.py)
             # from _refresh_cache_if_needed_unlocked().
+
+        # Signal outside the lock so listeners can wake without contention.
+        self.new_bundle_event.set()
 
     def prune_by_order_id(self, order_id: str) -> None:
         with self._lock:
@@ -144,6 +151,26 @@ class BundleStore:
 
     def ids(self) -> set[str]:
         return {bundle.bundle_id for bundle in self.all()}
+
+    def snapshot(self) -> tuple[list[Bundle], set[str]]:
+        """Return (all_bundles, all_ids) in a single lock+refresh cycle.
+
+        Use this instead of calling all() and ids() separately to avoid
+        two filesystem refreshes per exchange.
+        """
+
+        with self._lock:
+            self._refresh_cache_if_needed_unlocked()
+            self._prune_expired_unlocked()
+
+            bundles = [
+                bundle
+                for bundle in self._cache.values()
+                if not bundle.expired()
+            ]
+            ids = {bundle.bundle_id for bundle in bundles}
+
+        return bundles, ids
 
     def unknown_to_peer(
         self,
@@ -280,8 +307,11 @@ class BundleStore:
             if bundle_id not in on_disk
         ]
 
+        cache_changed = False
+
         for bundle_id in stale_ids:
             self._cache.pop(bundle_id, None)
+            cache_changed = True
 
         for bundle_id, file_path in on_disk.items():
             if bundle_id in self._cache:
@@ -292,14 +322,14 @@ class BundleStore:
                     bundle = Bundle.from_dict(json.load(f))
 
                 self._cache[bundle_id] = bundle
+                cache_changed = True
 
             except Exception:
                 continue
 
-        self._rebuild_confirmed_order_ids_unlocked()
-
-        for order_id in list(self.confirmed_order_ids):
-            self.prune_by_order_id(order_id)
+        if cache_changed:
+            self._rebuild_confirmed_order_ids_unlocked()
+            self._prune_confirmed_orders_unlocked()
 
     def _rebuild_confirmed_order_ids_unlocked(self) -> None:
         confirmed = set()
@@ -317,6 +347,23 @@ class BundleStore:
                 confirmed.add(order_id)
 
         self.confirmed_order_ids = confirmed
+
+    def _prune_confirmed_orders_unlocked(self) -> None:
+        if not self.confirmed_order_ids:
+            return
+        to_delete = []
+        for bundle_id, bundle in list(self._cache.items()):
+            if not isinstance(bundle.payload, dict):
+                continue
+            payload_type = bundle.payload.get("type")
+            if payload_type not in {"transfer_order", "signed_transfer_order"}:
+                continue
+            candidate_order_id = (bundle.payload.get("data", {}).get("order_id") or bundle.payload.get("data", {}).get("i"))
+            if candidate_order_id in self.confirmed_order_ids:
+                to_delete.append(bundle_id)
+        for bundle_id in to_delete:
+            self._delete_bundle_files_unlocked(bundle_id)
+            self._cache.pop(bundle_id, None)
 
     def _prune_expired_unlocked(self) -> None:
         now = time.time()

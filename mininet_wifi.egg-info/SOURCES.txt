@@ -4,7 +4,10 @@ setup.py
 bin/mn
 dtn/__init__.py
 dtn/bundle.py
+dtn/config.py
 dtn/epidemic.py
+dtn/prophet.py
+dtn/spray_and_wait.py
 dtn/store.py
 meshpay/__init__.py
 meshpay/cli/__init__.py

@@ -11,8 +11,14 @@ from pathlib import Path
 # Allow running this file directly:
 #   sudo python3 examples/oppnet.py ...
 ROOT_DIR = Path(__file__).resolve().parents[1]
-if str(ROOT_DIR) not in sys.path:
-    sys.path.insert(0, str(ROOT_DIR))
+if str(ROOT_DIR) in sys.path:
+    sys.path.remove(str(ROOT_DIR))
+sys.path.insert(0, str(ROOT_DIR))
+
+examples_dir = str(ROOT_DIR / "examples")
+if examples_dir in sys.path:
+    sys.path.remove(examples_dir)
+
 
 from mininet.log import info, setLogLevel
 from mn_wifi.link import adhoc, mesh, wmediumd

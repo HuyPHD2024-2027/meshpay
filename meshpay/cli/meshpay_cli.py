@@ -10,10 +10,12 @@ import threading
 import time
 from pathlib import Path
 from typing import Iterable, List, Optional
+from uuid import UUID
 
 from mininet.log import error, info
 from mn_wifi.cli import CLI
 from dtn import config as dtn_config
+from meshpay.benchmark.payment_metrics import collect_payment_metrics
 from meshpay.offline.virtual_accounts import account_host
 
 from meshpay.offline.dtn_adapter import DTNAdapter
@@ -45,7 +47,9 @@ class MeshPayRuntime:
         log_dir: str | Path,
         root_dir: str | Path,
         discovery_interval: float = dtn_config.DEFAULT_DISCOVERY_INTERVAL,
-        payment_poll_interval: float = 0.5,
+        payment_poll_interval: float = dtn_config.DEFAULT_PAYMENT_POLL_INTERVAL,
+        medium: str = "adhoc",
+        bundle_ttl: float = 900.0,
     ) -> None:
         self.net = net
         self.clients = list(clients)
@@ -57,19 +61,26 @@ class MeshPayRuntime:
         self.log_dir = Path(log_dir)
         self.root_dir = Path(root_dir)
 
+        if medium not in {"adhoc", "mesh"}:
+            raise ValueError("medium must be one of: adhoc, mesh")
+
         self.discovery_interval = discovery_interval
         self.payment_poll_interval = payment_poll_interval
+        self.medium = medium
+        self.bundle_ttl = float(bundle_ttl)
 
         self.file_offsets: dict[str, int] = {}
         self.processes = []
         self.running = False
         self.payment_thread: Optional[threading.Thread] = None
         self.processed_lines: dict[str, int] = {}
+        self.started_at: Optional[float] = None
 
         self.payment_log = self.log_dir / "payment.log"
         self._log_lock = threading.Lock()
 
     def start(self) -> None:
+        self.started_at = time.time()
         self.start_dtn_routers()
         time.sleep(2)
         self.start_payment_loop()
@@ -78,8 +89,108 @@ class MeshPayRuntime:
         self.stop_payment_loop()
         self.stop_dtn_routers()
 
+    def wireless_iface_for(self, node) -> str:
+        wlans = getattr(node, "params", {}).get("wlan")
+
+        if wlans:
+            return str(wlans[0])
+
+        wintfs = getattr(node, "wintfs", {})
+
+        if isinstance(wintfs, dict):
+            for intf in wintfs.values():
+                name = getattr(intf, "name", "")
+                if name:
+                    return str(name)
+
+        elif isinstance(wintfs, list):
+            for intf in wintfs:
+                name = getattr(intf, "name", "")
+                if name:
+                    return str(name)
+
+        return f"{node.name}-wlan0"
+
+    def node_ip(self, node) -> str:
+        ip_method = getattr(node, "IP", None)
+
+        if callable(ip_method):
+            ip = str(ip_method()).strip()
+            if ip:
+                return ip.split("/", 1)[0]
+
+        params = getattr(node, "params", {})
+        ip = str(params.get("ip", "")).strip()
+
+        if ip:
+            return ip.split("/", 1)[0]
+
+        raise ValueError(f"could not determine IP for node {node.name}")
+
+    def clean_mac(self, mac: str) -> str:
+        mac = mac.strip().lower()
+
+        if len(mac) == 17 and mac.count(":") == 5:
+            return mac
+
+        return ""
+
+    def node_mac(self, node) -> str:
+        iface = self.wireless_iface_for(node)
+        mac = self.clean_mac(node.cmd(f"cat /sys/class/net/{shlex.quote(iface)}/address").strip())
+
+        if mac:
+            return mac
+
+        wintfs = getattr(node, "wintfs", {})
+
+        if isinstance(wintfs, dict):
+            for intf in wintfs.values():
+                if getattr(intf, "name", None) == iface:
+                    mac = self.clean_mac(str(getattr(intf, "mac", "")))
+
+                    if mac:
+                        return mac
+
+        elif isinstance(wintfs, list):
+            for intf in wintfs:
+                if getattr(intf, "name", None) == iface:
+                    mac = self.clean_mac(str(getattr(intf, "mac", "")))
+
+                    if mac:
+                        return mac
+
+        return ""
+
+    def peer_table(self) -> dict[str, tuple[str, str]]:
+        table: dict[str, tuple[str, str]] = {}
+
+        for node in self.nodes:
+            table[node.name] = (self.node_ip(node), self.node_mac(node))
+
+        return table
+
+    def peer_args_for(self, node, peer_table: dict[str, tuple[str, str]]) -> str:
+        args: list[str] = []
+
+        for peer_name, (peer_ip, peer_mac) in sorted(peer_table.items()):
+            if peer_name == node.name:
+                continue
+
+            value = f"{peer_name}={peer_ip}"
+
+            if peer_mac:
+                value = f"{value},{peer_mac}"
+
+            args.append(f"--peer {shlex.quote(value)}")
+
+        return " ".join(args)
+
     def start_dtn_routers(self) -> None:
         info(f"*** Starting MeshPay DTN routing: {self.routing}\n")
+        info(f"*** DTN neighbour discovery mode: {self.medium}\n")
+
+        peer_table = self.peer_table()
 
         for node in self.nodes:
             store = self.store_for(node.name)
@@ -88,11 +199,17 @@ class MeshPayRuntime:
             node.cmd(f"rm -rf {shlex.quote(str(store))}")
             node.cmd(f"mkdir -p {shlex.quote(str(store))}")
 
+            wireless_iface = self.wireless_iface_for(node)
+            peer_args = self.peer_args_for(node, peer_table)
+
             cmd = (
                 f"PYTHONPATH={shlex.quote(str(self.root_dir))} "
                 f"python3 {shlex.quote(str(self.router_file))} "
                 f"--node {shlex.quote(node.name)} "
                 f"--store {shlex.quote(str(store))} "
+                f"--discovery-mode {shlex.quote(self.medium)} "
+                f"--wireless-iface {shlex.quote(wireless_iface)} "
+                f"{peer_args} "
                 f"--discovery-interval {self.discovery_interval} "
                 f"--connect-timeout {dtn_config.DEFAULT_CONNECT_TIMEOUT} "
                 f"--socket-timeout {dtn_config.DEFAULT_SOCKET_TIMEOUT} "
@@ -106,9 +223,10 @@ class MeshPayRuntime:
             proc = node.popen(cmd, shell=True)
             self.processes.append((node, proc))
 
-            info(f"*** {node.name}: epidemic daemon started\n")
+            info(f"*** {node.name}: {self.routing} daemon started\n")
             info(f"***     store={store}\n")
             info(f"***     log={log_file}\n")
+            info(f"***     discovery={self.medium} iface={wireless_iface} peers={len(peer_table) - 1}\n")
 
     def stop_dtn_routers(self) -> None:
         info("*** Stopping MeshPay DTN daemons\n")
@@ -119,9 +237,18 @@ class MeshPayRuntime:
             except Exception:
                 pass
 
+        router_patterns = [
+            "dtn/epidemic.py",
+            "epidemic.py",
+            "dtn/spray_and_wait.py",
+            "spray_and_wait.py",
+            "dtn/prophet.py",
+            "prophet.py",
+        ]
+
         for node in self.nodes:
-            node.cmd("pkill -f 'dtn/epidemic.py' || true")
-            node.cmd("pkill -f 'epidemic.py' || true")
+            for pattern in router_patterns:
+                node.cmd(f"pkill -f {shlex.quote(pattern)} || true")
 
         self.processes = []
 
@@ -214,34 +341,49 @@ class MeshPayRuntime:
     def inject_payload(self, src_name: str, dst_name: str, payload: dict) -> None:
         """Inject one MeshPay payload directly into the source DTN store.
 
-        This is much faster than spawning:
+        Writes the bundle JSON file atomically (tmp + os.replace) directly
+        into the store directory. The running router daemon discovers new
+        files via filesystem mtime checks — no BundleStore instance needed.
 
-            python3 dtn/epidemic.py --inject ...
-
-        Use this for benchmarks with thousands of transactions.
+        This avoids the overhead of instantiating a full BundleStore (cache
+        rebuild, confirmed-order scan, etc.) on every injection call, which
+        was a major bottleneck at high TPS.
         """
 
+        import os as _os
+
         from dtn.bundle import Bundle
-        from dtn.store import BundleStore
 
         store_path = self.store_for(src_name)
         store_path.mkdir(parents=True, exist_ok=True)
 
-        store = BundleStore(store_path)
+        payload = self.add_routing_hints(payload)
 
         bundle = Bundle.create(
             src=src_name,
             dst=dst_name,
             payload=payload,
-            ttl=300.0,
+            ttl=self.bundle_ttl,
         )
 
-        store.save(bundle)
+        # Write bundle JSON atomically — the router daemon will pick it up
+        # via _refresh_cache_if_needed_unlocked() on the next store.all().
+        bundle_data = bundle.to_dict()
+        bundle_file = store_path / f"{bundle.bundle_id}.json"
+        tmp_file = store_path / f"{bundle.bundle_id}.json.tmp"
+
+        with tmp_file.open("w", encoding="utf-8") as f:
+            json.dump(bundle_data, f, sort_keys=True)
+            f.write("\n")
+
+        _os.replace(tmp_file, bundle_file)
 
         payload_json = json.dumps(payload, sort_keys=True)
         payload_size_bytes = len(payload_json.encode("utf-8"))
 
-        store.record_event(
+        # Append creation event directly to the store's events.jsonl.
+        events_log = store_path / "events.jsonl"
+        event_record = json.dumps(
             {
                 "event": "created",
                 "node": src_name,
@@ -250,8 +392,12 @@ class MeshPayRuntime:
                 "dst": dst_name,
                 "size_bytes": bundle.size_bytes,
                 "payload": payload,
-            }
+                "time": time.time(),
+            },
+            sort_keys=True,
         )
+        with events_log.open("a", encoding="utf-8") as f:
+            f.write(event_record + "\n")
 
         sender = None
         recipient = None
@@ -286,6 +432,47 @@ class MeshPayRuntime:
                 "amount": amount,
             }
         )
+
+    def add_routing_hints(self, payload: dict) -> dict:
+        payload = dict(payload)
+        if payload.get("app") != "meshpay.offline":
+            return payload
+
+        hints = dict(payload.get("_meshpay_route", {}))
+        data = payload.get("data", {})
+        if not isinstance(data, dict):
+            data = {}
+
+        ptype = payload.get("type")
+        if ptype == "transfer_order":
+            hints.setdefault("sender_host", account_host(data.get("sender") or data.get("s")))
+            hints.setdefault("recipient_host", account_host(data.get("recipient") or data.get("r")))
+            hints.setdefault("authority_targets", [node.name for node in self.authorities])
+        elif ptype == "signed_transfer_order":
+            raw_order_id = str(data.get("order_id") or data.get("i") or "")
+            order_id = raw_order_id
+            if raw_order_id:
+                try:
+                    order_id = str(UUID(raw_order_id))
+                except Exception:
+                    order_id = raw_order_id
+
+            order = None
+            if order_id:
+                for node in self.nodes:
+                    order = self.lookup_order(node, order_id)
+                    if order is not None:
+                        break
+            if order is not None:
+                hints.setdefault("sender_host", account_host(order.sender))
+                hints.setdefault("recipient_host", account_host(order.recipient))
+        elif ptype == "confirmation_order":
+            hints.setdefault("sender_host", account_host(data.get("sender") or data.get("s")))
+            hints.setdefault("recipient_host", account_host(data.get("recipient") or data.get("r")))
+            hints.setdefault("authority_targets", [node.name for node in self.authorities])
+
+        payload["_meshpay_route"] = {key: value for key, value in hints.items() if value}
+        return payload
 
     def store_for(self, node_name: str) -> Path:
         return self.log_dir / "stores" / self.routing / node_name
@@ -504,18 +691,25 @@ class MeshPayRuntime:
                 }
             )
 
-            # Send confirmation to recipient's physical host.
-            self.inject_payload(
-                src_name=src_node.name,
-                dst_name=recipient_host,
-                payload=payload,
-            )
+            # Collect unique destinations, skipping the source node
+            # (it already has the confirmation in its store).
+            destinations: set[str] = set()
 
-            # Send confirmation to authorities so they update account state.
+            # Recipient's physical host needs the confirmation for acceptance.
+            destinations.add(recipient_host)
+
+            # Authorities need confirmations to update account state.
             for authority in self.authorities:
+                destinations.add(authority.name)
+
+            # Don't inject back to the node that created the confirmation —
+            # it already has the bundle in its store.
+            destinations.discard(src_node.name)
+
+            for dst_name in destinations:
                 self.inject_payload(
                     src_name=src_node.name,
-                    dst_name=authority.name,
+                    dst_name=dst_name,
                     payload=payload,
                 )
 
@@ -553,6 +747,8 @@ class MeshPayCLI(CLI):
 
         payments
         payments sta1
+
+        metrics
 
         paymentlog
         paymentlog sta1
@@ -788,6 +984,51 @@ class MeshPayCLI(CLI):
         for line in content[-lines:]:
             info(line + "\n")
 
+    def do_metrics(self, _line: str) -> None:
+        """Show MeshPay payment metrics including time to quorum.
+
+        Usage:
+            metrics
+        """
+
+        started_at = self.runtime.started_at or time.time()
+        report = collect_payment_metrics(
+            log_dir=self.runtime.log_dir,
+            started_at=started_at,
+            ended_at=time.time(),
+        )
+
+        summary = report["summary"]
+        quorum = report["latency_ms"]["time_to_quorum"]
+        accepted = report["latency_ms"]["time_to_acceptance"]
+
+        info(f"\n===== MeshPay metrics: {self.runtime.payment_log} =====\n")
+        info(f"payments_created:              {summary['payments_created']}\n")
+        info(f"payments_confirmed:            {summary['payments_confirmed']}\n")
+        info(f"payments_accepted:             {summary['payments_accepted']}\n")
+        info(
+            f"payment_confirmation_rate_pct: {summary['payment_confirmation_rate_percent']:.2f}\n"
+        )
+        info(
+            f"payment_acceptance_rate_pct:   {summary['payment_acceptance_rate_percent']:.2f}\n"
+        )
+
+        if quorum["avg"] is None:
+            info("time_to_quorum_ms:             None\n")
+        else:
+            info(f"avg_time_to_quorum_ms:         {quorum['avg']:.4f}\n")
+            info(f"p50_time_to_quorum_ms:         {quorum['p50']:.4f}\n")
+            info(f"p95_time_to_quorum_ms:         {quorum['p95']:.4f}\n")
+            info(f"min_time_to_quorum_ms:         {quorum['min']:.4f}\n")
+            info(f"max_time_to_quorum_ms:         {quorum['max']:.4f}\n")
+
+        if accepted["avg"] is None:
+            info("time_to_acceptance_ms:         None\n")
+        else:
+            info(f"avg_time_to_acceptance_ms:     {accepted['avg']:.4f}\n")
+            info(f"p50_time_to_acceptance_ms:     {accepted['p50']:.4f}\n")
+            info(f"p95_time_to_acceptance_ms:     {accepted['p95']:.4f}\n")
+
     def do_dtnlog(self, line: str) -> None:
         """Show DTN daemon logs.
 
@@ -868,6 +1109,7 @@ class MeshPayCLI(CLI):
         info("  balance sta1\n")
         info("  payments\n")
         info("  payments sta1\n")
+        info("  metrics\n")
         info("  paymentlog\n")
         info("  dtnlog\n")
         info("  dtnlog sta1\n")

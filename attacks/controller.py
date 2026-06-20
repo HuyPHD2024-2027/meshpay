@@ -63,6 +63,7 @@ class BenchmarkAttack:
             "tatk": self.tatk,
             "tpost": self.tpost,
             "target_count": self.target_count,
+            "target_selection": "random_subset_capped_at_one_third",
             "selected_target_count": len(self.targets),
             "targets": list(self.target_names),
             "load_rate": self.load_rate,

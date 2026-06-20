@@ -9,8 +9,14 @@ from pathlib import Path
 # Allow running this file directly:
 #   sudo python3 examples/meshpay_offline.py ...
 ROOT_DIR = Path(__file__).resolve().parents[1]
-if str(ROOT_DIR) not in sys.path:
-    sys.path.insert(0, str(ROOT_DIR))
+if str(ROOT_DIR) in sys.path:
+    sys.path.remove(str(ROOT_DIR))
+sys.path.insert(0, str(ROOT_DIR))
+
+examples_dir = str(ROOT_DIR / "examples")
+if examples_dir in sys.path:
+    sys.path.remove(examples_dir)
+
 
 from mininet.log import info, setLogLevel
 from mn_wifi.link import adhoc, mesh, wmediumd
@@ -21,6 +27,7 @@ from meshpay.cli.meshpay_cli import MeshPayCLI, MeshPayRuntime
 from meshpay.offline.nodes.authority import Authority
 from meshpay.offline.nodes.client import Client
 from meshpay.offline.virtual_accounts import make_account_id
+from dtn import config as dtn_config
 
 EXAMPLES_DIR = Path(__file__).resolve().parent
 DTN_DIR = ROOT_DIR / "dtn"
@@ -28,6 +35,8 @@ DEFAULT_LOG_DIR = ROOT_DIR / "logs" / "examples" / "meshpay_offline"
 
 ROUTER_FILES = {
     "epidemic": DTN_DIR / "epidemic.py",
+    "spray-and-wait": DTN_DIR / "spray_and_wait.py",
+    "prophet": DTN_DIR / "prophet.py",
 }
 
 
@@ -39,7 +48,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--routing",
         required=True,
-        choices=["epidemic"],
+        choices=sorted(ROUTER_FILES),
         help="DTN routing protocol to start automatically on every node.",
     )
 
@@ -401,7 +410,8 @@ def topology(args: argparse.Namespace) -> None:
         router_file=router_file,
         log_dir=log_dir,
         root_dir=ROOT_DIR,
-        payment_poll_interval=0.5,
+        payment_poll_interval=dtn_config.DEFAULT_PAYMENT_POLL_INTERVAL,
+        medium=args.medium,
     )
 
     try:
@@ -416,6 +426,7 @@ def topology(args: argparse.Namespace) -> None:
         info("*** Show balances:         balance\n")
         info("*** Show one balance:      balance sta1\n")
         info("*** Show payments:         payments\n")
+        info("*** Show payment metrics:  metrics\n")
         info("*** Show payment log:      paymentlog\n")
         info("*** Show DTN logs:         dtnlog\n")
         info("*** Show delivered:        delivered\n")
