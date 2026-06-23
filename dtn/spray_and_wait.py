@@ -6,7 +6,7 @@ import argparse
 import json
 import threading
 from pathlib import Path
-from typing import List, Set
+from typing import List, Set, Optional
 
 from dtn.bundle import Bundle
 from dtn.epidemic import EpidemicRouter, inject_bundle, parse_args
@@ -74,7 +74,12 @@ class SprayAndWaitRouter(EpidemicRouter):
             self._copies[bundle.bundle_id] = copies
         return copies
 
-    def select_bundles_for_peer(self, peer_ids: Set[str], peer_node: str) -> List[Bundle]:
+    def select_bundles_for_peer(
+        self, 
+        peer_ids: Set[str], 
+        peer_node: str,
+        local_snapshot: Optional[List[Bundle]] = None,
+    ) -> List[Bundle]:
         known = set(peer_ids)
         selected: List[Bundle] = []
 
@@ -85,7 +90,13 @@ class SprayAndWaitRouter(EpidemicRouter):
                 if key[0] != peer_node
             }
 
-            for bundle in self.store.unknown_to_peer(known, peer_node=peer_node):
+            # Use the pre-fetched snapshot to save disk I/O if provided
+            if local_snapshot is not None:
+                candidates = [b for b in local_snapshot if b.bundle_id not in known]
+            else:
+                candidates = self.store.unknown_to_peer(known, peer_node=peer_node)
+
+            for bundle in candidates:
                 copies = self._ensure_copies(bundle)
 
                 if bundle.dst == peer_node:
@@ -103,14 +114,6 @@ class SprayAndWaitRouter(EpidemicRouter):
                     continue
 
                 if copies <= 1:
-                    self.record_event(
-                        {
-                            "event": "spray_skipped_no_copies",
-                            "peer": peer_node,
-                            "bundle_id": bundle.bundle_id,
-                            "copies": copies,
-                        }
-                    )
                     continue
 
                 assigned = copies // 2

@@ -340,6 +340,7 @@ def plot_attack_impact(
     output_dir: Path,
     title: str = "Impact of RF Jamming Attack (loss=80%)\non Offline Payment Performance",
     window_size: int = 10,
+    filename_prefix: str = "attack_impact",
 ) -> Path:
     """Draw a quorum-only 3-panel stacked figure and save to output_dir."""
 
@@ -405,8 +406,8 @@ def plot_attack_impact(
     fig.suptitle(title, fontsize=13, fontweight="bold")
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    pdf_path = output_dir / "attack_impact.pdf"
-    png_path = output_dir / "attack_impact.png"
+    pdf_path = output_dir / f"{filename_prefix}.pdf"
+    png_path = output_dir / f"{filename_prefix}.png"
 
     fig.savefig(str(pdf_path), dpi=150, bbox_inches="tight")
     fig.savefig(str(png_path), dpi=150, bbox_inches="tight")
@@ -439,8 +440,8 @@ def plot_attack_impact(
 
         fig_single.suptitle(f"{title} - {name.capitalize()}", fontsize=13, fontweight="bold")
 
-        single_pdf = output_dir / f"{name}_impact.pdf"
-        single_png = output_dir / f"{name}_impact.png"
+        single_pdf = output_dir / f"{filename_prefix}_{name}.pdf"
+        single_png = output_dir / f"{filename_prefix}_{name}.png"
         fig_single.savefig(str(single_pdf), dpi=150, bbox_inches="tight")
         fig_single.savefig(str(single_png), dpi=150, bbox_inches="tight")
         plt.close(fig_single)
@@ -597,6 +598,298 @@ def resolve_dirs_and_labels(
     return dirs, labels
 
 
+def plot_latency_vs_loss(runs_data: List[Dict[str, Any]], output_dir: Path) -> None:
+    # Group runs by (routing, payment_rate)
+    groups = defaultdict(list)
+    for run in runs_data:
+        cfg = run["config"]
+        routing = cfg.get("routing", "unknown")
+        rate = cfg.get("payment_rate", 0.0)
+        loss = cfg.get("attack_loss_probability", 0.0)
+        
+        events = run["events"]
+        created = {e["order_id"]: float(e["time"]) for e in events if e.get("event") == "payment_created"}
+        confirmed = {}
+        for e in events:
+            if e.get("event") == "confirmation_created" and "order_id" in e:
+                oid = e["order_id"]
+                t = float(e["time"])
+                if oid not in confirmed or t < confirmed[oid]:
+                    confirmed[oid] = t
+                    
+        latencies = [confirmed[oid] - created[oid] for oid in confirmed if oid in created]
+        avg_latency = np.mean(latencies) if latencies else np.nan
+        
+        groups[(routing, rate)].append((loss, avg_latency))
+        
+    fig, ax = plt.subplots(figsize=(10, 6), constrained_layout=True)
+    
+    # Sort groups to ensure consistent plotting order
+    sorted_groups = sorted(groups.items(), key=lambda x: (x[0][0], x[0][1]))
+    
+    for idx, ((routing, rate), points) in enumerate(sorted_groups):
+        # Sort points by loss probability
+        points = sorted(points, key=lambda x: x[0])
+        losses = [p[0] for p in points]
+        latencies = [p[1] for p in points]
+        
+        # Format label
+        lbl_route = routing.replace("-", " ").title()
+        if routing == "spray-and-wait":
+            lbl_route = "Spray-and-Wait"
+        elif routing == "prophet":
+            lbl_route = "PRoPHET"
+            
+        label = f"{lbl_route} ({int(rate)} TPS)"
+        
+        # Color mapping
+        if "epi" in routing.lower():
+            color = "#1E88E5" # Blue
+        elif "snw" in routing.lower() or "spray" in routing.lower():
+            color = "#FB8C00" # Orange
+        elif "prophet" in routing.lower():
+            color = "#E53935" # Red
+        else:
+            color = LINE_COLORS[idx % len(LINE_COLORS)]
+            
+        linestyle = "--" if rate > 10.0 else "-"
+        marker = "s" if rate > 10.0 else "o"
+        
+        ax.plot(losses, latencies, label=label, color=color, linestyle=linestyle, marker=marker, linewidth=2.0, markersize=6)
+        
+    ax.set_xlabel("Packet Loss Probability", fontsize=11, fontweight="bold")
+    ax.set_ylabel("Average Time to Quorum (s)", fontsize=11, fontweight="bold")
+    ax.set_title("Average Quorum Latency vs. Packet Loss under Attack", fontsize=13, fontweight="bold")
+    ax.grid(True, alpha=0.3, linestyle="-", linewidth=0.5)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.legend(loc="upper left", fontsize=10, edgecolor="#BDBDBD", framealpha=0.9)
+    
+    pdf_path = output_dir / "latency_vs_packet_loss.pdf"
+    png_path = output_dir / "latency_vs_packet_loss.png"
+    
+    fig.savefig(str(pdf_path), dpi=150)
+    fig.savefig(str(png_path), dpi=150)
+    plt.close(fig)
+    print(f"Saved: {pdf_path}")
+    print(f"Saved: {png_path}")
+
+
+def generate_traffic_table(runs_data: List[Dict[str, Any]], output_dir: Path) -> None:
+    table_rows = []
+    
+    for run in runs_data:
+        cfg = run["config"]
+        events = run["events"]
+        run_dir = run["dir"]
+        
+        routing = cfg.get("routing", "epidemic")
+        rate = cfg.get("payment_rate", 0.0)
+        loss = cfg.get("attack_loss_probability", 0.0)
+        
+        tpre = float(cfg.get("attack_tpre", 60.0))
+        tatk = float(cfg.get("attack_tatk", 60.0))
+        tpost = float(cfg.get("attack_tpost", 240.0))
+        
+        t0 = None
+        created_events = [e for e in events if e.get("event") == "payment_created"]
+        if created_events:
+            t0 = min(float(e["time"]) for e in created_events)
+        else:
+            all_times = [float(e["time"]) for e in events if "time" in e]
+            t0 = min(all_times) if all_times else 0.0
+            
+        stores_dir = run_dir / "stores" / routing
+        if not stores_dir.exists():
+            base_stores = run_dir / "stores"
+            if base_stores.exists():
+                subdirs = [d for d in base_stores.iterdir() if d.is_dir()]
+                if subdirs:
+                    stores_dir = subdirs[0]
+                    
+        tx_bytes_pre = 0.0
+        tx_bytes_during = 0.0
+        tx_bytes_post = 0.0
+        
+        rx_bytes_pre = 0.0
+        rx_bytes_during = 0.0
+        rx_bytes_post = 0.0
+        
+        num_nodes = 0
+        if stores_dir.exists():
+            node_dirs = [d for d in stores_dir.iterdir() if d.is_dir()]
+            num_nodes = len(node_dirs)
+            for node_dir in node_dirs:
+                events_path = node_dir / "events.jsonl"
+                if events_path.exists():
+                    for event in load_jsonl(events_path):
+                        if event.get("event") != "exchange":
+                            continue
+                        sent = event.get("sent_bytes")
+                        received = event.get("received_bytes")
+                        time_val = float(event.get("time", 0.0))
+                        
+                        rel_time = time_val - t0
+                        if rel_time < tpre:
+                            tx_bytes_pre += sent or 0
+                            rx_bytes_pre += received or 0
+                        elif rel_time < tpre + tatk:
+                            tx_bytes_during += sent or 0
+                            rx_bytes_during += received or 0
+                        else:
+                            tx_bytes_post += sent or 0
+                            rx_bytes_post += received or 0
+                            
+        tpre_dur = tpre if tpre > 0 else 1.0
+        tatk_dur = tatk if tatk > 0 else 1.0
+        tpost_dur = tpost if tpost > 0 else 1.0
+        nodes_count = num_nodes if num_nodes > 0 else 1
+        
+        tx_rate_pre = (tx_bytes_pre / tpre_dur) / nodes_count / 1024.0
+        rx_rate_pre = (rx_bytes_pre / tpre_dur) / nodes_count / 1024.0
+        
+        tx_rate_during = (tx_bytes_during / tatk_dur) / nodes_count / 1024.0
+        rx_rate_during = (rx_bytes_during / tatk_dur) / nodes_count / 1024.0
+        
+        tx_rate_post = (tx_bytes_post / tpost_dur) / nodes_count / 1024.0
+        rx_rate_post = (rx_bytes_post / tpost_dur) / nodes_count / 1024.0
+        
+        # Pretty names
+        lbl_route = routing.replace("-", " ").title()
+        if routing == "spray-and-wait":
+            lbl_route = "Spray-and-Wait"
+        elif routing == "prophet":
+            lbl_route = "PRoPHET"
+            
+        table_rows.append({
+            "routing": lbl_route,
+            "rate": int(rate),
+            "loss": loss,
+            "pre_tx": tx_rate_pre,
+            "pre_rx": rx_rate_pre,
+            "dur_tx": tx_rate_during,
+            "dur_rx": rx_rate_during,
+            "post_tx": tx_rate_post,
+            "post_rx": rx_rate_post
+        })
+        
+    # Sort table rows by routing, rate, loss
+    table_rows.sort(key=lambda r: (r["routing"], r["rate"], r["loss"]))
+    
+    # Generate Markdown Table
+    md = []
+    md.append("# Peer Traffic Rates Before, During, and After Attack")
+    md.append("")
+    md.append("This table shows the **Average Peer TX and RX Rates (KiB/s)** computed across three distinct phases of each benchmark run:")
+    md.append("1. **Before Attack**: Pre-attack baseline phase.")
+    md.append("2. **During Attack**: Jamming/attack phase.")
+    md.append("3. **After Attack**: Recovery phase after attack stops.")
+    md.append("")
+    md.append("| Routing Protocol | Workload (TPS) | Loss Probability | Pre-Attack TX / RX (KiB/s) | During-Attack TX / RX (KiB/s) | Post-Attack TX / RX (KiB/s) |")
+    md.append("|:---|:---:|:---:|:---:|:---:|:---:|")
+    
+    for r in table_rows:
+        md.append(f"| {r['routing']} | {r['rate']} | {r['loss']:.2f} | {r['pre_tx']:.3f} / {r['pre_rx']:.3f} | {r['dur_tx']:.3f} / {r['dur_rx']:.3f} | {r['post_tx']:.3f} / {r['post_rx']:.3f} |")
+        
+    md_content = "\n".join(md)
+    
+    table_path = output_dir / "traffic_rates_table.md"
+    with open(table_path, "w", encoding="utf-8") as f:
+        f.write(md_content)
+        
+    print(f"Saved: {table_path}")
+    print("\n" + md_content + "\n")
+
+
+def run_multi_analysis(parent_dir: Path, output_dir: Path) -> int:
+    print(f"Running Multi-Run Analysis on: {parent_dir}")
+    
+    # Scan and load all run directories
+    runs_data = []
+    for d in sorted(parent_dir.iterdir()):
+        if d.is_dir() and (d / "benchmark_config.json").exists() and (d / "payment.log").exists():
+            config = load_config(d)
+            events = load_jsonl(d / "payment.log")
+            if events:
+                runs_data.append({
+                    "dir": d,
+                    "config": config,
+                    "events": events
+                })
+                
+    if not runs_data:
+        print("Error: No valid run directories found under parent directory.", file=sys.stderr)
+        return 1
+        
+    print(f"Found {len(runs_data)} valid run directories.")
+    
+    # Ensure output directory exists
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # --- Generate Figure 1: Stacked Time-Series Comparison ---
+    # We want to find the runs with payment_rate = 10.0 and attack_loss_probability = 0.8
+    # (or fallback to the maximum loss probability run for each protocol at the lowest rate)
+    target_loss = 0.8
+    target_rate = 10.0
+    
+    fig1_runs = []
+    fig1_labels = []
+    
+    for routing in ["epidemic", "spray-and-wait", "prophet"]:
+        match = None
+        for run in runs_data:
+            cfg = run["config"]
+            r_val = cfg.get("routing", "")
+            rate_val = cfg.get("payment_rate", 0.0)
+            loss_val = cfg.get("attack_loss_probability", 0.0)
+            if r_val == routing and abs(rate_val - target_rate) < 0.1 and abs(loss_val - target_loss) < 0.1:
+                match = run
+                break
+        
+        if not match:
+            candidates = [r for r in runs_data if r["config"].get("routing", "") == routing]
+            if candidates:
+                candidates.sort(key=lambda r: (-float(r["config"].get("attack_loss_probability", 0.0)), float(r["config"].get("payment_rate", 0.0))))
+                match = candidates[0]
+                
+        if match:
+            fig1_runs.append(match)
+            lbl = routing.replace("-", " ").title()
+            if routing == "spray-and-wait":
+                lbl = "Spray-and-Wait"
+            elif routing == "prophet":
+                lbl = "PRoPHET"
+            fig1_labels.append(lbl)
+            
+    if fig1_runs:
+        print(f"Generating Figure 1: Time-series comparison under attack for: {[r['dir'].name for r in fig1_runs]}")
+        series_list = []
+        for run in fig1_runs:
+            series = compute_time_series(run["events"], run["config"], window_size=10, log_dir=run["dir"])
+            series_list.append(series)
+            
+        plot_attack_impact(
+            series_list=series_list,
+            labels=fig1_labels,
+            output_dir=output_dir,
+            title="Comparison of Routing Protocols under RF Jamming Attack (loss=80%)",
+            window_size=10,
+            filename_prefix="attack_impact_comparison"
+        )
+    else:
+        print("Warning: Could not find suitable runs for Figure 1 (Time-series comparison under attack).")
+        
+    # --- Generate Figure 2: Latency vs. Packet Loss ---
+    print("Generating Figure 2: Latency vs. Packet Loss curves...")
+    plot_latency_vs_loss(runs_data, output_dir)
+    
+    # --- Generate Table 3: Average Peer Traffic Rates ---
+    print("Generating Table 3: Average Peer TX/RX Traffic Rates...")
+    generate_traffic_table(runs_data, output_dir)
+    
+    return 0
+
+
 def main() -> int:
     args = parse_args()
 
@@ -605,6 +898,14 @@ def main() -> int:
         return 1
 
     dirs, labels = resolve_dirs_and_labels(args.dirs, args.labels)
+
+    # Check if we should automatically enter Multi-Run Analysis Mode
+    if len(dirs) == 1:
+        parent_dir = dirs[0]
+        subdirs = sorted(list(parent_dir.glob("*/benchmark_config.json")))
+        if subdirs or (parent_dir / "summary.json").exists():
+            output_dir = Path(args.output).resolve() if args.output else parent_dir
+            return run_multi_analysis(parent_dir, output_dir)
 
     series_list: List[Dict[str, Any]] = []
 

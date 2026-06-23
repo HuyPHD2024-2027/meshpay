@@ -5,14 +5,18 @@ from pathlib import Path
 
 def main():
     root_dir = Path(__file__).resolve().parents[1]
-    summary_path = root_dir / "logs" / "benchmarks" / "scripts" / "summary.json"
+    summary_path = root_dir / "logs" / "benchmarks" / "scripts" / "aggregate.json"
     
     if len(sys.argv) > 1:
         summary_path = Path(sys.argv[1])
         
     if not summary_path.exists():
-        print(f"Error: {summary_path} not found.", file=sys.stderr)
-        sys.exit(1)
+        fallback = summary_path.with_name("summary.json")
+        if fallback.exists():
+            summary_path = fallback
+        else:
+            print(f"Error: {summary_path} not found.", file=sys.stderr)
+            sys.exit(1)
         
     with open(summary_path, "r", encoding="utf-8") as f:
         try:
@@ -24,6 +28,9 @@ def main():
     # Filter completed runs (exit_code must be 0, and metrics must be populated)
     completed_runs = []
     for row in data:
+        if row.get("samples"):
+            completed_runs.append(row)
+            continue
         if row.get("exit_code") == 0:
             completed_runs.append(row)
         # If dry run but executed is not true, we might still have rows without exit_code
@@ -63,7 +70,7 @@ def main():
         headers = [
             "Routing Protocol",
             "Acceptance Rate",
-            "Confirmation Rate",
+            "Offered Confirmation Yield",
             "Avg Acceptance Latency",
             "Avg Quorum Latency",
             "Throughput (Tx+Rx)"
@@ -86,20 +93,20 @@ def main():
             elif routing.lower() == "prophet":
                 routing = "PRoPHET"
                 
-            acc_rate_val = run.get("payment_acceptance_rate_percent")
+            acc_rate_val = run.get("offered_acceptance_rate_percent.mean", run.get("payment_acceptance_rate_percent"))
             acc_rate = f"{acc_rate_val:.2f}%" if acc_rate_val is not None else "N/A"
             
-            conf_rate_val = run.get("payment_confirmation_rate_percent")
+            conf_rate_val = run.get("offered_confirmation_rate_percent.mean", run.get("payment_confirmation_rate_percent"))
             conf_rate = f"{conf_rate_val:.2f}%" if conf_rate_val is not None else "N/A"
             
-            avg_acc_val = run.get("avg_time_to_acceptance_ms")
+            avg_acc_val = run.get("avg_time_to_acceptance_ms.mean", run.get("avg_time_to_acceptance_ms"))
             avg_acc = f"{avg_acc_val / 1000.0:.2f}s" if avg_acc_val is not None else "N/A"
             
-            avg_q_val = run.get("avg_time_to_quorum_ms")
+            avg_q_val = run.get("avg_time_to_quorum_ms.mean", run.get("avg_time_to_quorum_ms"))
             avg_q = f"{avg_q_val / 1000.0:.2f}s" if avg_q_val is not None else "N/A"
             
             # Overhead tx+rx in KB/s
-            bytes_sec = run.get("tx_plus_rx_bytes_per_second")
+            bytes_sec = run.get("tx_plus_rx_bytes_per_second.mean", run.get("tx_plus_rx_bytes_per_second"))
             throughput = f"{bytes_sec / 1024.0:.2f} KB/s" if bytes_sec is not None else "N/A"
             
             row_cols = [

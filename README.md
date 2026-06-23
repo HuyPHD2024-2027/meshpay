@@ -405,8 +405,14 @@ sudo python3 examples/meshpay_benchmark.py \
 MeshPay records payment-level and DTN-level metrics.
 
 Main payment metrics:
+The primary loss-comparison metric is `offered_confirmation_rate_percent` (`payments_confirmed / payments_attempted`). `payment_confirmation_rate_percent` remains a conditional metric over admitted, created payments and must not be used alone to claim resilience under overload.
+
 
 ```text
+payments_planned
+payments_attempted
+admission_rate_percent
+offered_confirmation_rate_percent
 payments_created
 payments_confirmed
 payments_accepted

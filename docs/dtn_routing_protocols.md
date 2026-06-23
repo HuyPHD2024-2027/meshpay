@@ -42,15 +42,16 @@ Benchmark runs now also record:
 
 ## Packet-Loss Attack Smoke Matrix
 
-Run the compact comparison matrix with three protocols and 25%, 50%, and 80% packet-loss attack levels:
+Run the compact comparison matrix with three protocols, a 0% control, and 25%, 50%, and 80% receive-loss levels across five paired seeds:
 
 ```bash
 python3 scripts/run_meshpay_benchmark_matrix.py \
   --execute \
   --continue-on-error \
   --routing epidemic,spray-and-wait,prophet \
+  --seed 1,2,3,4,5 \
   --attack packetloss \
-  --attack-loss-probability 0.25,0.5,0.8 \
+  --attack-loss-probability 0,0.25,0.5,0.8 \
   --clients 4 \
   --authorities 4 \
   --ranges 100 \
@@ -66,7 +67,8 @@ python3 scripts/run_meshpay_benchmark_matrix.py \
 
 With `--duration auto`, each attack run keeps a 120 second observation tail after the pre-attack, attack, and recovery traffic windows.
 
-The matrix writes per-run logs and reports in each run directory, plus `summary.json` and `summary.csv` at the output root.
+The matrix writes per-run logs and reports in each run directory, plus per-run summaries and aggregated `aggregate.json` and `aggregate.csv` at the output root.
+Packet loss is applied only on targeted receivers so dropped packets have already consumed wireless airtime. Reports include eligible and dropped iptables packet counters; no DTN routing implementation is modified.
 
 ## Plotting
 

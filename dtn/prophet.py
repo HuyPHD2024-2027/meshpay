@@ -6,7 +6,7 @@ import json
 import threading
 import time
 from pathlib import Path
-from typing import Any, List, Set
+from typing import Any, List, Optional, Set
 
 from dtn.bundle import Bundle
 from dtn.epidemic import EpidemicRouter, inject_bundle, parse_args
@@ -15,9 +15,9 @@ from dtn.epidemic import EpidemicRouter, inject_bundle, parse_args
 P_INIT = 0.75
 BETA = 0.5
 GAMMA = 0.995
-EPSILON = 0.15
-DEFAULT_REPLICATION_BUDGET = 8
-DEFAULT_TRANSFER_REPLICATION_BUDGET = 14
+EPSILON = 0.0
+DEFAULT_REPLICATION_BUDGET = 4
+DEFAULT_TRANSFER_REPLICATION_BUDGET = 6
 
 PAYLOAD_PRIORITIES = {
     "confirmation_order": 0,
@@ -82,6 +82,10 @@ class ProphetRouter(EpidemicRouter):
         self._state_save_interval = 2.0  # throttle disk writes to every 2 s
         self._load_state()
 
+    # ------------------------------------------------------------------
+    # State persistence
+    # ------------------------------------------------------------------
+
     def _load_state(self) -> None:
         if not self._state_path.exists():
             return
@@ -132,6 +136,10 @@ class ProphetRouter(EpidemicRouter):
         tmp.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
         tmp.replace(self._state_path)
 
+    # ------------------------------------------------------------------
+    # PRoPHET math helpers
+    # ------------------------------------------------------------------
+
     @staticmethod
     def _clamp(value: float) -> float:
         return max(0.0, min(1.0, value))
@@ -162,16 +170,14 @@ class ProphetRouter(EpidemicRouter):
         previous = self._predictabilities.get(peer_node, 0.0)
         updated = previous + (1.0 - previous) * self.p_init
         self._predictabilities[peer_node] = self._clamp(updated)
-        self.record_event(
-            {
-                "event": "prophet_predictability_updated",
-                "peer": peer_node,
-                "target": peer_node,
-                "previous": previous,
-                "updated": self._predictabilities[peer_node],
-                "reason": "direct_contact",
-            }
-        )
+        self.record_event({
+            "event":    "prophet_predictability_updated",
+            "peer":     peer_node,
+            "target":   peer_node,
+            "previous": previous,
+            "updated":  self._predictabilities[peer_node],
+            "reason":   "direct_contact",
+        })
 
     def _update_transitive(self, peer_node: str, peer_preds: dict[str, float]) -> None:
         p_peer = self._predictabilities.get(peer_node, 0.0)
@@ -185,40 +191,42 @@ class ProphetRouter(EpidemicRouter):
                 peer_target = self._clamp(float(peer_target_raw))
             except Exception:
                 continue
-            previous = self._predictabilities.get(target, 0.0)
+            previous  = self._predictabilities.get(target, 0.0)
             candidate = previous + (1.0 - previous) * p_peer * peer_target * self.beta
             candidate = self._clamp(candidate)
             if candidate <= previous:
                 continue
             self._predictabilities[target] = candidate
-            self.record_event(
-                {
-                    "event": "prophet_predictability_updated",
-                    "peer": peer_node,
-                    "target": target,
-                    "previous": previous,
-                    "updated": candidate,
-                    "reason": "transitive",
-                }
-            )
+            self.record_event({
+                "event":    "prophet_predictability_updated",
+                "peer":     peer_node,
+                "target":   target,
+                "previous": previous,
+                "updated":  candidate,
+                "reason":   "transitive",
+            })
+
+    # ------------------------------------------------------------------
+    # Routing hooks
+    # ------------------------------------------------------------------
 
     def summary_metadata(self) -> dict:
         with self._state_lock:
             self._age_predictabilities()
             self._save_state()
             return {
-                "protocol": "prophet",
+                "protocol":         "prophet",
                 "predictabilities": dict(self._predictabilities),
-                "role": "authority" if self._is_authority(self.node) else "client",
+                "role":             "authority" if self._is_authority(self.node) else "client",
             }
 
     def observe_peer_summary(self, peer_node: str, summary: dict) -> None:
-        routing = summary.get("routing", {})
+        routing    = summary.get("routing", {})
         peer_preds = routing.get("predictabilities", {}) if isinstance(routing, dict) else {}
         if not isinstance(peer_preds, dict):
             peer_preds = {}
 
-        clean_peer_preds = {}
+        clean_peer_preds: dict[str, float] = {}
         for target, value in peer_preds.items():
             try:
                 clean_peer_preds[str(target)] = self._clamp(float(value))
@@ -232,6 +240,10 @@ class ProphetRouter(EpidemicRouter):
             self._update_transitive(peer_node, clean_peer_preds)
             self._save_state()
 
+    # ------------------------------------------------------------------
+    # MeshPay role priors
+    # ------------------------------------------------------------------
+
     def _route_hints(self, bundle: Bundle) -> dict[str, Any]:
         if not isinstance(bundle.payload, dict):
             return {}
@@ -239,9 +251,9 @@ class ProphetRouter(EpidemicRouter):
         return hints if isinstance(hints, dict) else {}
 
     def _role_prior(self, bundle: Bundle, node: str) -> float:
-        ptype = payload_type(bundle)
-        data = payload_data(bundle)
-        hints = self._route_hints(bundle)
+        ptype            = payload_type(bundle)
+        data             = payload_data(bundle)
+        hints            = self._route_hints(bundle)
         authority_targets = set(hints.get("authority_targets", []))
 
         if bundle.dst == node:
@@ -265,6 +277,10 @@ class ProphetRouter(EpidemicRouter):
 
         return 0.0
 
+    # ------------------------------------------------------------------
+    # Scoring and replication control
+    # ------------------------------------------------------------------
+
     def _score_for_node(
         self,
         bundle: Bundle,
@@ -276,18 +292,21 @@ class ProphetRouter(EpidemicRouter):
             self._role_prior(bundle, node),
         )
 
+    def _remaining_spray(self, bundle: Bundle) -> int:
+        """How many non-score-based forwards are still allowed for this bundle."""
+        forwarded = len(self._forwarded_to.get(bundle.bundle_id, set()))
+        return max(0, self.replication_budget - forwarded)
+
     def _can_replicate(self, bundle: Bundle, peer_node: str) -> bool:
         if bundle.dst == peer_node:
             return True
         if self._role_prior(bundle, peer_node) > 0.0:
             return True
 
-        ptype = payload_type(bundle)
+        ptype  = payload_type(bundle)
         budget = self.replication_budget
         if ptype == "transfer_order":
-            # Transfer orders need extra copies at authorities to form quorum,
-            # but globally raising relay copies crowds out signatures and confirmations.
-            if bundle.dst == peer_node or self._is_authority(peer_node):
+            if self._is_authority(peer_node):
                 budget = self.transfer_replication_budget
         elif ptype == "confirmation_order":
             budget *= 4
@@ -305,7 +324,23 @@ class ProphetRouter(EpidemicRouter):
             bundle.created_at,
         )
 
-    def select_bundles_for_peer(self, peer_ids: Set[str], peer_node: str) -> List[Bundle]:
+    # ------------------------------------------------------------------
+    # Bundle selection  ← THE FIX: added local_snapshot parameter
+    # ------------------------------------------------------------------
+
+    def select_bundles_for_peer(
+        self,
+        peer_ids: Set[str],
+        peer_node: str,
+        local_snapshot: Optional[List[Bundle]] = None,
+    ) -> List[Bundle]:
+        """Select and prioritise bundles to send to *peer_node*.
+
+        *local_snapshot* is an optional pre-fetched bundle list passed by the
+        base class to avoid a redundant store scan.  When absent we fall back
+        to querying the store directly, so the override is fully backwards
+        compatible.
+        """
         known = set(peer_ids)
         selected: List[tuple[tuple[int, float, float], Bundle, float, float, bool]] = []
 
@@ -313,66 +348,59 @@ class ProphetRouter(EpidemicRouter):
             self._age_predictabilities()
             peer_preds = self._peer_predictabilities.get(peer_node, {})
 
-            for bundle in self.store.unknown_to_peer(known, peer_node=peer_node):
+            # Use the pre-fetched snapshot when available; otherwise fall back
+            # to a direct store scan (e.g. when called from older code paths).
+            if local_snapshot is not None:
+                candidates = [b for b in local_snapshot if b.bundle_id not in known]
+            else:
+                candidates = self.store.unknown_to_peer(known, peer_node=peer_node)
+
+            for bundle in candidates:
                 local_score = self._score_for_node(bundle, self.node, self._predictabilities)
-                peer_score = self._score_for_node(bundle, peer_node, peer_preds)
-                direct = bundle.dst == peer_node
-                role_boost = self._role_prior(bundle, peer_node) > 0.0
+                peer_score  = self._score_for_node(bundle, peer_node, peer_preds)
+                direct      = bundle.dst == peer_node
+                role_boost  = self._role_prior(bundle, peer_node) > 0.0
 
                 if not self._can_replicate(bundle, peer_node):
-                    self.record_event(
-                        {
-                            "event": "prophet_skipped_replication_budget",
-                            "peer": peer_node,
-                            "bundle_id": bundle.bundle_id,
-                            "dst": bundle.dst,
-                            "payload_type": payload_type(bundle),
-                        }
-                    )
                     continue
 
-                should_forward = direct or role_boost or peer_score + self.epsilon >= local_score
-                if should_forward:
-                    selected.append((self._priority_tuple(bundle, peer_score), bundle, local_score, peer_score, direct))
-                else:
-                    self.record_event(
-                        {
-                            "event": "prophet_skipped_lower_predictability",
-                            "peer": peer_node,
-                            "bundle_id": bundle.bundle_id,
-                            "dst": bundle.dst,
-                            "payload_type": payload_type(bundle),
-                            "local_predictability": local_score,
-                            "peer_predictability": peer_score,
-                            "epsilon": self.epsilon,
-                        }
-                    )
+                is_prophet_forward = peer_score > local_score + self.epsilon
+                in_initial_spray   = self._remaining_spray(bundle) > 0
+
+                if direct or role_boost or is_prophet_forward or in_initial_spray:
+                    selected.append((
+                        self._priority_tuple(bundle, peer_score),
+                        bundle, local_score, peer_score, direct,
+                    ))
 
             selected = sorted(selected, key=lambda item: item[0])[: self.max_bundles_per_exchange]
             bundles: List[Bundle] = []
 
             for _priority, bundle, local_score, peer_score, direct in selected:
                 bundles.append(bundle)
-                if not direct:
+                if not direct and self._role_prior(bundle, peer_node) == 0.0:
                     self._forwarded_to.setdefault(bundle.bundle_id, set()).add(peer_node)
-                self.record_event(
-                    {
-                        "event": "prophet_forwarded",
-                        "peer": peer_node,
-                        "bundle_id": bundle.bundle_id,
-                        "dst": bundle.dst,
-                        "payload_type": payload_type(bundle),
-                        "local_predictability": local_score,
-                        "peer_predictability": peer_score,
-                        "direct_delivery": direct,
-                        "role_prior": self._role_prior(bundle, peer_node),
-                    }
-                )
+                self.record_event({
+                    "event":                "prophet_forwarded",
+                    "peer":                 peer_node,
+                    "bundle_id":            bundle.bundle_id,
+                    "dst":                  bundle.dst,
+                    "payload_type":         payload_type(bundle),
+                    "local_predictability": local_score,
+                    "peer_predictability":  peer_score,
+                    "direct_delivery":      direct,
+                    "role_prior":           self._role_prior(bundle, peer_node),
+                    "remaining_spray":      self._remaining_spray(bundle),
+                })
 
             self._save_state()
 
         return bundles
 
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 def main() -> None:
     args = parse_args()

@@ -48,7 +48,7 @@ class MeshPayRuntime:
         root_dir: str | Path,
         discovery_interval: float = dtn_config.DEFAULT_DISCOVERY_INTERVAL,
         payment_poll_interval: float = dtn_config.DEFAULT_PAYMENT_POLL_INTERVAL,
-        medium: str = "adhoc",
+        medium: str = "mesh",
         bundle_ttl: float = 900.0,
     ) -> None:
         self.net = net

@@ -252,11 +252,6 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated transmission ranges.",
     )
     parser.add_argument(
-        "--accounts",
-        default="10,20",
-        help="Comma-separated virtual accounts per station.",
-    )
-    parser.add_argument(
         "--total-virtual-accounts",
         default=None,
         help=(
@@ -345,7 +340,6 @@ def parse_args() -> argparse.Namespace:
     args.clients = parse_int_list(args.clients, "--clients")
     args.authorities = parse_int_list(args.authorities, "--authorities")
     args.ranges = parse_float_list(args.ranges, "--ranges")
-    args.accounts = parse_int_list(args.accounts, "--accounts")
     if args.total_virtual_accounts is not None:
         args.total_virtual_accounts = parse_int_list(
             args.total_virtual_accounts,
@@ -447,12 +441,13 @@ def build_specs(args: argparse.Namespace) -> list[RunSpec]:
     specs = []
     run_index = 1
 
-    account_values = args.total_virtual_accounts or args.accounts
+    total_accounts_list = args.total_virtual_accounts if args.total_virtual_accounts is not None else [None]
+
     matrix = itertools.product(
         args.clients,
         args.authorities,
         args.ranges,
-        account_values,
+        total_accounts_list,
         args.speeds,
         args.payment_rate,
         args.routing,
@@ -469,7 +464,7 @@ def build_specs(args: argparse.Namespace) -> list[RunSpec]:
         routing,
         attack_loss_probability,
     ) in matrix:
-        if args.total_virtual_accounts is not None:
+        if account_value is not None:
             if account_value % clients != 0:
                 raise SystemExit(
                     f"total virtual accounts {account_value} must be divisible by "
@@ -477,7 +472,7 @@ def build_specs(args: argparse.Namespace) -> list[RunSpec]:
                 )
             requested_accounts_per_station = account_value // clients
         else:
-            requested_accounts_per_station = account_value
+            requested_accounts_per_station = 100
 
         duration = (
             compute_auto_duration(

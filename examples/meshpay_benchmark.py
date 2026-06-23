@@ -606,18 +606,13 @@ def configure_mobility(
         seed=config.seed,
     )
 
-
 def run_payment_traffic(
     runtime: MeshPayRuntime,
     clients,
     config: MeshPayBenchmarkConfig,
     attack_controller: BenchmarkAttack | None = None,
 ) -> tuple[float, float]:
-    """Generate payments between virtual accounts.
-
-    Physical stations are still sta1, sta2, ...
-    Logical accounts are sta1/u00001, sta1/u00002, ...
-    """
+    """Generate payments between virtual accounts based on time and rate."""
 
     rng = random.Random(config.seed)
 
@@ -638,13 +633,20 @@ def run_payment_traffic(
     if len(all_accounts) < 2:
         raise ValueError("Need at least two virtual accounts")
 
+    # Set traffic to run for the full benchmark duration (no tail)
+    if config.attack != "none":
+        traffic_duration = min(config.duration, config.attack_tpre + config.attack_tatk + config.attack_tpost)
+    else:
+        traffic_duration = config.duration
+
     info(f"*** Physical client stations: {len(clients)}\n")
     info(f"*** Accounts per station:    {config.accounts_per_station}\n")
     info(f"*** Total virtual accounts:  {len(all_accounts)}\n")
-    info(f"*** Requested payments:      {config.payments}\n")
+    info(f"*** Payment rate:            {config.payment_rate} tx/s\n")
+    info(f"*** Traffic duration:        {traffic_duration:.2f}s\n")
 
     started_at = time.time()
-    deadline = started_at + config.duration
+    traffic_deadline = started_at + traffic_duration
 
     if attack_controller is not None:
         attack_controller.start(started_at)
@@ -681,28 +683,20 @@ def run_payment_traffic(
             with traffic_lock:
                 currently_submitting.remove(sender)
 
-    max_workers = min(100, config.payments)
+    max_workers = 100
     info(f"*** Using ThreadPoolExecutor with {max_workers} workers\n")
+
+    target_payments = int(config.payment_rate * traffic_duration)
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         while True:
-            with traffic_lock:
-                if submitted_success >= config.payments:
-                    break
-                if time.time() >= deadline:
-                    break
-
-                active_tasks = len(currently_submitting)
-                if submitted_success + active_tasks >= config.payments:
-                    should_wait = True
-                else:
-                    should_wait = False
-
-            if should_wait:
-                time.sleep(0.01)
-                continue
-
             now = time.time()
+            
+            # Check if traffic generation phase is over
+            if submitted_total >= target_payments or now >= traffic_deadline:
+                break
+
+            # Enforce the target payment rate
             if now < next_submit_at:
                 time.sleep(min(next_submit_at - now, 0.05))
                 continue
@@ -742,10 +736,12 @@ def run_payment_traffic(
 
                 currently_submitting.add(sender_account)
                 submitted_total += 1
-                next_submit_at = max(
-                    next_submit_at + submit_interval,
-                    time.time() + submit_interval,
-                )
+                
+                next_submit_at += submit_interval
+                
+                # If we somehow fell massively behind (e.g. > 1 second), prevent infinite blast:
+                if next_submit_at < time.time() - 1.0:
+                    next_submit_at = time.time()
 
             executor.submit(worker_task, sender_account, recipient_account)
 
@@ -755,19 +751,12 @@ def run_payment_traffic(
         {
             "event": "payment_submission_finished",
             "submitted": submitted_success,
-            "requested": config.payments,
             "submission_duration_s": submission_finished_at - started_at,
             "physical_client_stations": len(clients),
             "accounts_per_station": config.accounts_per_station,
             "total_virtual_accounts": len(all_accounts),
         }
     )
-
-    remaining = config.duration - (submission_finished_at - started_at)
-
-    if remaining > 0:
-        info(f"*** Waiting {remaining:.2f}s for final delivery\n")
-        time.sleep(remaining)
 
     ended_at = time.time()
 
