@@ -7,9 +7,11 @@ dtn/bundle.py
 dtn/config.py
 dtn/epidemic.py
 dtn/prophet.py
+dtn/router.py
 dtn/spray_and_wait.py
 dtn/store.py
 meshpay/__init__.py
+meshpay/mininet_cmd.py
 meshpay/cli/__init__.py
 meshpay/cli/meshpay_cli.py
 meshpay/cli/oppnet_cli.py

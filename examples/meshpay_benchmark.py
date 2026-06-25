@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import shutil
 import sys
 import threading
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -37,6 +39,7 @@ from meshpay.cli.meshpay_cli import MeshPayRuntime
 from meshpay.offline.nodes.authority import Authority
 from meshpay.offline.nodes.client import Client
 from meshpay.offline.virtual_accounts import make_account_id
+from dtn import config as dtn_config
 
 DEFAULT_LOG_DIR = ROOT_DIR / "logs" / "benchmarks" / "meshpay_offline"
 
@@ -55,13 +58,14 @@ class MeshPayBenchmarkConfig:
     authorities: int
     accounts_per_station: int
     
-    payments: int
     payment_rate: float
     amount: int
     initial_balance: int
 
     duration: float
     warmup: float
+    settle_time: float
+    max_submit_workers: int
 
     seed: int
     log_dir: Path
@@ -107,9 +111,6 @@ class MeshPayBenchmarkConfig:
         if self.accounts_per_station < 1:
             raise ValueError("--accounts-per-station must be at least 1")
 
-        if self.payments < 1:
-            raise ValueError("--payments must be at least 1")
-
         if self.payment_rate <= 0:
             raise ValueError("--payment-rate must be greater than 0")
 
@@ -124,6 +125,12 @@ class MeshPayBenchmarkConfig:
 
         if self.warmup < 0:
             raise ValueError("--warmup must be >= 0")
+
+        if self.settle_time < 0:
+            raise ValueError("--settle-time must be >= 0")
+
+        if self.max_submit_workers < 1:
+            raise ValueError("--max-submit-workers must be >= 1")
 
         if self.node_range <= 0:
             raise ValueError("--node-range must be greater than 0")
@@ -215,17 +222,17 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
-        "--payments",
-        type=int,
-        default=20,
-        help="Number of payments to submit.",
-    )
-
-    parser.add_argument(
         "--payment-rate",
         type=float,
         default=1.0,
         help="Maximum payment submission rate in payments per second.",
+    )
+
+    parser.add_argument(
+        "--accounts-per-station",
+        type=int,
+        default=None,
+        help="Virtual accounts per physical client. Default: enough accounts for the requested traffic.",
     )
 
     parser.add_argument(
@@ -238,8 +245,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--initial-balance",
         type=int,
-        default=100,
-        help="Initial balance for every client.",
+        default=10000,
+        help="Initial balance for every virtual account.",
     )
 
     parser.add_argument(
@@ -253,7 +260,24 @@ def parse_args() -> argparse.Namespace:
         "--warmup",
         type=float,
         default=5.0,
-        help="Warm-up time before submitting payments.",
+        help="Seconds to wait after starting DTN daemons before submitting payments.",
+    )
+
+    parser.add_argument(
+        "--settle-time",
+        type=float,
+        default=60.0,
+        help="Drain-only seconds after traffic stops before metrics are collected.",
+    )
+
+    parser.add_argument(
+        "--max-submit-workers",
+        type=int,
+        default=0,
+        help=(
+            "Maximum concurrent payment-submission workers. "
+            "0 means min(--clients, 8)."
+        ),
     )
 
     parser.add_argument(
@@ -270,15 +294,15 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
-        "--no-clean",
-        action="store_true",
-        help="Do not delete old benchmark logs.",
-    )
-
-    parser.add_argument(
         "--keep-debug-logs",
         action="store_true",
         help="Keep daemon logs and all bundle/delivered logs (default: False/clean up to save storage).",
+    )
+
+    parser.add_argument(
+        "--no-clean",
+        action="store_true",
+        help="Do not delete the previous log directory before this run.",
     )
 
     parser.add_argument(
@@ -286,41 +310,6 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=40.0,
         help="Wireless range for each node.",
-    )
-
-    parser.add_argument(
-        "--area-width",
-        type=float,
-        default=200.0,
-        help="RandomDirection mobility area width.",
-    )
-
-    parser.add_argument(
-        "--area-height",
-        type=float,
-        default=200.0,
-        help="RandomDirection mobility area height.",
-    )
-
-    parser.add_argument(
-        "--min-velocity",
-        type=float,
-        default=0.5,
-        help="Minimum RandomDirection velocity.",
-    )
-
-    parser.add_argument(
-        "--max-velocity",
-        type=float,
-        default=2.0,
-        help="Maximum RandomDirection velocity.",
-    )
-
-    parser.add_argument(
-        "--mobility-start",
-        type=float,
-        default=1.0,
-        help="Time at which RandomDirection mobility starts.",
     )
 
     parser.add_argument(
@@ -333,13 +322,6 @@ def parse_args() -> argparse.Namespace:
         "--plot",
         action="store_true",
         help="Show Mininet-WiFi graph.",
-    )
-
-    parser.add_argument(
-        "--accounts-per-station",
-        type=int,
-        default=100,
-        help="Number of virtual logical accounts hosted by each client station.",
     )
 
     parser.add_argument(
@@ -394,27 +376,44 @@ def parse_args() -> argparse.Namespace:
 
 
 def build_config(args: argparse.Namespace) -> MeshPayBenchmarkConfig:
+    if args.attack != "none":
+        traffic_duration = min(args.duration, args.attack_tpre + args.attack_tatk + args.attack_tpost)
+    else:
+        traffic_duration = args.duration
+
+    import math
+    target_payments = math.ceil(args.payment_rate * traffic_duration)
+    if args.accounts_per_station is None:
+        accounts_per_station = max(100, math.ceil(target_payments / args.clients))
+    else:
+        accounts_per_station = int(args.accounts_per_station)
+
     config = MeshPayBenchmarkConfig(
         routing=args.routing,
         medium=args.medium,
         clients=args.clients,
         authorities=args.authorities,
-        accounts_per_station=args.accounts_per_station,
-        payments=args.payments,
+        accounts_per_station=accounts_per_station,
         payment_rate=args.payment_rate,
         amount=args.amount,
         initial_balance=args.initial_balance,
         duration=args.duration,
         warmup=args.warmup,
+        settle_time=args.settle_time,
+        max_submit_workers=(
+            int(args.max_submit_workers)
+            if int(args.max_submit_workers) > 0
+            else min(args.clients, 8)
+        ),
         seed=args.seed,
         log_dir=Path(args.log_dir),
         clean=not args.no_clean,
         node_range=args.node_range,
-        area_width=args.area_width,
-        area_height=args.area_height,
-        min_velocity=args.min_velocity,
-        max_velocity=args.max_velocity,
-        mobility_start=args.mobility_start,
+        area_width=200.0,
+        area_height=200.0,
+        min_velocity=0.5,
+        max_velocity=2.0,
+        mobility_start=1.0,
         no_mobility=args.no_mobility,
         plot=args.plot,
         attack=args.attack,
@@ -429,6 +428,7 @@ def build_config(args: argparse.Namespace) -> MeshPayBenchmarkConfig:
 
     config.validate()
     return config
+
 
 
 def prepare_log_dir(config: MeshPayBenchmarkConfig) -> Path:
@@ -633,6 +633,11 @@ def run_payment_traffic(
     if len(all_accounts) < 2:
         raise ValueError("Need at least two virtual accounts")
 
+    # Spread the first wave of submissions across physical stations.
+    # Without this, all_accounts starts as sta1/u00001, sta1/u00002, ...
+    # and the benchmark hammers one Mininet node shell with concurrent injects.
+    rng.shuffle(all_accounts)
+
     # Set traffic to run for the full benchmark duration (no tail)
     if config.attack != "none":
         traffic_duration = min(config.duration, config.attack_tpre + config.attack_tatk + config.attack_tpost)
@@ -652,7 +657,9 @@ def run_payment_traffic(
         attack_controller.start(started_at)
 
     traffic_lock = threading.Lock()
+    submit_locks = {client.name: threading.Lock() for client in clients}
     currently_submitting = set()
+    available_senders = deque(all_accounts)
     submitted_success = 0
     submitted_total = 0
     last_backpressure_log = 0.0
@@ -661,12 +668,18 @@ def run_payment_traffic(
 
     def worker_task(sender, recipient):
         nonlocal submitted_success, submitted_total
+        host = sender.split("/", 1)[0]
         try:
-            runtime.pay_account(
-                sender_account=sender,
-                recipient_account=recipient,
-                amount=config.amount,
-            )
+            # Serialise payment submission per physical source node.  A single
+            # Mininet node shell cannot safely run multiple node.cmd() calls at
+            # once, and each payment injection uses that shell to contact the
+            # in-memory DTN daemon.
+            with submit_locks[host]:
+                runtime.pay_account(
+                    sender_account=sender,
+                    recipient_account=recipient,
+                    amount=config.amount,
+                )
             with traffic_lock:
                 submitted_success += 1
         except Exception as exc:
@@ -676,14 +689,19 @@ def run_payment_traffic(
                     "sender": sender,
                     "recipient": recipient,
                     "amount": config.amount,
-                    "error": str(exc),
+                    "error": f"{type(exc).__name__}: {exc!r}",
                 }
             )
         finally:
+            client = client_by_name[host]
+            with client._lock:
+                can_reuse = client.can_pay_from(sender, config.amount)
             with traffic_lock:
-                currently_submitting.remove(sender)
+                currently_submitting.discard(sender)
+                if can_reuse:
+                    available_senders.append(sender)
 
-    max_workers = 100
+    max_workers = max(1, int(config.max_submit_workers))
     info(f"*** Using ThreadPoolExecutor with {max_workers} workers\n")
 
     target_payments = int(config.payment_rate * traffic_duration)
@@ -701,18 +719,24 @@ def run_payment_traffic(
                 time.sleep(min(next_submit_at - now, 0.05))
                 continue
 
-            eligible_senders = []
-            for account_id in all_accounts:
+            sender_account = None
+            while True:
                 with traffic_lock:
-                    if account_id in currently_submitting:
-                        continue
-                host = account_id.split("/", 1)[0]
+                    candidate = available_senders.popleft() if available_senders else None
+
+                if candidate is None:
+                    break
+
+                host = candidate.split("/", 1)[0]
                 client = client_by_name[host]
                 with client._lock:
-                    if client.can_pay_from(account_id, config.amount):
-                        eligible_senders.append(account_id)
+                    can_pay = client.can_pay_from(candidate, config.amount)
 
-            if not eligible_senders:
+                if can_pay:
+                    sender_account = candidate
+                    break
+
+            if sender_account is None:
                 now = time.time()
                 with traffic_lock:
                     if now - last_backpressure_log > 0.5:
@@ -727,18 +751,16 @@ def run_payment_traffic(
                 time.sleep(0.01)
                 continue
 
-            with traffic_lock:
-                sender_account = rng.choice(eligible_senders)
-                receiver_candidates = [
-                    acc for acc in all_accounts if acc != sender_account
-                ]
-                recipient_account = rng.choice(receiver_candidates)
+            recipient_account = rng.choice(all_accounts)
+            while recipient_account == sender_account:
+                recipient_account = rng.choice(all_accounts)
 
+            with traffic_lock:
                 currently_submitting.add(sender_account)
                 submitted_total += 1
-                
+
                 next_submit_at += submit_interval
-                
+
                 # If we somehow fell massively behind (e.g. > 1 second), prevent infinite blast:
                 if next_submit_at < time.time() - 1.0:
                     next_submit_at = time.time()
@@ -800,6 +822,32 @@ def print_summary(report: dict) -> None:
         info("avg_time_to_acceptance_ms:         None\n")
 
 
+def _set_lightweight_dtn_metric_env() -> dict[str, str | None]:
+    """Disable DTN hot-path debug files for socket-IPC benchmark mode.
+
+    Payment metrics come from the runtime's buffered payment.log, flushed before
+    collection.  Router injection and delivery use Unix-domain sockets, so
+    events.jsonl and delivered.log are no longer needed during benchmark runs.
+    """
+    names = {
+        "MESHPAY_DTN_EVENT_LOG": "0",
+        "MESHPAY_DTN_DELIVERED_LOG": "0",
+        "MESHPAY_DTN_EVENT_FILTER": "metrics",
+        "MESHPAY_SKIP_DELIVERY_RECEIPTS": "1",
+    }
+    previous = {name: os.environ.get(name) for name in names}
+    os.environ.update(names)
+    return previous
+
+
+def _restore_env(previous: dict[str, str | None]) -> None:
+    for name, value in previous.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
+
+
 def topology(config: MeshPayBenchmarkConfig) -> None:
     router_file = router_file_for(config.routing)
     prepare_log_dir(config)
@@ -839,12 +887,24 @@ def topology(config: MeshPayBenchmarkConfig) -> None:
         router_file=router_file,
         log_dir=config.log_dir,
         root_dir=ROOT_DIR,
-        payment_poll_interval=0.5,
+        payment_poll_interval=dtn_config.DEFAULT_PAYMENT_POLL_INTERVAL,
+        # Critical: keep the DTN daemon discovery mode aligned with the
+        # Mininet-WiFi link type.  Without this, --medium adhoc accidentally
+        # starts DTN routers in mesh mode, which can collapse delivery.
+        medium=config.medium,
     )
 
     attack_controller = None
 
-    if config.attack != "none":
+    # Treat packetloss with probability 0 as an explicit no-op baseline.
+    # Starting the attack controller for loss=0 only adds node.cmd()/iptables
+    # activity and can collide with payment injection threads.
+    attack_is_noop = (
+        config.attack == "packetloss"
+        and float(config.attack_loss_probability) <= 0.0
+    )
+
+    if config.attack != "none" and not attack_is_noop:
         attack_load_rate = (
             config.attack_load_rate
             if config.attack_load_rate > 0
@@ -864,9 +924,20 @@ def topology(config: MeshPayBenchmarkConfig) -> None:
             load_rate=attack_load_rate,
             seed=config.seed,
         )
+    elif attack_is_noop:
+        runtime.record_event(
+            {
+                "event": "attack_noop",
+                "attack": config.attack,
+                "reason": "packetloss_probability_zero",
+                "loss_probability": config.attack_loss_probability,
+            }
+        )
 
     started_at = time.time()
     ended_at = started_at
+
+    previous_env = _set_lightweight_dtn_metric_env()
 
     try:
         runtime.start()
@@ -875,12 +946,23 @@ def topology(config: MeshPayBenchmarkConfig) -> None:
             info(f"*** Warm-up: waiting {config.warmup:.2f}s\n")
             time.sleep(config.warmup)
 
-        started_at, ended_at = run_payment_traffic(
+        started_at, traffic_ended_at = run_payment_traffic(
             runtime=runtime,
             clients=clients,
             config=config,
             attack_controller=attack_controller,
         )
+
+        if config.settle_time > 0:
+            info(f"*** DTN settle/drain: waiting {config.settle_time:.2f}s after traffic stops\n")
+            time.sleep(config.settle_time)
+
+        ended_at = time.time()
+
+        # Runtime records payment events in memory to avoid payment.log writes
+        # on the hot path.  Flush once before the existing metrics collector
+        # reads payment.log.
+        runtime.flush_payment_log()
 
         report = collect_payment_metrics(
             log_dir=config.log_dir,
@@ -891,7 +973,9 @@ def topology(config: MeshPayBenchmarkConfig) -> None:
         report["config"] = config.to_dict()
         report["timing"] = {
             "started_at": started_at,
+            "traffic_ended_at": traffic_ended_at,
             "ended_at": ended_at,
+            "settle_time_s": config.settle_time,
         }
 
         if attack_controller is not None:
@@ -905,6 +989,8 @@ def topology(config: MeshPayBenchmarkConfig) -> None:
         info(f"*** CSV:  {config.log_dir / 'benchmark.csv'}\n")
 
     finally:
+        _restore_env(previous_env)
+
         if attack_controller is not None:
             attack_controller.cleanup()
 
@@ -929,7 +1015,8 @@ def cleanup_logs(config: MeshPayBenchmarkConfig) -> None:
             except Exception as e:
                 info(f"Failed to delete daemon log {p}: {e}\n")
 
-    # 2. Delete all bundle stores files (.json, .txt, .log) except events.jsonl
+    # 2. Delete lightweight store metric logs after reports are written.
+    #    No bundle JSON files are expected in the refactored in-memory store.
     stores_dir = log_dir / "stores"
     if stores_dir.exists():
         for p in stores_dir.rglob("*"):

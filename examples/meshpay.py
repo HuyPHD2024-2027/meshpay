@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -159,6 +160,26 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=100,
         help="Number of virtual logical accounts hosted by each client station.",
+    )
+
+    parser.add_argument(
+        "--no-dtn-metric-logs",
+        action="store_true",
+        help=(
+            "Disable lightweight DTN events.jsonl/delivered.log files. "
+            "Bundles still remain in memory; disabling this mainly affects "
+            "the interactive dtnlog/delivered/metrics commands."
+        ),
+    )
+
+    parser.add_argument(
+        "--dtn-event-filter",
+        default="metrics",
+        choices=["metrics", "all"],
+        help=(
+            "Which DTN events to write when lightweight metric logs are enabled. "
+            "Use 'metrics' for low overhead, or 'all' for debugging."
+        ),
     )
     
     return parser.parse_args()
@@ -372,6 +393,45 @@ def configure_mobility(net: Mininet_wifi, args: argparse.Namespace) -> None:
     )
 
 
+def _set_lightweight_dtn_env(args: argparse.Namespace) -> dict[str, str | None]:
+    """Configure child router daemons for the lightweight in-memory DTN store.
+
+    Bundles are not written as ``<bundle_id>.json`` files.  The optional
+    metrics logs are tiny append-only files used by the interactive CLI commands
+    and by the same metric collectors used in benchmark mode.
+    """
+    desired = {
+        # Backward compatible with the older store.py implementation.
+        "MESHPAY_PERSIST_BUNDLES": "0",
+        # Do not create delivered-<bundle_id>.txt marker files.
+        "MESHPAY_SKIP_DELIVERY_RECEIPTS": "1",
+    }
+
+    if args.no_dtn_metric_logs:
+        desired.update({
+            "MESHPAY_DTN_EVENT_LOG": "0",
+            "MESHPAY_DTN_DELIVERED_LOG": "0",
+        })
+    else:
+        desired.update({
+            "MESHPAY_DTN_EVENT_LOG": "1",
+            "MESHPAY_DTN_DELIVERED_LOG": "1",
+            "MESHPAY_DTN_EVENT_FILTER": args.dtn_event_filter,
+        })
+
+    previous = {name: os.environ.get(name) for name in desired}
+    os.environ.update(desired)
+    return previous
+
+
+def _restore_env(previous: dict[str, str | None]) -> None:
+    for name, value in previous.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
+
+
 def topology(args: argparse.Namespace) -> None:
     router_file = router_file_for(args.routing)
     log_dir = prepare_log_dir(args.log_dir)
@@ -414,7 +474,17 @@ def topology(args: argparse.Namespace) -> None:
         medium=args.medium,
     )
 
+    previous_env = _set_lightweight_dtn_env(args)
+
     try:
+        if args.no_dtn_metric_logs:
+            info("*** DTN store: in-memory bundles; metric logs disabled\n")
+        else:
+            info(
+                "*** DTN store: in-memory bundles; "
+                f"lightweight metric logs enabled ({args.dtn_event_filter})\n"
+            )
+
         runtime.start()
 
         info("\n*** MeshPay offline interactive demo is ready\n")
@@ -438,6 +508,7 @@ def topology(args: argparse.Namespace) -> None:
         )
 
     finally:
+        _restore_env(previous_env)
         runtime.stop()
         info("*** Stopping network\n")
         net.stop()

@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 
 from __future__ import annotations
-from chardet import langbulgarianmodel
-from IPython.core import payload
 
+import hashlib
 import json
+import os
 import shlex
+import socket
 import threading
 import time
 from pathlib import Path
@@ -17,6 +18,7 @@ from mn_wifi.cli import CLI
 from dtn import config as dtn_config
 from meshpay.benchmark.payment_metrics import collect_payment_metrics
 from meshpay.offline.virtual_accounts import account_host
+from meshpay.mininet_cmd import safe_node_cmd, node_cmd_lock
 
 from meshpay.offline.dtn_adapter import DTNAdapter
 from meshpay.types.transaction import (
@@ -31,8 +33,8 @@ class MeshPayRuntime:
 
     Responsibilities:
         - start/stop one Epidemic Routing daemon per node
-        - inject MeshPay payment payloads into DTN
-        - poll delivered.log for payment payloads
+        - inject MeshPay payment payloads into DTN through Unix control sockets
+        - receive delivered payment payloads through a Unix delivery socket
         - call Client/Authority protocol handlers
         - inject outgoing response payloads
     """
@@ -77,17 +79,89 @@ class MeshPayRuntime:
         self.started_at: Optional[float] = None
 
         self.payment_log = self.log_dir / "payment.log"
-        self._log_lock = threading.Lock()
+        self._log_lock = threading.RLock()
+        self._payment_events: list[dict] = []
+        self._payment_log_flushed = 0
+        # Keep payment.log out of the hot path by default, but make it
+        # possible to get a live-ish log for long interactive runs without
+        # restoring per-event writes. 0 means flush only on explicit calls
+        # such as metrics/paymentlog/benchmark-finalization/stop.
+        self._payment_log_flush_events = max(
+            0,
+            int(os.environ.get("MESHPAY_PAYMENT_LOG_FLUSH_EVENTS", "0")),
+        )
+
+        self.socket_dir = self._make_socket_dir()
+        self.delivery_socket = self.socket_dir / "delivery.sock"
+        self.delivery_thread: Optional[threading.Thread] = None
+        self._delivery_server: Optional[socket.socket] = None
+        self._node_by_name = {node.name: node for node in self.nodes}
+
+        # Mininet node.cmd() is not thread-safe.  Use the shared per-node
+        # command lock from meshpay.mininet_cmd so payment injection, attack
+        # controller code, debug commands, and cleanup all serialize access to
+        # the same Mininet node shell.
+        self._node_cmd_locks: dict[str, threading.RLock] = {
+            node.name: node_cmd_lock(node)
+            for node in self.nodes
+        }
 
     def start(self) -> None:
         self.started_at = time.time()
+        self.running = True
+        # Create payment.log immediately for compatibility with existing
+        # CLI/benchmark tooling.  Events are still buffered and flushed in
+        # batches, so this does not reintroduce hot-path file I/O.
+        self.ensure_payment_log()
+        self.start_delivery_listener()
         self.start_dtn_routers()
         time.sleep(2)
-        self.start_payment_loop()
 
     def stop(self) -> None:
-        self.stop_payment_loop()
+        self.running = False
+        self.flush_payment_log()
+        self.stop_delivery_listener()
         self.stop_dtn_routers()
+        self.cleanup_ipc_sockets()
+
+    def _make_socket_dir(self) -> Path:
+        """Return a short filesystem path for Unix-domain IPC sockets.
+
+        Linux limits AF_UNIX pathname sockets to about 108 bytes. Benchmark
+        log directories are often deeply nested, for example under
+        logs/benchmarks/scripts/<long-run-name>/..., so placing sockets inside
+        log_dir can fail with ``OSError: AF_UNIX path too long``. Keep the
+        socket directory under /tmp and use the long log_dir only for logs.
+        """
+        override = os.environ.get("MESHPAY_SOCKET_DIR") or os.environ.get("MESHPAY_IPC_DIR")
+        if override:
+            return Path(override)
+
+        digest = hashlib.sha1(str(self.log_dir.resolve()).encode("utf-8")).hexdigest()[:10]
+        return Path("/tmp") / f"meshpay-{os.getpid()}-{digest}"
+
+    def prepare_ipc_sockets(self) -> None:
+        self.socket_dir.mkdir(parents=True, exist_ok=True)
+        for path in [self.delivery_socket, *[self.control_socket_for(node.name) for node in self.nodes]]:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+
+    def cleanup_ipc_sockets(self) -> None:
+        for path in [self.delivery_socket, *[self.control_socket_for(node.name) for node in self.nodes]]:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+        try:
+            self.socket_dir.rmdir()
+        except OSError:
+            pass
 
     def wireless_iface_for(self, node) -> str:
         wlans = getattr(node, "params", {}).get("wlan")
@@ -137,7 +211,7 @@ class MeshPayRuntime:
 
     def node_mac(self, node) -> str:
         iface = self.wireless_iface_for(node)
-        mac = self.clean_mac(node.cmd(f"cat /sys/class/net/{shlex.quote(iface)}/address").strip())
+        mac = self.clean_mac(self.node_cmd(node, f"cat /sys/class/net/{shlex.quote(iface)}/address").strip())
 
         if mac:
             return mac
@@ -186,6 +260,50 @@ class MeshPayRuntime:
 
         return " ".join(args)
 
+    def node_cmd(self, node, cmd: str) -> str:
+        """Run node.cmd() under a per-node lock.
+
+        Mininet's node shell asserts when two threads use node.cmd() on the
+        same node at the same time.  This helper is intentionally narrow: it
+        protects shell-command based control actions such as one-shot DTN
+        injection and debug log reads.
+        """
+        lock = self._node_cmd_locks.setdefault(node.name, node_cmd_lock(node))
+        with lock:
+            return safe_node_cmd(node, cmd)
+
+    def dtn_env(self) -> dict[str, str]:
+        """Environment inherited by DTN daemons.
+
+        Benchmark hot-path delivery uses Unix sockets, so DTN event files and
+        delivered.log are disabled by default.  Enable them only for debugging.
+        """
+        return {
+            "PYTHONPATH": str(self.root_dir),
+            "MESHPAY_PERSIST_BUNDLES": os.environ.get("MESHPAY_PERSIST_BUNDLES", "0"),
+            "MESHPAY_SKIP_DELIVERY_RECEIPTS": os.environ.get("MESHPAY_SKIP_DELIVERY_RECEIPTS", "1"),
+            "MESHPAY_DTN_EVENT_LOG": os.environ.get("MESHPAY_DTN_EVENT_LOG", "0"),
+            "MESHPAY_DTN_DELIVERED_LOG": os.environ.get("MESHPAY_DTN_DELIVERED_LOG", "0"),
+            "MESHPAY_DTN_EVENT_FILTER": os.environ.get("MESHPAY_DTN_EVENT_FILTER", "metrics"),
+        }
+
+    def shell_env_prefix(self, env: dict[str, str]) -> str:
+        return " ".join(
+            f"{key}={shlex.quote(str(value))}"
+            for key, value in sorted(env.items())
+            if value is not None
+        )
+
+    @staticmethod
+    def bundle_id_from_inject_output(output: str) -> Optional[str]:
+        marker = "Injected bundle="
+        for line in output.splitlines():
+            if marker not in line:
+                continue
+            tail = line.split(marker, 1)[1]
+            return tail.split(None, 1)[0].strip() or None
+        return None
+
     def start_dtn_routers(self) -> None:
         info(f"*** Starting MeshPay DTN routing: {self.routing}\n")
         info(f"*** DTN neighbour discovery mode: {self.medium}\n")
@@ -196,17 +314,21 @@ class MeshPayRuntime:
             store = self.store_for(node.name)
             log_file = self.dtn_log_for(node.name)
 
-            node.cmd(f"rm -rf {shlex.quote(str(store))}")
-            node.cmd(f"mkdir -p {shlex.quote(str(store))}")
+            self.node_cmd(node, f"rm -rf {shlex.quote(str(store))}")
+            self.node_cmd(node, f"mkdir -p {shlex.quote(str(store))}")
 
             wireless_iface = self.wireless_iface_for(node)
             peer_args = self.peer_args_for(node, peer_table)
 
+            env_prefix = self.shell_env_prefix(self.dtn_env())
+
             cmd = (
-                f"PYTHONPATH={shlex.quote(str(self.root_dir))} "
+                f"{env_prefix} "
                 f"python3 {shlex.quote(str(self.router_file))} "
                 f"--node {shlex.quote(node.name)} "
                 f"--store {shlex.quote(str(store))} "
+                f"--control-socket {shlex.quote(str(self.control_socket_for(node.name)))} "
+                f"--delivery-socket {shlex.quote(str(self.delivery_socket))} "
                 f"--discovery-mode {shlex.quote(self.medium)} "
                 f"--wireless-iface {shlex.quote(wireless_iface)} "
                 f"{peer_args} "
@@ -226,6 +348,7 @@ class MeshPayRuntime:
             info(f"*** {node.name}: {self.routing} daemon started\n")
             info(f"***     store={store}\n")
             info(f"***     log={log_file}\n")
+            info(f"***     control-socket={self.control_socket_for(node.name)}\n")
             info(f"***     discovery={self.medium} iface={wireless_iface} peers={len(peer_table) - 1}\n")
 
     def stop_dtn_routers(self) -> None:
@@ -248,29 +371,109 @@ class MeshPayRuntime:
 
         for node in self.nodes:
             for pattern in router_patterns:
-                node.cmd(f"pkill -f {shlex.quote(pattern)} || true")
+                self.node_cmd(node, f"pkill -f {shlex.quote(pattern)} || true")
 
         self.processes = []
 
-    def start_payment_loop(self) -> None:
-        if self.payment_thread is not None:
+    def start_delivery_listener(self) -> None:
+        """Start runtime delivery event listener.
+
+        Routers connect to this Unix-domain socket whenever a bundle is
+        delivered locally.  This replaces delivered.log polling in the payment
+        hot path.
+        """
+        if self.delivery_thread is not None:
             return
 
-        self.running = True
-        self.payment_thread = threading.Thread(
-            target=self._payment_loop,
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.prepare_ipc_sockets()
+
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(str(self.delivery_socket))
+        server.listen(512)
+        server.settimeout(1.0)
+        self._delivery_server = server
+
+        self.delivery_thread = threading.Thread(
+            target=self._delivery_listener_loop,
             daemon=True,
         )
-        self.payment_thread.start()
+        self.delivery_thread.start()
+        info(f"*** MeshPay IPC socket dir: {self.socket_dir}\n")
+        info(f"*** MeshPay delivery socket listening: {self.delivery_socket}\n")
 
-        info("*** MeshPay payment loop started\n")
+    def stop_delivery_listener(self) -> None:
+        if self._delivery_server is not None:
+            try:
+                self._delivery_server.close()
+            except Exception:
+                pass
+            self._delivery_server = None
+
+        # Wake accept() if it is blocked.
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                s.settimeout(0.1)
+                s.connect(str(self.delivery_socket))
+        except Exception:
+            pass
+
+        if self.delivery_thread is not None:
+            self.delivery_thread.join(timeout=2.0)
+            self.delivery_thread = None
+
+        try:
+            self.delivery_socket.unlink()
+        except Exception:
+            pass
+
+    def start_payment_loop(self) -> None:
+        """Backward-compatible alias; delivery now arrives through IPC."""
+        self.start_delivery_listener()
 
     def stop_payment_loop(self) -> None:
-        self.running = False
+        self.stop_delivery_listener()
 
-        if self.payment_thread is not None:
-            self.payment_thread.join(timeout=2.0)
-            self.payment_thread = None
+    def _delivery_listener_loop(self) -> None:
+        while self.running:
+            server = self._delivery_server
+            if server is None:
+                return
+            try:
+                conn, _addr = server.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            except Exception as exc:
+                self.record_event({"event": "delivery_listener_error", "error": f"{type(exc).__name__}: {exc!r}"})
+                continue
+            threading.Thread(target=self._handle_delivery_conn, args=(conn,), daemon=True).start()
+
+    def _handle_delivery_conn(self, conn: socket.socket) -> None:
+        try:
+            with conn:
+                f = conn.makefile("r")
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if event.get("type") != "delivered_bundle":
+                        continue
+                    node_name = str(event.get("node", ""))
+                    node = self._node_by_name.get(node_name)
+                    payload = event.get("payload")
+                    if node is None or not isinstance(payload, dict):
+                        continue
+                    if payload.get("app") != "meshpay.offline":
+                        continue
+                    self.handle_payment_payload(node, payload)
+        except Exception as exc:
+            self.record_event({"event": "delivery_handler_error", "error": f"{type(exc).__name__}: {exc!r}"})
 
     def pay(self, src_name: str, dst_name: str, amount: int) -> None:
         """Interactive payment between physical station accounts.
@@ -339,25 +542,19 @@ class MeshPayRuntime:
             )
 
     def inject_payload(self, src_name: str, dst_name: str, payload: dict) -> None:
-        """Inject one MeshPay payload directly into the source DTN store.
+        """Inject one MeshPay payload into the running source DTN daemon.
 
-        Writes the bundle JSON file atomically (tmp + os.replace) directly
-        into the store directory. The running router daemon discovers new
-        files via filesystem mtime checks — no BundleStore instance needed.
-
-        This avoids the overhead of instantiating a full BundleStore (cache
-        rebuild, confirmed-order scan, etc.) on every injection call, which
-        was a major bottleneck at high TPS.
+        This uses a Unix-domain control socket in the node's store directory.
+        It avoids per-bundle node.cmd(), avoids one Python subprocess per
+        bundle, and avoids inbox.jsonl file polling.
         """
-
-        import os as _os
 
         from dtn.bundle import Bundle
 
-        store_path = self.store_for(src_name)
-        store_path.mkdir(parents=True, exist_ok=True)
-
+        src_node = self.net.get(src_name)
         payload = self.add_routing_hints(payload)
+        payload_json = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+        payload_size_bytes = len(payload_json.encode("utf-8"))
 
         bundle = Bundle.create(
             src=src_name,
@@ -365,48 +562,24 @@ class MeshPayRuntime:
             payload=payload,
             ttl=self.bundle_ttl,
         )
+        bundle_id = bundle.bundle_id
 
-        # Write bundle JSON atomically — the router daemon will pick it up
-        # via _refresh_cache_if_needed_unlocked() on the next store.all().
-        bundle_data = bundle.to_dict()
-        bundle_file = store_path / f"{bundle.bundle_id}.json"
-        tmp_file = store_path / f"{bundle.bundle_id}.json.tmp"
-
-        with tmp_file.open("w", encoding="utf-8") as f:
-            json.dump(bundle_data, f, sort_keys=True)
-            f.write("\n")
-
-        _os.replace(tmp_file, bundle_file)
-
-        payload_json = json.dumps(payload, sort_keys=True)
-        payload_size_bytes = len(payload_json.encode("utf-8"))
-
-        # Append creation event directly to the store's events.jsonl.
-        events_log = store_path / "events.jsonl"
-        event_record = json.dumps(
-            {
-                "event": "created",
-                "node": src_name,
-                "bundle_id": bundle.bundle_id,
-                "src": src_name,
-                "dst": dst_name,
-                "size_bytes": bundle.size_bytes,
-                "payload": payload,
-                "time": time.time(),
-            },
-            sort_keys=True,
+        response = self._send_control_message(
+            src_name,
+            {"type": "inject", "bundle": bundle.to_dict()},
         )
-        with events_log.open("a", encoding="utf-8") as f:
-            f.write(event_record + "\n")
+        if not response or response.get("type") != "inject_ack":
+            raise RuntimeError(f"invalid DTN inject response from {src_name}: {response!r}")
+        if not response.get("stored") and response.get("error"):
+            raise RuntimeError(f"DTN inject failed on {src_name}: {response.get('error')}")
 
         sender = None
         recipient = None
         amount = None
         try:
-            source_node = self.net.get(src_name)
             obj = DTNAdapter.from_payload(
                 payload,
-                order_lookup=self.order_lookup_for_node(source_node),
+                order_lookup=self.order_lookup_for_node(src_node),
             )
             if isinstance(obj, TransferOrder):
                 sender = obj.sender
@@ -424,13 +597,46 @@ class MeshPayRuntime:
                 "event": "payload_injected",
                 "src": src_name,
                 "dst": dst_name,
-                "bundle_id": bundle.bundle_id,
+                "bundle_id": bundle_id,
                 "payload_type": payload.get("type"),
                 "payload_size_bytes": payload_size_bytes,
                 "sender": sender,
                 "recipient": recipient,
                 "amount": amount,
+                "injection_mode": "unix_control_socket",
             }
+        )
+
+    def _send_control_message(self, node_name: str, message: dict, retries: int = 20) -> dict:
+        socket_path = self.control_socket_for(node_name)
+        line = json.dumps(message, separators=(",", ":"), sort_keys=True) + "\n"
+        last_error: Optional[Exception] = None
+
+        for attempt in range(retries):
+            try:
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+                    conn.settimeout(2.0)
+                    conn.connect(str(socket_path))
+                    conn.sendall(line.encode("utf-8"))
+                    data = b""
+                    while not data.endswith(b"\n"):
+                        chunk = conn.recv(65536)
+                        if not chunk:
+                            break
+                        data += chunk
+                if not data:
+                    return {}
+                return json.loads(data.decode("utf-8"))
+            except (FileNotFoundError, ConnectionRefusedError) as exc:
+                last_error = exc
+                time.sleep(min(0.05 * (attempt + 1), 0.5))
+            except Exception as exc:
+                last_error = exc
+                break
+
+        raise RuntimeError(
+            f"could not inject into DTN daemon for {node_name} via {socket_path}: "
+            f"{type(last_error).__name__}: {last_error!r}"
         )
 
     def add_routing_hints(self, payload: dict) -> dict:
@@ -477,6 +683,9 @@ class MeshPayRuntime:
     def store_for(self, node_name: str) -> Path:
         return self.log_dir / "stores" / self.routing / node_name
 
+    def control_socket_for(self, node_name: str) -> Path:
+        return self.socket_dir / f"{node_name}.sock"
+
     def dtn_log_for(self, node_name: str) -> Path:
         return self.log_dir / f"{node_name}-{self.routing}.log"
 
@@ -493,7 +702,7 @@ class MeshPayRuntime:
                         {
                             "event": "payment_loop_error",
                             "node": node.name,
-                            "error": str(exc),
+                            "error": f"{type(exc).__name__}: {exc!r}",
                         }
                     )
 
@@ -715,14 +924,51 @@ class MeshPayRuntime:
 
             return
 
+    def ensure_payment_log(self) -> None:
+        """Create the compatibility payment.log file if it does not exist.
+
+        The socket-IPC implementation keeps payment events in memory and flushes
+        them explicitly.  Some scripts and interactive users nevertheless expect
+        the file path to exist as soon as the runtime starts.
+        """
+        self.payment_log.parent.mkdir(parents=True, exist_ok=True)
+        self.payment_log.touch(exist_ok=True)
+
     def record_event(self, event: dict) -> None:
+        """Record a payment event in memory.
+
+        This keeps payment.log writes out of the per-payment hot path. Existing
+        metrics tooling is preserved by flushing before metrics/paymentlog and at
+        benchmark finalization. Set MESHPAY_PAYMENT_LOG_FLUSH_EVENTS=N to flush
+        every N buffered events during long interactive/debug runs.
+        """
         event = dict(event)
         event.setdefault("time", time.time())
 
         with self._log_lock:
-            self.payment_log.parent.mkdir(parents=True, exist_ok=True)
-            with self.payment_log.open("a", encoding="utf-8") as f:
+            self._payment_events.append(event)
+            if (
+                self._payment_log_flush_events > 0
+                and len(self._payment_events) - self._payment_log_flushed
+                >= self._payment_log_flush_events
+            ):
+                self._flush_payment_log_locked()
+
+    def _flush_payment_log_locked(self) -> None:
+        pending = self._payment_events[self._payment_log_flushed :]
+        if not pending:
+            self.ensure_payment_log()
+            return
+
+        self.payment_log.parent.mkdir(parents=True, exist_ok=True)
+        with self.payment_log.open("a", encoding="utf-8") as f:
+            for event in pending:
                 f.write(json.dumps(event, sort_keys=True) + "\n")
+        self._payment_log_flushed = len(self._payment_events)
+
+    def flush_payment_log(self) -> None:
+        with self._log_lock:
+            self._flush_payment_log_locked()
 
     @staticmethod
     def object_order_id(obj) -> Optional[str]:
@@ -811,7 +1057,7 @@ class MeshPayCLI(CLI):
                 amount=amount,
             )
         except Exception as exc:
-            error(f"*** Virtual payment failed: {exc}\n")
+            error(f"*** Virtual payment failed: {type(exc).__name__}: {exc!r}\n")
 
     def do_pay(self, line: str) -> None:
         """Create an offline payment.
@@ -842,7 +1088,7 @@ class MeshPayCLI(CLI):
         try:
             self.runtime.pay(src, dst, amount)
         except Exception as exc:
-            error(f"*** Payment failed: {exc}\n")
+            error(f"*** Payment failed: {type(exc).__name__}: {exc!r}\n")
 
     def do_accounts(self, line: str) -> None:
         """Show virtual accounts hosted by client stations.
@@ -971,6 +1217,11 @@ class MeshPayCLI(CLI):
                 error("*** Usage: paymentlog [lines]\n")
                 return
 
+        # Payment events are buffered in memory to keep the payment hot path
+        # fast.  The interactive command must flush before reading the
+        # compatibility payment.log file, otherwise it shows a stale snapshot.
+        self.runtime.flush_payment_log()
+
         path = self.runtime.payment_log
 
         info(f"\n===== payment log: {path} =====\n")
@@ -990,6 +1241,12 @@ class MeshPayCLI(CLI):
         Usage:
             metrics
         """
+
+        # Payment events are buffered in memory during normal operation.
+        # Flush before using the existing file-based metrics collector so the
+        # interactive metrics command reflects all events already processed by
+        # the runtime and delivery socket.
+        self.runtime.flush_payment_log()
 
         started_at = self.runtime.started_at or time.time()
         report = collect_payment_metrics(
@@ -1053,7 +1310,8 @@ class MeshPayCLI(CLI):
 
             info(f"\n===== {node_name} DTN log =====\n")
 
-            output = self.mn.get(node_name).cmd(
+            output = self.runtime.node_cmd(
+                self.mn.get(node_name),
                 f"test -f {shlex.quote(str(log_file))} "
                 f"&& tail -n 40 {shlex.quote(str(log_file))} "
                 f"|| true"
@@ -1088,7 +1346,8 @@ class MeshPayCLI(CLI):
 
             info(f"\n===== {node_name} delivered.log =====\n")
 
-            output = self.mn.get(node_name).cmd(
+            output = self.runtime.node_cmd(
+                self.mn.get(node_name),
                 f"test -f {shlex.quote(str(delivered_log))} "
                 f"&& tail -n 40 {shlex.quote(str(delivered_log))} "
                 f"|| true"

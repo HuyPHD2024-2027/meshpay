@@ -61,6 +61,7 @@ class RunSpec:
     attack_load_rate: float
     keep_debug_logs: bool
     run_index: int
+    plot: bool
 
     @property
     def run_id(self) -> str:
@@ -293,6 +294,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mobility-start", type=float, default=1.0)
     parser.add_argument("--no-mobility", action="store_true", help="Disable mobility for all runs.")
     parser.add_argument("--output-root", default=str(DEFAULT_OUTPUT_ROOT))
+    parser.add_argument("--plot", action="store_true", help="Show Mininet-WiFi graph.")
 
     parser.add_argument(
         "--attack",
@@ -426,14 +428,10 @@ def compute_auto_duration(
     """Compute duration without a separate payment-count control."""
     if attack == "none":
         base = 60.0
-        propagation_margin = 120.0
     else:
         base = attack_tpre + attack_tatk + attack_tpost
-        propagation_margin = max(120.0, attack_tpost + 60.0)
-
-    # Higher offered rates create more bundles, so leave a modest extra
-    # observation tail for epidemic exchanges without changing injection rate.
-    propagation_margin = max(propagation_margin, min(300.0, payment_rate * 0.5))
+        
+    propagation_margin = 60
     return math.ceil((base + propagation_margin) / 10.0) * 10.0
 
 
@@ -464,16 +462,6 @@ def build_specs(args: argparse.Namespace) -> list[RunSpec]:
         routing,
         attack_loss_probability,
     ) in matrix:
-        if account_value is not None:
-            if account_value % clients != 0:
-                raise SystemExit(
-                    f"total virtual accounts {account_value} must be divisible by "
-                    f"clients {clients}"
-                )
-            requested_accounts_per_station = account_value // clients
-        else:
-            requested_accounts_per_station = 100
-
         duration = (
             compute_auto_duration(
                 payment_rate=payment_rate,
@@ -485,6 +473,7 @@ def build_specs(args: argparse.Namespace) -> list[RunSpec]:
             if args.duration == "auto"
             else args.duration
         )
+
         traffic_duration = traffic_generation_duration(
             duration=duration,
             attack=args.attack,
@@ -493,10 +482,8 @@ def build_specs(args: argparse.Namespace) -> list[RunSpec]:
             attack_tpost=args.attack_tpost,
         )
         derived_payments = derive_payment_count(payment_rate, traffic_duration)
-        accounts_per_station = max(
-            requested_accounts_per_station,
-            math.ceil(derived_payments / clients),
-        )
+        accounts_per_station = math.ceil(derived_payments / clients)
+
         total_accounts = clients * accounts_per_station
 
         specs.append(
@@ -520,6 +507,7 @@ def build_specs(args: argparse.Namespace) -> list[RunSpec]:
                 mobility_start=args.mobility_start,
                 no_mobility=args.no_mobility,
                 attack=args.attack,
+                plot=args.plot,
                 attack_loss_probability=attack_loss_probability,
                 attack_tpre=args.attack_tpre,
                 attack_tatk=args.attack_tatk,
@@ -552,32 +540,12 @@ def command_for(spec: RunSpec, run_dir: Path, use_sudo: bool) -> list[str]:
             str(spec.clients),
             "--authorities",
             str(spec.authorities),
-            "--accounts-per-station",
-            str(spec.accounts_per_station),
             "--payment-rate",
             str(spec.payment_rate),
-            "--amount",
-            str(spec.amount),
-            "--initial-balance",
-            str(spec.initial_balance),
             "--duration",
             str(spec.duration),
-            "--warmup",
-            str(spec.warmup),
-            "--seed",
-            str(spec.seed),
             "--node-range",
             str(spec.node_range),
-            "--area-width",
-            str(spec.area_width),
-            "--area-height",
-            str(spec.area_height),
-            "--min-velocity",
-            str(spec.speed.min_velocity),
-            "--max-velocity",
-            str(spec.speed.max_velocity),
-            "--mobility-start",
-            str(spec.mobility_start),
             "--log-dir",
             str(run_dir),
         ]
@@ -585,6 +553,9 @@ def command_for(spec: RunSpec, run_dir: Path, use_sudo: bool) -> list[str]:
 
     if spec.no_mobility:
         command.append("--no-mobility")
+
+    if spec.plot:
+        command.append("--plot")
 
     if spec.keep_debug_logs:
         command.append("--keep-debug-logs")
