@@ -183,6 +183,42 @@ def collect_payment_metrics(
     payments_confirmed = len(confirmed_by_order)
     payments_accepted_count = len(accepted_by_order)
 
+    net_stats_events = [
+        e for e in events
+        if e.get("event") == "network_stats"
+    ]
+
+    node_samples: dict[str, list[dict]] = {}
+    for e in net_stats_events:
+        node = e.get("node")
+        if not node:
+            continue
+        if node not in node_samples:
+            node_samples[node] = []
+        node_samples[node].append(e)
+
+    total_net_tx_bytes = 0
+    total_net_rx_bytes = 0
+    total_net_tx_packets = 0
+    total_net_rx_packets = 0
+
+    for node, samples in node_samples.items():
+        if len(samples) < 2:
+            continue
+        samples_sorted = sorted(samples, key=lambda x: float(x.get("time", 0.0)))
+        first = samples_sorted[0]
+        last = samples_sorted[-1]
+        
+        tx_diff = max(0, int(last.get("tx_bytes", 0)) - int(first.get("tx_bytes", 0)))
+        rx_diff = max(0, int(last.get("rx_bytes", 0)) - int(first.get("rx_bytes", 0)))
+        tx_packets_diff = max(0, int(last.get("tx_packets", 0)) - int(first.get("tx_packets", 0)))
+        rx_packets_diff = max(0, int(last.get("rx_packets", 0)) - int(first.get("rx_packets", 0)))
+
+        total_net_tx_bytes += tx_diff
+        total_net_rx_bytes += rx_diff
+        total_net_tx_packets += tx_packets_diff
+        total_net_rx_packets += rx_packets_diff
+
     summary = {
         "duration_s": duration_s,
 
@@ -191,6 +227,25 @@ def collect_payment_metrics(
         "payments_accepted": payments_accepted_count,
         "payments_failed_to_submit": len(submit_failed),
         "payments_skipped": len(skipped),
+
+        "network_tx_bytes": total_net_tx_bytes,
+        "network_rx_bytes": total_net_rx_bytes,
+        "network_tx_plus_rx_bytes": total_net_tx_bytes + total_net_rx_bytes,
+        "network_tx_bytes_per_second": safe_div(total_net_tx_bytes, duration_s),
+        "network_rx_bytes_per_second": safe_div(total_net_rx_bytes, duration_s),
+        "network_tx_plus_rx_bytes_per_second": safe_div(
+            total_net_tx_bytes + total_net_rx_bytes,
+            duration_s,
+        ),
+        "network_tx_packets": total_net_tx_packets,
+        "network_rx_packets": total_net_rx_packets,
+        "network_tx_plus_rx_packets": total_net_tx_packets + total_net_rx_packets,
+        "network_tx_packets_per_second": safe_div(total_net_tx_packets, duration_s),
+        "network_rx_packets_per_second": safe_div(total_net_rx_packets, duration_s),
+        "network_tx_plus_rx_packets_per_second": safe_div(
+            total_net_tx_packets + total_net_rx_packets,
+            duration_s,
+        ),
 
         "payment_confirmation_rate_percent": (
             safe_div(payments_confirmed, payments_created) * 100.0

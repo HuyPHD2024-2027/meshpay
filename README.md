@@ -628,20 +628,14 @@ If you use MeshPay in academic work, please cite:
 
 ```bibtex
 @inproceedings{do2026meshpay,
-  title     = {MeshPay: Resilient Offline Payment with Wireless Mesh Network},
-  author    = {Do, Quang Huy and Tucci-Piergiovanni, Sara and Agyemang, Justice Owusu and Souihi, Sami},
-  booktitle = {Proceedings of the IEEE Wireless Communications and Networking Conference (WCNC)},
-  year      = {2026},
-  note      = {To appear}
+  title={MeshPay: Resilient Offline Payment with Wireless Mesh Network},
+  author={Do, Quang Huy and Tucci-Piergiovanni, Sara and Agyemang, Justice Owusu and Souihi, Sami},
+  booktitle={2026 IEEE Wireless Communications and Networking Conference (WCNC)},
+  pages={1--6},
+  year={2026},
+  organization={IEEE}
 }
-```
 
-Plain-text citation:
-
-```text
-Q. H. Do, S. Tucci-Piergiovanni, J. O. Agyemang, and S. Souihi,
-"MeshPay: Resilient Offline Payment with Wireless Mesh Network,"
-IEEE Wireless Communications and Networking Conference (WCNC), 2026.
 ```
 
 ---

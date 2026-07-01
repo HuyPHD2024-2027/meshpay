@@ -607,7 +607,7 @@ class MeshPayRuntime:
             }
         )
 
-    def _send_control_message(self, node_name: str, message: dict, retries: int = 20) -> dict:
+    def _send_control_message(self, node_name: str, message: dict, retries: int = 5) -> dict:
         socket_path = self.control_socket_for(node_name)
         line = json.dumps(message, separators=(",", ":"), sort_keys=True) + "\n"
         last_error: Optional[Exception] = None
@@ -615,7 +615,7 @@ class MeshPayRuntime:
         for attempt in range(retries):
             try:
                 with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
-                    conn.settimeout(2.0)
+                    conn.settimeout(0.5)
                     conn.connect(str(socket_path))
                     conn.sendall(line.encode("utf-8"))
                     data = b""
@@ -854,9 +854,26 @@ class MeshPayRuntime:
                     }
                 )
 
-        for out_obj in outgoing_objects:
-            self.route_outgoing_object(src_node=node, obj=out_obj)
-             
+        if outgoing_objects:
+            threading.Thread(
+                target=self._route_outgoing_objects,
+                args=(node, outgoing_objects),
+                daemon=True,
+            ).start()
+
+    def _route_outgoing_objects(self, src_node, objects) -> None:
+        for out_obj in objects:
+            try:
+                self.route_outgoing_object(src_node=src_node, obj=out_obj)
+            except Exception as e:
+                self.record_event(
+                    {
+                        "event": "async_routing_error",
+                        "node": src_node.name,
+                        "error": str(e),
+                    }
+                )
+
     def route_outgoing_object(self, src_node, obj) -> None:
         payload = DTNAdapter.to_payload(obj)
 

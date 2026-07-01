@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 from typing import Dict, List, Optional
 
@@ -39,6 +40,7 @@ class Authority(Station):
 
         self.name = name
         self.committee = committee or []
+        self._lock = threading.RLock()
 
         self.address = Address(
             node_id=name,
@@ -63,76 +65,76 @@ class Authority(Station):
 
     def register_account(self, account_address: str, balance: int = 0) -> None:
         """Register or reset an account in the authority's off-chain state."""
-
-        self.state.accounts[account_address] = AccountOffchainState(
-            address=account_address,
-            balance=balance,
-            last_update=time.time(),
-            pending_confirmation=None,
-            confirmed_transfers={},
-            sequence_number=0,
-        )
+        with self._lock:
+            self.state.accounts[account_address] = AccountOffchainState(
+                address=account_address,
+                balance=balance,
+                last_update=time.time(),
+                pending_confirmation=None,
+                confirmed_transfers={},
+                sequence_number=0,
+            )
 
     def handle_transfer(
         self,
         order: TransferOrder,
     ) -> Optional[SignedTransferOrder]:
         """Validate and sign a TransferOrder."""
+        with self._lock:
+            if not self._validate_transfer(order):
+                return None
 
-        if not self._validate_transfer(order):
-            return None
+            sender_account = self.state.accounts[order.sender]
+            existing_pending = sender_account.pending_confirmation
 
-        sender_account = self.state.accounts[order.sender]
-        existing_pending = sender_account.pending_confirmation
+            if existing_pending is not None:
+                existing_order = existing_pending.transfer_order
 
-        if existing_pending is not None:
-            existing_order = existing_pending.transfer_order
+                if str(existing_order.order_id) == str(order.order_id):
+                    return existing_pending
 
-            if str(existing_order.order_id) == str(order.order_id):
-                return existing_pending
+                return None
 
-            return None
+            signature = sign_payload(self.name, order.signing_dict())
 
-        signature = sign_payload(self.name, order.signing_dict())
+            signed = SignedTransferOrder(
+                order_id=order.order_id,
+                transfer_order=order,
+                authority_signature={self.name: signature},
+                timestamp=time.time(),
+            )
 
-        signed = SignedTransferOrder(
-            order_id=order.order_id,
-            transfer_order=order,
-            authority_signature={self.name: signature},
-            timestamp=time.time(),
-        )
+            sender_account.pending_confirmation = signed
+            sender_account.last_update = time.time()
 
-        sender_account.pending_confirmation = signed
-        sender_account.last_update = time.time()
-
-        return signed
+            return signed
 
     def handle_confirmation(self, confirmation: ConfirmationOrder) -> bool:
         """Apply a confirmed transfer to authority account state."""
+        with self._lock:
+            order = confirmation.transfer_order
+            order_id = str(order.order_id)
 
-        order = confirmation.transfer_order
-        order_id = str(order.order_id)
+            if not self._validate_confirmation(confirmation):
+                return False
 
-        if not self._validate_confirmation(confirmation):
-            return False
+            sender_account = self.state.accounts[order.sender]
+            recipient_account = self._get_or_create_account(order.recipient)
 
-        sender_account = self.state.accounts[order.sender]
-        recipient_account = self._get_or_create_account(order.recipient)
+            if order_id in sender_account.confirmed_transfers:
+                return False
 
-        if order_id in sender_account.confirmed_transfers:
-            return False
+            sender_account.debit(order.amount)
+            sender_account.set_sequence(order.sequence_number)
+            sender_account.pending_confirmation = None
+            sender_account.confirmed_transfers[order_id] = confirmation
+            sender_account.last_update = time.time()
 
-        sender_account.debit(order.amount)
-        sender_account.set_sequence(order.sequence_number)
-        sender_account.pending_confirmation = None
-        sender_account.confirmed_transfers[order_id] = confirmation
-        sender_account.last_update = time.time()
+            recipient_account.credit(order.amount)
 
-        recipient_account.credit(order.amount)
+            confirmation.status = TransactionStatus.CONFIRMED
 
-        confirmation.status = TransactionStatus.CONFIRMED
-
-        return True
+            return True
 
     def on_payment_object(self, obj) -> List[object]:
         """Handle a decoded payment object.

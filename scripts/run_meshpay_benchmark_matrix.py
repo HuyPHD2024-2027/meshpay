@@ -43,6 +43,7 @@ class RunSpec:
     payment_rate: float
     duration: float
     warmup: float
+    settle_time: float
     amount: int
     initial_balance: int
     medium: str
@@ -280,6 +281,7 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--warmup", type=float, default=5.0)
+    parser.add_argument("--settle-time", type=float, default=60.0)
     parser.add_argument("--amount", type=int, default=1)
     parser.add_argument("--initial-balance", type=int, default=10000)
     parser.add_argument("--medium", choices=["adhoc", "mesh"], default="adhoc")
@@ -371,10 +373,16 @@ def parse_args() -> argparse.Namespace:
 
     if args.warmup < 0:
         parser.error("--warmup must be >= 0")
+    
+    if args.settle_time < 0:
+        parser.error("--settle-time must be >= 0")
+
     if args.amount <= 0:
         parser.error("--amount must be positive")
+
     if args.initial_balance < 0:
         parser.error("--initial-balance must be >= 0")
+        
     for loss_probability in args.attack_loss_probability:
         if not 0.0 <= loss_probability <= 1.0:
             parser.error("--attack-loss-probability must be between 0.0 and 1.0")
@@ -424,6 +432,7 @@ def compute_auto_duration(
     attack_tpre: float,
     attack_tatk: float,
     attack_tpost: float,
+    settle_time: float,
 ) -> float:
     """Compute duration without a separate payment-count control."""
     if attack == "none":
@@ -431,8 +440,7 @@ def compute_auto_duration(
     else:
         base = attack_tpre + attack_tatk + attack_tpost
         
-    propagation_margin = 60
-    return math.ceil((base + propagation_margin) / 10.0) * 10.0
+    return math.ceil((base + settle_time) / 10.0) * 10.0
 
 
 def build_specs(args: argparse.Namespace) -> list[RunSpec]:
@@ -469,6 +477,7 @@ def build_specs(args: argparse.Namespace) -> list[RunSpec]:
                 attack_tpre=args.attack_tpre,
                 attack_tatk=args.attack_tatk,
                 attack_tpost=args.attack_tpost,
+                settle_time=args.settle_time,
             )
             if args.duration == "auto"
             else args.duration
@@ -497,6 +506,7 @@ def build_specs(args: argparse.Namespace) -> list[RunSpec]:
                 payment_rate=payment_rate,
                 duration=duration,
                 warmup=args.warmup,
+                settle_time=args.settle_time,
                 amount=args.amount,
                 initial_balance=args.initial_balance,
                 medium=args.medium,
@@ -548,6 +558,18 @@ def command_for(spec: RunSpec, run_dir: Path, use_sudo: bool) -> list[str]:
             str(spec.node_range),
             "--log-dir",
             str(run_dir),
+            "--warmup",
+            str(spec.warmup),
+            "--settle-time",
+            str(spec.settle_time),
+            "--amount",
+            str(spec.amount),
+            "--initial-balance",
+            str(spec.initial_balance),
+            "--seed",
+            str(spec.seed),
+            "--accounts-per-station",
+            str(spec.accounts_per_station),
         ]
     )
 
@@ -640,6 +662,18 @@ def summarize_result(
         "summary.tx_bytes_per_second": "tx_bytes_per_second",
         "summary.rx_bytes_per_second": "rx_bytes_per_second",
         "summary.tx_plus_rx_bytes_per_second": "tx_plus_rx_bytes_per_second",
+        "summary.network_tx_bytes": "network_tx_bytes",
+        "summary.network_rx_bytes": "network_rx_bytes",
+        "summary.network_tx_plus_rx_bytes": "network_tx_plus_rx_bytes",
+        "summary.network_tx_bytes_per_second": "network_tx_bytes_per_second",
+        "summary.network_rx_bytes_per_second": "network_rx_bytes_per_second",
+        "summary.network_tx_plus_rx_bytes_per_second": "network_tx_plus_rx_bytes_per_second",
+        "summary.network_tx_packets": "network_tx_packets",
+        "summary.network_rx_packets": "network_rx_packets",
+        "summary.network_tx_plus_rx_packets": "network_tx_plus_rx_packets",
+        "summary.network_tx_packets_per_second": "network_tx_packets_per_second",
+        "summary.network_rx_packets_per_second": "network_rx_packets_per_second",
+        "summary.network_tx_plus_rx_packets_per_second": "network_tx_plus_rx_packets_per_second",
         "latency_ms.time_to_quorum.avg": "avg_time_to_quorum_ms",
         "latency_ms.time_to_quorum.p50": "p50_time_to_quorum_ms",
         "latency_ms.time_to_quorum.p95": "p95_time_to_quorum_ms",

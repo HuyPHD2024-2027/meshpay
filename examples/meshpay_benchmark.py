@@ -605,6 +605,102 @@ def configure_mobility(
         max_y=config.area_height,
         seed=config.seed,
     )
+class NetworkStatsCollector(threading.Thread):
+    def __init__(self, runtime: MeshPayRuntime, nodes, interval: float = 5.0):
+        super().__init__(name="NetworkStatsCollector")
+        self.runtime = runtime
+        self.nodes = nodes
+        self.interval = interval
+        self.stop_event = threading.Event()
+        self.daemon = True
+
+    def _parse_dev_line(self, raw_output: str, iface: str) -> dict[str, int] | None:
+        for line in raw_output.splitlines():
+            if iface not in line:
+                continue
+            if ":" not in line:
+                continue
+            try:
+                parts = line.split(":", 1)[1].split()
+                if len(parts) >= 12:
+                    return {
+                        "rx_bytes": int(parts[0]),
+                        "rx_packets": int(parts[1]),
+                        "rx_errs": int(parts[2]),
+                        "rx_drop": int(parts[3]),
+                        "tx_bytes": int(parts[8]),
+                        "tx_packets": int(parts[9]),
+                        "tx_errs": int(parts[10]),
+                        "tx_drop": int(parts[11]),
+                    }
+            except (ValueError, IndexError):
+                pass
+        return None
+
+    def run(self) -> None:
+        from meshpay.mininet_cmd import safe_node_cmd
+
+        # First collection immediately
+        timestamp = time.time()
+        for node in self.nodes:
+            iface = node.params.get("wlan", [f"{node.name}-wlan0"])[0]
+            try:
+                res = safe_node_cmd(node, f"cat /proc/net/dev | grep {iface}")
+                stats = self._parse_dev_line(res, iface)
+                if stats:
+                    self.runtime.record_event(
+                        {
+                            "event": "network_stats",
+                            "node": node.name,
+                            "time": timestamp,
+                            **stats,
+                        }
+                    )
+            except Exception:
+                pass
+
+        # Subsequent collections every interval
+        while not self.stop_event.wait(self.interval):
+            timestamp = time.time()
+            for node in self.nodes:
+                iface = node.params.get("wlan", [f"{node.name}-wlan0"])[0]
+                try:
+                    res = safe_node_cmd(node, f"cat /proc/net/dev | grep {iface}")
+                    stats = self._parse_dev_line(res, iface)
+                    if stats:
+                        self.runtime.record_event(
+                            {
+                                "event": "network_stats",
+                                "node": node.name,
+                                "time": timestamp,
+                                **stats,
+                            }
+                        )
+                except Exception:
+                    pass
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        from meshpay.mininet_cmd import safe_node_cmd
+        timestamp = time.time()
+        for node in self.nodes:
+            iface = node.params.get("wlan", [f"{node.name}-wlan0"])[0]
+            try:
+                res = safe_node_cmd(node, f"cat /proc/net/dev | grep {iface}")
+                stats = self._parse_dev_line(res, iface)
+                if stats:
+                    self.runtime.record_event(
+                        {
+                            "event": "network_stats",
+                            "node": node.name,
+                            "time": timestamp,
+                            **stats,
+                        }
+                    )
+            except Exception:
+                pass
+        self.join(timeout=2.0)
+
 
 def run_payment_traffic(
     runtime: MeshPayRuntime,
@@ -652,6 +748,14 @@ def run_payment_traffic(
 
     started_at = time.time()
     traffic_deadline = started_at + traffic_duration
+
+    # Start the network stats collector
+    stats_collector = NetworkStatsCollector(
+        runtime=runtime,
+        nodes=list(clients) + list(runtime.authorities),
+        interval=5.0
+    )
+    stats_collector.start()
 
     if attack_controller is not None:
         attack_controller.start(started_at)
@@ -706,66 +810,69 @@ def run_payment_traffic(
 
     target_payments = int(config.payment_rate * traffic_duration)
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        while True:
-            now = time.time()
-            
-            # Check if traffic generation phase is over
-            if submitted_total >= target_payments or now >= traffic_deadline:
-                break
-
-            # Enforce the target payment rate
-            if now < next_submit_at:
-                time.sleep(min(next_submit_at - now, 0.05))
-                continue
-
-            sender_account = None
+    try:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
             while True:
-                with traffic_lock:
-                    candidate = available_senders.popleft() if available_senders else None
-
-                if candidate is None:
-                    break
-
-                host = candidate.split("/", 1)[0]
-                client = client_by_name[host]
-                with client._lock:
-                    can_pay = client.can_pay_from(candidate, config.amount)
-
-                if can_pay:
-                    sender_account = candidate
-                    break
-
-            if sender_account is None:
                 now = time.time()
-                with traffic_lock:
-                    if now - last_backpressure_log > 0.5:
-                        runtime.record_event(
-                            {
-                                "event": "payment_backpressure",
-                                "submitted": submitted_success,
-                                "reason": "no virtual account is currently available",
-                            }
-                        )
-                        last_backpressure_log = now
-                time.sleep(0.01)
-                continue
+                
+                # Check if traffic generation phase is over
+                if submitted_total >= target_payments or now >= traffic_deadline:
+                    break
 
-            recipient_account = rng.choice(all_accounts)
-            while recipient_account == sender_account:
+                # Enforce the target payment rate
+                if now < next_submit_at:
+                    time.sleep(min(next_submit_at - now, 0.05))
+                    continue
+
+                sender_account = None
+                while True:
+                    with traffic_lock:
+                        candidate = available_senders.popleft() if available_senders else None
+
+                    if candidate is None:
+                        break
+
+                    host = candidate.split("/", 1)[0]
+                    client = client_by_name[host]
+                    with client._lock:
+                        can_pay = client.can_pay_from(candidate, config.amount)
+
+                    if can_pay:
+                        sender_account = candidate
+                        break
+
+                if sender_account is None:
+                    now = time.time()
+                    with traffic_lock:
+                        if now - last_backpressure_log > 0.5:
+                            runtime.record_event(
+                                {
+                                    "event": "payment_backpressure",
+                                    "submitted": submitted_success,
+                                    "reason": "no virtual account is currently available",
+                                }
+                            )
+                            last_backpressure_log = now
+                    time.sleep(0.01)
+                    continue
+
                 recipient_account = rng.choice(all_accounts)
+                while recipient_account == sender_account:
+                    recipient_account = rng.choice(all_accounts)
 
-            with traffic_lock:
-                currently_submitting.add(sender_account)
-                submitted_total += 1
+                with traffic_lock:
+                    currently_submitting.add(sender_account)
+                    submitted_total += 1
 
-                next_submit_at += submit_interval
+                    next_submit_at += submit_interval
 
-                # If we somehow fell massively behind (e.g. > 1 second), prevent infinite blast:
-                if next_submit_at < time.time() - 1.0:
-                    next_submit_at = time.time()
+                    # If we somehow fell massively behind (e.g. > 1 second), prevent infinite blast:
+                    if next_submit_at < time.time() - 1.0:
+                        next_submit_at = time.time()
 
-            executor.submit(worker_task, sender_account, recipient_account)
+                executor.submit(worker_task, sender_account, recipient_account)
+    finally:
+        stats_collector.stop()
 
     submission_finished_at = time.time()
 
