@@ -651,11 +651,17 @@ def summarize_result(
         "summary.payments_created": "payments_created",
         "summary.payments_confirmed": "payments_confirmed",
         "summary.payments_accepted": "payments_accepted",
+        "summary.payments_unconfirmed": "payments_unconfirmed",
+        "summary.payments_unaccepted": "payments_unaccepted",
         "summary.payment_confirmation_rate_percent": "payment_confirmation_rate_percent",
         "summary.payment_acceptance_rate_percent": "payment_acceptance_rate_percent",
         "summary.created_tps": "created_tps",
         "summary.confirmed_tps": "confirmed_tps",
         "summary.accepted_tps": "accepted_tps",
+        "summary.quorum_latency_completed_count": "quorum_latency_completed_count",
+        "summary.quorum_latency_censored_count": "quorum_latency_censored_count",
+        "summary.acceptance_latency_completed_count": "acceptance_latency_completed_count",
+        "summary.acceptance_latency_censored_count": "acceptance_latency_censored_count",
         "summary.tx_payloads_per_second": "tx_payloads_per_second",
         "summary.rx_payloads_per_second": "rx_payloads_per_second",
         "summary.tx_plus_rx_payloads_per_second": "tx_plus_rx_payloads_per_second",
@@ -677,9 +683,15 @@ def summarize_result(
         "latency_ms.time_to_quorum.avg": "avg_time_to_quorum_ms",
         "latency_ms.time_to_quorum.p50": "p50_time_to_quorum_ms",
         "latency_ms.time_to_quorum.p95": "p95_time_to_quorum_ms",
+        "latency_ms.time_to_quorum.sample_count": "time_to_quorum_sample_count",
+        "latency_ms.time_to_quorum.completed_count": "time_to_quorum_completed_count",
+        "latency_ms.time_to_quorum.censored_count": "time_to_quorum_censored_count",
         "latency_ms.time_to_acceptance.avg": "avg_time_to_acceptance_ms",
         "latency_ms.time_to_acceptance.p50": "p50_time_to_acceptance_ms",
         "latency_ms.time_to_acceptance.p95": "p95_time_to_acceptance_ms",
+        "latency_ms.time_to_acceptance.sample_count": "time_to_acceptance_sample_count",
+        "latency_ms.time_to_acceptance.completed_count": "time_to_acceptance_completed_count",
+        "latency_ms.time_to_acceptance.censored_count": "time_to_acceptance_censored_count",
         "raw_counts.payment_created_events": "raw_payment_created_events",
         "raw_counts.confirmation_created_events": "raw_confirmation_created_events",
         "raw_counts.payment_accepted_events": "raw_payment_accepted_events",
@@ -697,6 +709,13 @@ def summarize_result(
 
     for path, name in fields.items():
         row[name] = nested_get(benchmark, path)
+
+    row["avg_time_to_quorum_ms"] = row.get("avg_time_to_quorum_ms")
+    row["p50_time_to_quorum_ms"] = row.get("p50_time_to_quorum_ms")
+    row["p95_time_to_quorum_ms"] = row.get("p95_time_to_quorum_ms")
+    row["avg_time_to_acceptance_ms"] = row.get("avg_time_to_acceptance_ms")
+    row["p50_time_to_acceptance_ms"] = row.get("p50_time_to_acceptance_ms")
+    row["p95_time_to_acceptance_ms"] = row.get("p95_time_to_acceptance_ms")
 
     return row
 

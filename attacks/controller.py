@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 from typing import Sequence
 
-from attacks.load_injection import SyntheticLoadInjector
+from attacks.targeted_load import SyntheticLoadInjector
 from attacks.packet_loss import apply_packet_loss, cleanup_packet_loss, select_targets
 
 
@@ -63,7 +63,11 @@ class BenchmarkAttack:
             "tatk": self.tatk,
             "tpost": self.tpost,
             "target_count": self.target_count,
-            "target_selection": "random_subset_capped_at_one_third",
+            "target_selection": (
+                "all_nodes"
+                if len(self.targets) == len(self.all_nodes)
+                else "random_subset"
+            ),
             "selected_target_count": len(self.targets),
             "targets": list(self.target_names),
             "load_rate": self.load_rate,

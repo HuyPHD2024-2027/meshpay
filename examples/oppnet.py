@@ -291,10 +291,6 @@ def start_dtn_routers(
         proc = sta.popen(cmd, shell=True)
         processes.append((sta, proc))
 
-        info(f"*** {sta.name}: daemon started\n")
-        info(f"***     store={store}\n")
-        info(f"***     log={log_file}\n")
-
     time.sleep(2)
 
     return processes

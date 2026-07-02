@@ -7,7 +7,7 @@ benchmark output directories, computes per-second time-series for three
 key metrics, and produces a publication-quality 3-panel stacked figure.
 
 Metrics:
-    1. Time to quorum (s)         — payment_created to confirmation_created
+    1. Time to quorum (s)         — all payment_created orders, censored at observation end
     2. Network Throughput (KB/s)  — DTN exchange bytes when available
     3. Quorum Finality Rate (%)   — cumulative confirmed / created
 
@@ -64,16 +64,29 @@ def load_jsonl(path: Path) -> List[Dict[str, Any]]:
 
 def load_config(log_dir: Path) -> Dict[str, Any]:
     """Load benchmark_config.json or benchmark.json for metadata."""
-    config_path = log_dir / "benchmark_config.json"
-    if config_path.exists():
-        with config_path.open("r", encoding="utf-8") as f:
-            return json.load(f)
-
     benchmark_path = log_dir / "benchmark.json"
+
+    if (log_dir / "benchmark_config.json").exists():
+        with (log_dir / "benchmark_config.json").open("r", encoding="utf-8") as f:
+            config = json.load(f)
+        if benchmark_path.exists():
+            with benchmark_path.open("r", encoding="utf-8") as f:
+                benchmark = json.load(f)
+            timing = benchmark.get("timing", {})
+            if isinstance(config, dict) and isinstance(timing, dict):
+                config = dict(config)
+                config["_benchmark_ended_at"] = timing.get("ended_at")
+        return config
+
     if benchmark_path.exists():
         with benchmark_path.open("r", encoding="utf-8") as f:
             data = json.load(f)
-            return data.get("config", data)
+            config = data.get("config", data)
+            timing = data.get("timing", {})
+            if isinstance(config, dict) and isinstance(timing, dict):
+                config = dict(config)
+                config["_benchmark_ended_at"] = timing.get("ended_at")
+            return config
 
     return {}
 
@@ -177,13 +190,13 @@ def _latency_series(
 ) -> np.ndarray:
     latency_bins: Dict[int, List[float]] = defaultdict(list)
 
-    for order_id, completed_at in completed_by_order.items():
-        created_at = created_by_order.get(order_id)
-        if created_at is None:
-            continue
-        second_bin = int(completed_at - t0)
+    observation_end = t0 + max(total_seconds - 1, 0)
+
+    for order_id, created_at in created_by_order.items():
+        completed_at = completed_by_order.get(order_id, observation_end)
+        second_bin = int(created_at - t0)
         if 0 <= second_bin < total_seconds:
-            latency_bins[second_bin].append(completed_at - created_at)
+            latency_bins[second_bin].append(max(0.0, completed_at - created_at))
 
     raw_latency = np.full(total_seconds, np.nan, dtype=float)
     for second, values in latency_bins.items():
@@ -390,7 +403,7 @@ def plot_attack_impact(
         if source:
             throughput_label = f"Network Rate\n({source} KB/s)"
 
-    ax_latency.set_ylabel(f"Time to Quorum (s)\n{window_size}s smoothed", fontsize=11, fontweight="bold")
+    ax_latency.set_ylabel(f"Time to Quorum", fontsize=11, fontweight="bold")
     ax_throughput.set_ylabel(throughput_label, fontsize=11, fontweight="bold")
     ax_finality.set_ylabel("Cumulative Finality (%)", fontsize=11, fontweight="bold")
     ax_finality.set_xlabel("Time (s)", fontsize=11, fontweight="bold")
@@ -417,7 +430,7 @@ def plot_attack_impact(
     print(f"Saved: {png_path}")
 
     single_metrics = [
-        ("latency_quorum_s", f"Time to Quorum (s) - {window_size}s smoothed", "latency"),
+        ("latency_quorum_s", f"Time to Quorum", "latency"),
         ("throughput_kbps", throughput_label.replace("\n", " "), "throughput"),
         ("finality_quorum_pct", "Cumulative Finality (%)", "finality"),
     ]
@@ -617,7 +630,21 @@ def plot_latency_vs_loss(runs_data: List[Dict[str, Any]], output_dir: Path) -> N
                 if oid not in confirmed or t < confirmed[oid]:
                     confirmed[oid] = t
                     
-        latencies = [confirmed[oid] - created[oid] for oid in confirmed if oid in created]
+        if created:
+            t0 = min(created.values())
+            cfg_duration = float(cfg.get("duration", 0.0) or 0.0)
+            cfg_ended_at = cfg.get("_benchmark_ended_at")
+            if cfg_ended_at is not None:
+                observation_end = float(cfg_ended_at)
+            else:
+                last_event_time = max(float(e.get("time", t0)) for e in events)
+                observation_end = max(t0 + cfg_duration, last_event_time)
+            latencies = [
+                max(0.0, confirmed.get(oid, observation_end) - created_at)
+                for oid, created_at in created.items()
+            ]
+        else:
+            latencies = []
         avg_latency = np.mean(latencies) if latencies else np.nan
         
         groups[(routing, rate)].append((loss, avg_latency))
@@ -658,7 +685,7 @@ def plot_latency_vs_loss(runs_data: List[Dict[str, Any]], output_dir: Path) -> N
         ax.plot(losses, latencies, label=label, color=color, linestyle=linestyle, marker=marker, linewidth=2.0, markersize=6)
         
     ax.set_xlabel("Packet Loss Probability", fontsize=11, fontweight="bold")
-    ax.set_ylabel("Average Time to Quorum (s)", fontsize=11, fontweight="bold")
+    ax.set_ylabel("Time to Quorum", fontsize=11, fontweight="bold")
     ax.set_title("Average Quorum Latency vs. Packet Loss under Attack", fontsize=13, fontweight="bold")
     ax.grid(True, alpha=0.3, linestyle="-", linewidth=0.5)
     ax.spines["top"].set_visible(False)

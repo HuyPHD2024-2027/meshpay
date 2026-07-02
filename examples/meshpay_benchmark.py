@@ -178,14 +178,15 @@ class MeshPayBenchmarkConfig:
         if self.attack_load_rate < 0:
             raise ValueError("--attack-load-rate must be >= 0")
 
-        if self.attack_target_count != "auto":
+        attack_target_count = str(self.attack_target_count).strip().lower()
+        if attack_target_count not in {"auto", "all"}:
             try:
                 target_count = int(self.attack_target_count)
             except ValueError as exc:
-                raise ValueError("--attack-target-count must be auto or a non-negative integer") from exc
+                raise ValueError("--attack-target-count must be auto, all, or a non-negative integer") from exc
 
             if target_count < 0:
-                raise ValueError("--attack-target-count must be auto or a non-negative integer")
+                raise ValueError("--attack-target-count must be auto, all, or a non-negative integer")
 
 
 def parse_args() -> argparse.Namespace:
@@ -362,7 +363,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--attack-target-count",
         default="auto",
-        help="Number of random nodes to attack, capped at floor(total_nodes / 3), or auto.",
+        help="Number of random nodes to attack, all nodes with 'all', or all nodes with 'auto'.",
     )
 
     parser.add_argument(
@@ -899,7 +900,9 @@ def print_summary(report: dict) -> None:
     info("\n*** MeshPay payment benchmark summary\n")
     info(f"payments_created:                  {summary['payments_created']}\n")
     info(f"payments_confirmed:                {summary['payments_confirmed']}\n")
+    info(f"payments_unconfirmed:              {summary['payments_unconfirmed']}\n")
     info(f"payments_accepted:                 {summary['payments_accepted']}\n")
+    info(f"payments_unaccepted:               {summary['payments_unaccepted']}\n")
     info(f"payment_acceptance_rate_percent:   {summary['payment_acceptance_rate_percent']:.2f}%\n")
 
     info(f"created_tps:                       {summary['created_tps']:.4f}\n")
@@ -915,18 +918,18 @@ def print_summary(report: dict) -> None:
     info(f"tx_plus_rx_bytes_per_second:       {summary['tx_plus_rx_bytes_per_second']:.4f}\n")
 
     if quorum["avg"] is not None:
-        info(f"avg_time_to_quorum_ms:             {quorum['avg']:.4f}\n")
-        info(f"p50_time_to_quorum_ms:             {quorum['p50']:.4f}\n")
-        info(f"p95_time_to_quorum_ms:             {quorum['p95']:.4f}\n")
+        info(f"avg_time_to_quorum_ms: {quorum['avg']:.4f}\n")
+        info(f"p50_time_to_quorum_ms: {quorum['p50']:.4f}\n")
+        info(f"p95_time_to_quorum_ms: {quorum['p95']:.4f}\n")
     else:
-        info("avg_time_to_quorum_ms:             None\n")
+        info("avg_time_to_quorum_ms: None\n")
 
     if accepted["avg"] is not None:
-        info(f"avg_time_to_acceptance_ms:         {accepted['avg']:.4f}\n")
-        info(f"p50_time_to_acceptance_ms:         {accepted['p50']:.4f}\n")
-        info(f"p95_time_to_acceptance_ms:         {accepted['p95']:.4f}\n")
+        info(f"avg_time_to_acceptance_ms: {accepted['avg']:.4f}\n")
+        info(f"p50_time_to_acceptance_ms: {accepted['p50']:.4f}\n")
+        info(f"p95_time_to_acceptance_ms: {accepted['p95']:.4f}\n")
     else:
-        info("avg_time_to_acceptance_ms:         None\n")
+        info("avg_time_to_acceptance_ms: None\n")
 
 
 def _set_lightweight_dtn_metric_env() -> dict[str, str | None]:

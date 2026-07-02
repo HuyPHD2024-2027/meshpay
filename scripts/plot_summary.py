@@ -8,54 +8,37 @@ Usage:
 
 Figures produced:
     1. confirmation_rate_vs_loss.{pdf,png}
-       Confirmation rate (%) vs. packet-loss probability, one line per
-       (routing, payment-rate) combination.
+       Confirmation rate (%) vs. packet-loss probability.
 
     2. acceptance_rate_vs_loss.{pdf,png}
        Payment acceptance rate (%) vs. packet-loss probability.
 
-    3. quorum_latency_vs_loss.{pdf,png}
-       Average time-to-quorum (s) vs. packet-loss probability.
-
-    4. confirmed_tps_vs_rate.{pdf,png}
-       Confirmed TPS vs. payment-rate for each routing protocol,
-       grouped by loss probability.
-
-    5. heatmap_confirmation_rate.{pdf,png}
+    3. heatmap_confirmation_rate.{pdf,png}
        Heatmap of confirmation-rate: routing × loss_probability, for each rate.
 
-    6. latency_vs_rate.{pdf,png}
-       Quorum latency (s) vs. payment-rate (TPS) for each protocol.
+    4. network_throughput_vs_loss.{pdf,png}
+       Network-layer throughput (TX/RX) vs. packet-loss probability.
 
-    7. network_efficiency.{pdf,png}
-       Confirmed TPS per KB/s of total network traffic (efficiency metric).
+    5. quorum_latency_vs_loss.{pdf,png}
+       Average time-to-quorum vs. packet-loss probability.
 
-    8. confirmation_vs_acceptance_ratio.{pdf,png}
-       Confirmation / Acceptance ratio.
-
-    9. p95_vs_p50_latency.{pdf,png}
-       P95 vs. P50 quorum latency scatter.
-
-    10. quorum_latency_p50_p95_vs_loss.{pdf,png}
-        Quorum latency P50 & P95 vs. packet-loss probability.
-
-    11. network_throughput_vs_loss.{pdf,png}
-        Network-layer throughput (TX/RX) vs. packet-loss probability.
+    6. bandwidth_phase_table.{pdf,png,csv,md}
+       Average MeshPay application TX/RX goodput before, during, and after each attack.
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import sys
-from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import matplotlib.ticker as mticker
+from matplotlib.patches import Rectangle
 import numpy as np
 
 # ---------------------------------------------------------------------------
@@ -76,19 +59,6 @@ ROUTING_MARKERS = {
     "epidemic":      "o",
     "spray-and-wait": "s",
     "prophet":       "^",
-}
-
-LOSS_COLORS = {
-    0.0:  "#2196F3",
-    0.25: "#4CAF50",
-    0.5:  "#FF9800",
-    0.8:  "#F44336",
-}
-LOSS_LABELS = {
-    0.0:  "0% loss",
-    0.25: "25% loss",
-    0.5:  "50% loss",
-    0.8:  "80% loss",
 }
 
 RATES = [10, 20, 50, 100]
@@ -124,17 +94,273 @@ def load_summary(path: Path) -> List[Dict[str, Any]]:
     return data
 
 
+def load_jsonl(path: Path) -> List[Dict[str, Any]]:
+    if not path.exists():
+        return []
+
+    events: List[Dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                events.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return events
+
+
 def normalise_loss(v: Any) -> float:
     if v is None:
         return 0.0
     return round(float(v), 4)
-
 
 def ms_to_seconds(v: Any) -> float | None:
     if v is None:
         return None
     return float(v) / 1000.0
 
+
+def _format_delta(value: float | None, baseline: float | None) -> str:
+    if value is None:
+        return "-"
+
+    value_text = f"{value:,.1f}"
+    if baseline is None or baseline <= 0:
+        return value_text
+
+    delta = ((value - baseline) / baseline) * 100.0
+    return f"{value_text} ({delta:+.1f}%)"
+
+
+def _format_rate(value: float | None) -> str:
+    if value is None:
+        return "-"
+    return f"{value:,.1f}"
+
+
+def _phase_name(t: float, phases: Dict[str, tuple[float, float]]) -> str | None:
+    for phase, (start, end) in phases.items():
+        if start <= t < end:
+            return phase
+    return None
+
+
+def _phase_event_counts(
+    events: List[Dict[str, Any]],
+    phases: Dict[str, tuple[float, float]],
+    event_name: str,
+) -> Dict[str, int]:
+    counts = {"before": 0, "during": 0, "after": 0}
+    for event in events:
+        if event.get("event") != event_name or "time" not in event:
+            continue
+        phase = _phase_name(float(event["time"]), phases)
+        if phase is not None:
+            counts[phase] += 1
+    return counts
+
+
+def _phase_payload_bytes(
+    events: List[Dict[str, Any]],
+    phases: Dict[str, tuple[float, float]],
+    event_name: str,
+) -> Dict[str, int]:
+    payload_bytes = {"before": 0, "during": 0, "after": 0}
+    for event in events:
+        if event.get("event") != event_name or "time" not in event:
+            continue
+        phase = _phase_name(float(event["time"]), phases)
+        if phase is not None:
+            payload_bytes[phase] += int(event.get("payload_size_bytes", 0) or 0)
+    return payload_bytes
+
+
+def _payload_goodput_kib_s(payload_bytes: int, duration_s: float) -> float | None:
+    if duration_s <= 0:
+        return None
+    return payload_bytes / duration_s / 1024.0
+
+
+def _bandwidth_phase_row(run: Dict[str, Any]) -> Dict[str, Any] | None:
+    run_dir_raw = run.get("run_dir")
+    if not run_dir_raw:
+        return None
+
+    events = load_jsonl(Path(run_dir_raw) / "payment.log")
+    if not events:
+        return None
+
+    attack_started = [
+        float(e["time"])
+        for e in events
+        if e.get("event") == "attack_started" and "time" in e
+    ]
+    attack_stopped = [
+        float(e["time"])
+        for e in events
+        if e.get("event") == "attack_stopped" and "time" in e
+    ]
+    if not attack_started or not attack_stopped:
+        return None
+
+    timed_events = [
+        e
+        for e in events
+        if "time" in e and e.get("event") in {
+            "payment_created",
+            "payload_injected",
+            "payment_payload_delivered",
+            "confirmation_created",
+            "network_stats",
+        }
+    ]
+    if not timed_events:
+        return None
+
+    attack_start = attack_started[0]
+    attack_stop = attack_stopped[-1]
+
+    attack_event = next(
+        (event for event in events if event.get("event") == "attack_started"),
+        {},
+    )
+    tpre = float(
+        attack_event.get("tpre")
+        or run.get("param.attack_tpre")
+        or run.get("attack_tpre")
+        or 0.0
+    )
+    tpost = float(
+        attack_event.get("tpost")
+        or run.get("param.attack_tpost")
+        or run.get("attack_tpost")
+        or 0.0
+    )
+
+    phases = {
+        "before": (attack_start - max(tpre, 0.0), attack_start),
+        "during": (attack_start, attack_stop),
+        "after": (attack_stop, attack_stop + max(tpost, 0.0)),
+    }
+
+    attack_targets = attack_event.get("targets", run.get("attack_targets", ""))
+    if isinstance(attack_targets, list):
+        attack_targets_text = ",".join(str(target) for target in attack_targets)
+    else:
+        attack_targets_text = str(attack_targets)
+
+    row: Dict[str, Any] = {
+        "routing": run.get("param.routing", run.get("routing", "")),
+        "payment_rate": run.get("param.payment_rate", run.get("payment_rate", "")),
+        "packet_loss": normalise_loss(run.get("param.attack_loss_probability", 0.0)),
+        "run_id": run.get("run_id", Path(run_dir_raw).name),
+        "attack_targets": attack_targets_text,
+        "network_stat_nodes": len({
+            str(event.get("node"))
+            for event in events
+            if event.get("event") == "network_stats" and event.get("node")
+        }),
+    }
+
+    injected_bytes = _phase_payload_bytes(events, phases, "payload_injected")
+    delivered_bytes = _phase_payload_bytes(events, phases, "payment_payload_delivered")
+
+    for phase, (start, end) in phases.items():
+        duration_s = max(end - start, 0.0)
+        row[f"{phase}_duration_s"] = duration_s
+        row[f"tx_{phase}_kib_s"] = _payload_goodput_kib_s(injected_bytes[phase], duration_s)
+        row[f"rx_{phase}_kib_s"] = _payload_goodput_kib_s(delivered_bytes[phase], duration_s)
+        row[f"app_tx_payload_bytes_{phase}"] = injected_bytes[phase]
+        row[f"app_rx_payload_bytes_{phase}"] = delivered_bytes[phase]
+
+    for event_name, prefix in [
+        ("payment_created", "payments_created"),
+        ("payload_injected", "payload_injected"),
+        ("payment_payload_delivered", "payload_delivered"),
+        ("confirmation_created", "confirmations_created"),
+    ]:
+        counts = _phase_event_counts(events, phases, event_name)
+        for phase, count in counts.items():
+            row[f"{prefix}_{phase}"] = count
+
+    return row
+
+
+def _write_bandwidth_phase_csv(output_dir: Path, rows: List[Dict[str, Any]]) -> None:
+    path = output_dir / "bandwidth_phase_table.csv"
+    fields = [
+        "routing",
+        "payment_rate",
+        "packet_loss",
+        "run_id",
+        "attack_targets",
+        "network_stat_nodes",
+        "before_duration_s",
+        "during_duration_s",
+        "after_duration_s",
+        "tx_before_kib_s",
+        "tx_during_kib_s",
+        "tx_after_kib_s",
+        "rx_before_kib_s",
+        "rx_during_kib_s",
+        "rx_after_kib_s",
+        "app_tx_payload_bytes_before",
+        "app_tx_payload_bytes_during",
+        "app_tx_payload_bytes_after",
+        "app_rx_payload_bytes_before",
+        "app_rx_payload_bytes_during",
+        "app_rx_payload_bytes_after",
+        "payments_created_before",
+        "payments_created_during",
+        "payments_created_after",
+        "payload_injected_before",
+        "payload_injected_during",
+        "payload_injected_after",
+        "payload_delivered_before",
+        "payload_delivered_during",
+        "payload_delivered_after",
+        "confirmations_created_before",
+        "confirmations_created_during",
+        "confirmations_created_after",
+    ]
+    with path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"  Saved: {path}")
+
+
+def _write_bandwidth_phase_markdown(output_dir: Path, rows: List[Dict[str, Any]]) -> None:
+    path = output_dir / "bandwidth_phase_table.md"
+    lines = [
+        "Application goodput is computed from MeshPay payload events: TX uses `payload_injected` bytes and RX uses successfully delivered `payment_payload_delivered` bytes. The after phase is the active `attack_tpost` traffic window.",
+        "",
+        "| Routing | Loss | TX Before | TX During (% Delta) | TX After (% Delta) | RX Before | RX During (% Delta) | RX After (% Delta) | Durations B/D/A (s) | Payloads Injected B/D/A | Payloads Delivered B/D/A |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+
+    for row in rows:
+        tx_before = row.get("tx_before_kib_s")
+        rx_before = row.get("rx_before_kib_s")
+        lines.append(
+            "| "
+            f"{ROUTING_LABELS.get(str(row['routing']), row['routing'])} | "
+            f"{int(float(row['packet_loss']) * 100)}% | "
+            f"{_format_delta(tx_before, None)} | "
+            f"{_format_delta(row.get('tx_during_kib_s'), tx_before)} | "
+            f"{_format_delta(row.get('tx_after_kib_s'), tx_before)} | "
+            f"{_format_delta(rx_before, None)} | "
+            f"{_format_delta(row.get('rx_during_kib_s'), rx_before)} | "
+            f"{_format_delta(row.get('rx_after_kib_s'), rx_before)} | "
+            f"{row.get('before_duration_s', 0):.1f}/{row.get('during_duration_s', 0):.1f}/{row.get('after_duration_s', 0):.1f} | "
+            f"{row.get('payload_injected_before', 0)}/{row.get('payload_injected_during', 0)}/{row.get('payload_injected_after', 0)} | "
+            f"{row.get('payload_delivered_before', 0)}/{row.get('payload_delivered_during', 0)}/{row.get('payload_delivered_after', 0)} |"
+        )
+
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"  Saved: {path}")
 
 # ---------------------------------------------------------------------------
 # Figure 1 — Confirmation rate vs. loss
@@ -218,90 +444,7 @@ def fig_acceptance_rate_vs_loss(runs: List[Dict], output_dir: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Figure 3 — Quorum latency vs. loss
-# ---------------------------------------------------------------------------
-
-def fig_quorum_latency_vs_loss(runs: List[Dict], output_dir: Path) -> None:
-    rates = sorted({int(r["param.payment_rate"]) for r in runs})
-    n = len(rates)
-    fig, axes = plt.subplots(1, n, figsize=(4.5 * n, 5), constrained_layout=True, sharey=True)
-    if n == 1:
-        axes = [axes]
-
-    for ax, rate in zip(axes, rates):
-        subset = [r for r in runs if int(r["param.payment_rate"]) == rate]
-        for routing in ROUTINGS:
-            pts = sorted(
-                [(normalise_loss(r["param.attack_loss_probability"]),
-                  ms_to_seconds(r["avg_time_to_quorum_ms"]))
-                 for r in subset if r["param.routing"] == routing],
-                key=lambda x: x[0],
-            )
-            if not pts:
-                continue
-            losses, vals = zip(*pts)
-            ax.plot(
-                losses, vals,
-                color=ROUTING_COLORS[routing],
-                marker=ROUTING_MARKERS[routing],
-                linewidth=2.0, markersize=7,
-                label=ROUTING_LABELS[routing],
-            )
-        ax.set_title(f"{rate} TPS", fontsize=12, fontweight="bold")
-        ax.set_xlabel("Packet Loss Probability", fontsize=10)
-        ax.set_xticks(LOSSES)
-        _style_ax(ax)
-
-    axes[0].set_ylabel("Avg. Time-to-Quorum (s)", fontsize=11, fontweight="bold")
-    axes[-1].legend(fontsize=9, edgecolor="#BDBDBD", framealpha=0.9)
-    fig.suptitle("Average Quorum Latency vs. Packet-Loss Probability", fontsize=13, fontweight="bold")
-    _save(fig, output_dir, "quorum_latency_vs_loss")
-
-
-# ---------------------------------------------------------------------------
-# Figure 4 — Confirmed TPS vs. payment-rate
-# ---------------------------------------------------------------------------
-
-def fig_confirmed_tps_vs_rate(runs: List[Dict], output_dir: Path) -> None:
-    losses = sorted({normalise_loss(r["param.attack_loss_probability"]) for r in runs})
-    n = len(losses)
-    fig, axes = plt.subplots(1, n, figsize=(4.5 * n, 5), constrained_layout=True, sharey=True)
-    if n == 1:
-        axes = [axes]
-
-    for ax, loss in zip(axes, losses):
-        subset = [r for r in runs if normalise_loss(r["param.attack_loss_probability"]) == loss]
-        for routing in ROUTINGS:
-            pts = sorted(
-                [(int(r["param.payment_rate"]), r["confirmed_tps"])
-                 for r in subset if r["param.routing"] == routing],
-                key=lambda x: x[0],
-            )
-            if not pts:
-                continue
-            rates, vals = zip(*pts)
-            ax.plot(
-                rates, vals,
-                color=ROUTING_COLORS[routing],
-                marker=ROUTING_MARKERS[routing],
-                linewidth=2.0, markersize=7,
-                label=ROUTING_LABELS[routing],
-            )
-        ax.set_title(f"Loss={int(loss * 100)}%", fontsize=12, fontweight="bold")
-        ax.set_xlabel("Payment Rate (TPS)", fontsize=10)
-        ax.set_xscale("log")
-        ax.xaxis.set_major_formatter(mticker.ScalarFormatter())
-        ax.set_xticks(RATES)
-        _style_ax(ax)
-
-    axes[0].set_ylabel("Confirmed TPS", fontsize=11, fontweight="bold")
-    axes[-1].legend(fontsize=9, edgecolor="#BDBDBD", framealpha=0.9)
-    fig.suptitle("Confirmed TPS vs. Payment Rate", fontsize=13, fontweight="bold")
-    _save(fig, output_dir, "confirmed_tps_vs_rate")
-
-
-# ---------------------------------------------------------------------------
-# Figure 5 — Heatmap of confirmation rate
+# Figure 3 — Heatmap of confirmation rate
 # ---------------------------------------------------------------------------
 
 def fig_heatmap_confirmation_rate(runs: List[Dict], output_dir: Path) -> None:
@@ -343,241 +486,7 @@ def fig_heatmap_confirmation_rate(runs: List[Dict], output_dir: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Figure 6 — Latency vs. rate
-# ---------------------------------------------------------------------------
-
-def fig_latency_vs_rate(runs: List[Dict], output_dir: Path) -> None:
-    losses = sorted({normalise_loss(r["param.attack_loss_probability"]) for r in runs})
-    n = len(losses)
-    fig, axes = plt.subplots(1, n, figsize=(4.5 * n, 5), constrained_layout=True, sharey=True)
-    if n == 1:
-        axes = [axes]
-
-    for ax, loss in zip(axes, losses):
-        subset = [r for r in runs if normalise_loss(r["param.attack_loss_probability"]) == loss]
-        for routing in ROUTINGS:
-            pts = sorted(
-                [(int(r["param.payment_rate"]), latency_s)
-                 for r in subset
-                 if r["param.routing"] == routing
-                 for latency_s in [ms_to_seconds(r.get("avg_time_to_quorum_ms"))]
-                 if latency_s is not None],
-                key=lambda x: x[0],
-            )
-            if not pts:
-                continue
-            rates, vals = zip(*pts)
-            ax.plot(
-                rates, vals,
-                color=ROUTING_COLORS[routing],
-                marker=ROUTING_MARKERS[routing],
-                linewidth=2.0, markersize=7,
-                label=ROUTING_LABELS[routing],
-            )
-        ax.set_title(f"Loss={int(loss * 100)}%", fontsize=12, fontweight="bold")
-        ax.set_xlabel("Payment Rate (TPS)", fontsize=10)
-        ax.set_xscale("log")
-        ax.xaxis.set_major_formatter(mticker.ScalarFormatter())
-        ax.set_xticks(RATES)
-        _style_ax(ax)
-
-    axes[0].set_ylabel("Avg. Time-to-Quorum (s)", fontsize=11, fontweight="bold")
-    axes[-1].legend(fontsize=9, edgecolor="#BDBDBD", framealpha=0.9)
-    fig.suptitle("Quorum Latency vs. Payment Rate", fontsize=13, fontweight="bold")
-    _save(fig, output_dir, "latency_vs_rate")
-
-
-# ---------------------------------------------------------------------------
-# Figure 7 — Network efficiency (confirmed_tps / total_kbps)
-# ---------------------------------------------------------------------------
-
-def fig_network_efficiency(runs: List[Dict], output_dir: Path) -> None:
-    losses = sorted({normalise_loss(r["param.attack_loss_probability"]) for r in runs})
-    n = len(losses)
-    fig, axes = plt.subplots(1, n, figsize=(4.5 * n, 5), constrained_layout=True, sharey=True)
-    if n == 1:
-        axes = [axes]
-
-    for ax, loss in zip(axes, losses):
-        subset = [r for r in runs if normalise_loss(r["param.attack_loss_probability"]) == loss]
-        for routing in ROUTINGS:
-            pts = []
-            for r in subset:
-                if r["param.routing"] != routing:
-                    continue
-                total_kbps = r["tx_plus_rx_bytes_per_second"] / 1024.0
-                if total_kbps > 0:
-                    eff = r["confirmed_tps"] / total_kbps
-                    pts.append((int(r["param.payment_rate"]), eff))
-            pts = sorted(pts, key=lambda x: x[0])
-            if not pts:
-                continue
-            rates, vals = zip(*pts)
-            ax.plot(
-                rates, vals,
-                color=ROUTING_COLORS[routing],
-                marker=ROUTING_MARKERS[routing],
-                linewidth=2.0, markersize=7,
-                label=ROUTING_LABELS[routing],
-            )
-        ax.set_title(f"Loss={int(loss * 100)}%", fontsize=12, fontweight="bold")
-        ax.set_xlabel("Payment Rate (TPS)", fontsize=10)
-        ax.set_xscale("log")
-        ax.xaxis.set_major_formatter(mticker.ScalarFormatter())
-        ax.set_xticks(RATES)
-        _style_ax(ax)
-
-    axes[0].set_ylabel("Efficiency (confirmed TPS / KB/s)", fontsize=11, fontweight="bold")
-    axes[-1].legend(fontsize=9, edgecolor="#BDBDBD", framealpha=0.9)
-    fig.suptitle("Network Efficiency: Confirmed TPS per KB/s of Traffic", fontsize=13, fontweight="bold")
-    _save(fig, output_dir, "network_efficiency")
-
-
-# ---------------------------------------------------------------------------
-# Figure 8 — Confirmation vs. Acceptance delta (overconfirmation anomaly)
-# ---------------------------------------------------------------------------
-
-def fig_confirmation_vs_acceptance(runs: List[Dict], output_dir: Path) -> None:
-    """Show confirmation count vs. acceptance count to highlight the anomaly
-    where confirmed > accepted (multiple authority votes per payment)."""
-    rates = sorted({int(r["param.payment_rate"]) for r in runs})
-    n = len(rates)
-    fig, axes = plt.subplots(1, n, figsize=(4.5 * n, 5), constrained_layout=True, sharey=True)
-    if n == 1:
-        axes = [axes]
-
-    for ax, rate in zip(axes, rates):
-        subset = [r for r in runs if int(r["param.payment_rate"]) == rate]
-        for routing in ROUTINGS:
-            pts = sorted(
-                [(normalise_loss(r["param.attack_loss_probability"]),
-                  r["payments_confirmed"] / max(r["payments_accepted"], 1))
-                 for r in subset if r["param.routing"] == routing],
-                key=lambda x: x[0],
-            )
-            if not pts:
-                continue
-            losses, vals = zip(*pts)
-            ax.plot(
-                losses, vals,
-                color=ROUTING_COLORS[routing],
-                marker=ROUTING_MARKERS[routing],
-                linewidth=2.0, markersize=7,
-                label=ROUTING_LABELS[routing],
-            )
-        ax.axhline(1.0, color="gray", linestyle="--", linewidth=1.2, label="1:1 baseline")
-        ax.set_title(f"{rate} TPS", fontsize=12, fontweight="bold")
-        ax.set_xlabel("Packet Loss Probability", fontsize=10)
-        ax.set_xticks(LOSSES)
-        _style_ax(ax)
-
-    axes[0].set_ylabel("Confirmations / Acceptances", fontsize=11, fontweight="bold")
-    axes[-1].legend(fontsize=9, edgecolor="#BDBDBD", framealpha=0.9)
-    fig.suptitle("Confirmation / Acceptance Ratio\n(>1 means more confirmations than client-side acceptances)",
-                 fontsize=13, fontweight="bold")
-    _save(fig, output_dir, "confirmation_vs_acceptance_ratio")
-
-
-# ---------------------------------------------------------------------------
-# Figure 9 — P95 latency spread vs. median (tail-latency stability)
-# ---------------------------------------------------------------------------
-
-def fig_p95_vs_p50_latency(runs: List[Dict], output_dir: Path) -> None:
-    """Scatter p95 vs. p50 quorum latency to show tail behaviour."""
-    fig, axes = plt.subplots(1, len(ROUTINGS), figsize=(5.5 * len(ROUTINGS), 5),
-                              constrained_layout=True, sharey=True, sharex=True)
-
-    for ax, routing in zip(axes, ROUTINGS):
-        subset = [r for r in runs if r["param.routing"] == routing]
-        for loss in LOSSES:
-            pts = [(p50_s, p95_s)
-                   for r in subset
-                   if normalise_loss(r["param.attack_loss_probability"]) == loss
-                   for p50_s in [ms_to_seconds(r.get("p50_time_to_quorum_ms"))]
-                   for p95_s in [ms_to_seconds(r.get("p95_time_to_quorum_ms"))]
-                   if p50_s is not None and p95_s is not None]
-            if not pts:
-                continue
-            p50s, p95s = zip(*pts)
-            ax.scatter(p50s, p95s,
-                       color=LOSS_COLORS.get(loss, "gray"),
-                       label=LOSS_LABELS.get(loss, f"{loss}"),
-                       s=80, edgecolors="white", linewidths=0.5, zorder=3)
-
-        # Identity line
-        lims = [0, max(ax.get_xlim()[1], ax.get_ylim()[1]) * 1.05]
-        ax.plot(lims, lims, "k--", linewidth=0.8, alpha=0.4, label="P50=P95")
-        ax.set_xlim(0, None)
-        ax.set_ylim(0, None)
-        ax.set_title(ROUTING_LABELS[routing], fontsize=12, fontweight="bold")
-        ax.set_xlabel("P50 Quorum Latency (s)", fontsize=10)
-        _style_ax(ax)
-
-    axes[0].set_ylabel("P95 Quorum Latency (s)", fontsize=11, fontweight="bold")
-    axes[-1].legend(fontsize=9, edgecolor="#BDBDBD", framealpha=0.9)
-    fig.suptitle("P95 vs. P50 Time-to-Quorum (Tail-Latency Analysis)", fontsize=13, fontweight="bold")
-    _save(fig, output_dir, "p95_vs_p50_latency")
-
-
-# ---------------------------------------------------------------------------
-# Figure 10 — Quorum latency P50 & P95 vs. packet-loss probability
-# ---------------------------------------------------------------------------
-
-def fig_latency_p50_p95_vs_loss(runs: List[Dict], output_dir: Path) -> None:
-    rates = sorted({int(r["param.payment_rate"]) for r in runs})
-    n = len(rates)
-    fig, axes = plt.subplots(1, n, figsize=(4.5 * n, 5), constrained_layout=True, sharey=True)
-    if n == 1:
-        axes = [axes]
-
-    for ax, rate in zip(axes, rates):
-        subset = [r for r in runs if int(r["param.payment_rate"]) == rate]
-        for routing in ROUTINGS:
-            pts_50 = sorted(
-                [(normalise_loss(r["param.attack_loss_probability"]),
-                  r.get("p50_time_to_quorum_ms", 0.0) / 1000.0)
-                 for r in subset if r["param.routing"] == routing and r.get("p50_time_to_quorum_ms") is not None],
-                key=lambda x: x[0],
-            )
-            pts_95 = sorted(
-                [(normalise_loss(r["param.attack_loss_probability"]),
-                  r.get("p95_time_to_quorum_ms", 0.0) / 1000.0)
-                 for r in subset if r["param.routing"] == routing and r.get("p95_time_to_quorum_ms") is not None],
-                key=lambda x: x[0],
-            )
-            if pts_50:
-                losses_50, vals_50 = zip(*pts_50)
-                ax.plot(
-                    losses_50, vals_50,
-                    color=ROUTING_COLORS[routing],
-                    marker=ROUTING_MARKERS[routing],
-                    linewidth=2.0, markersize=7,
-                    linestyle="-",
-                    label=f"{ROUTING_LABELS[routing]} (P50)",
-                )
-            if pts_95:
-                losses_95, vals_95 = zip(*pts_95)
-                ax.plot(
-                    losses_95, vals_95,
-                    color=ROUTING_COLORS[routing],
-                    marker=ROUTING_MARKERS[routing],
-                    linewidth=1.5, markersize=5,
-                    linestyle="--",
-                    label=f"{ROUTING_LABELS[routing]} (P95)",
-                )
-        ax.set_title(f"{rate} TPS", fontsize=12, fontweight="bold")
-        ax.set_xlabel("Packet Loss Probability", fontsize=10)
-        ax.set_xticks(LOSSES)
-        _style_ax(ax)
-
-    axes[0].set_ylabel("Quorum Latency P50/P95 (s)", fontsize=11, fontweight="bold")
-    axes[-1].legend(fontsize=8, edgecolor="#BDBDBD", framealpha=0.9)
-    fig.suptitle("Quorum Latency P50 & P95 vs. Packet-Loss Probability", fontsize=13, fontweight="bold")
-    _save(fig, output_dir, "quorum_latency_p50_p95_vs_loss")
-
-
-# ---------------------------------------------------------------------------
-# Figure 11 — Network-layer throughput (TX/RX) vs. packet-loss probability
+# Figure 4 — Network-layer throughput (TX/RX) vs. packet-loss probability
 # ---------------------------------------------------------------------------
 
 def fig_network_throughput_vs_loss(runs: List[Dict], output_dir: Path) -> None:
@@ -634,6 +543,321 @@ def fig_network_throughput_vs_loss(runs: List[Dict], output_dir: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Figure 5 — Quorum latency vs. loss
+# ---------------------------------------------------------------------------
+
+def fig_quorum_latency_vs_loss(runs: List[Dict], output_dir: Path) -> None:
+    rates = sorted({int(r["param.payment_rate"]) for r in runs})
+    n = len(rates)
+    fig, axes = plt.subplots(1, n, figsize=(4.5 * n, 5), constrained_layout=True, sharey=True)
+    if n == 1:
+        axes = [axes]
+
+    for ax, rate in zip(axes, rates):
+        subset = [r for r in runs if int(r["param.payment_rate"]) == rate]
+        for routing in ROUTINGS:
+            pts = sorted(
+                [(normalise_loss(r["param.attack_loss_probability"]),
+                  ms_to_seconds(r["avg_time_to_quorum_ms"]))
+                 for r in subset if r["param.routing"] == routing],
+                key=lambda x: x[0],
+            )
+            if not pts:
+                continue
+            losses, vals = zip(*pts)
+            ax.plot(
+                losses, vals,
+                color=ROUTING_COLORS[routing],
+                marker=ROUTING_MARKERS[routing],
+                linewidth=2.0, markersize=7,
+                label=ROUTING_LABELS[routing],
+            )
+        ax.set_title(f"{rate} TPS", fontsize=12, fontweight="bold")
+        ax.set_xlabel("Packet Loss Probability", fontsize=10)
+        ax.set_xticks(LOSSES)
+        _style_ax(ax)
+
+    axes[0].set_ylabel("Avg. Time-to-Quorum (s)", fontsize=11, fontweight="bold")
+    axes[-1].legend(fontsize=9, edgecolor="#BDBDBD", framealpha=0.9)
+    fig.suptitle("Average Quorum Latency vs. Packet-Loss Probability", fontsize=13, fontweight="bold")
+    _save(fig, output_dir, "quorum_latency_vs_loss")
+
+
+
+# ---------------------------------------------------------------------------
+# Figure 6 — Application goodput before/during/after attack
+# ---------------------------------------------------------------------------
+
+def fig_bandwidth_phase_table(runs: List[Dict], output_dir: Path) -> None:
+    rows = [row for run in runs for row in [_bandwidth_phase_row(run)] if row is not None]
+    rows = sorted(rows, key=lambda r: (float(r.get("payment_rate", 0)), str(r.get("routing", "")), float(r.get("packet_loss", 0))))
+
+    if not rows:
+        print("  Skipped: no attack runs with network_stats found.")
+        return
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    _write_bandwidth_phase_csv(output_dir, rows)
+    _write_bandwidth_phase_markdown(output_dir, rows)
+
+    display_rows = []
+    for row in rows:
+        tx_before = row.get("tx_before_kib_s")
+        rx_before = row.get("rx_before_kib_s")
+        display_rows.append(
+            [
+                ROUTING_LABELS.get(str(row["routing"]), row["routing"]),
+                f"{int(float(row['packet_loss']) * 100)}%",
+                _format_delta(tx_before, None),
+                _format_delta(row.get("tx_during_kib_s"), tx_before),
+                _format_delta(row.get("tx_after_kib_s"), tx_before),
+                _format_delta(rx_before, None),
+                _format_delta(row.get("rx_during_kib_s"), rx_before),
+                _format_delta(row.get("rx_after_kib_s"), rx_before),
+            ]
+        )
+
+    phase_header = [
+        "Routing",
+        "Loss",
+        "Before",
+        "During (% Delta)",
+        "After (% Delta)",
+        "Before",
+        "During (% Delta)",
+        "After (% Delta)",
+    ]
+    table_rows = [phase_header, *display_rows]
+
+    fig_height = max(2.4, 0.38 * len(display_rows) + 1.9)
+    fig, ax = plt.subplots(figsize=(13.0, fig_height))
+    ax.axis("off")
+    table = ax.table(
+        cellText=table_rows,
+        loc="center",
+        cellLoc="right",
+        colLoc="center",
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(9)
+    table.scale(1.0, 1.35)
+
+    for (row_idx, col_idx), cell in table.get_celld().items():
+        cell.set_edgecolor("#BDBDBD")
+        cell.set_linewidth(0.6)
+        if row_idx == 0:
+            cell.set_facecolor("#E0E0E0")
+            cell.set_text_props(weight="bold", color="black", ha="center")
+        elif row_idx % 2 == 0:
+            cell.set_facecolor("#F5F5F5")
+        if row_idx >= 1 and col_idx in (0, 1):
+            cell.set_text_props(ha="left" if col_idx == 0 else "center")
+
+    fig.canvas.draw()
+
+    def draw_column_group(label: str, first_col: int, last_col: int) -> None:
+        first = table[(0, first_col)]
+        last = table[(0, last_col)]
+        x = first.get_x()
+        y = first.get_y() + first.get_height()
+        width = last.get_x() + last.get_width() - x
+        height = first.get_height() * 0.88
+        rect = Rectangle(
+            (x, y),
+            width,
+            height,
+            transform=ax.transAxes,
+            facecolor="#E0E0E0",
+            edgecolor="#BDBDBD",
+            linewidth=0.6,
+            clip_on=False,
+        )
+        ax.add_patch(rect)
+        ax.text(
+            x + width / 2.0,
+            y + height / 2.0,
+            label,
+            transform=ax.transAxes,
+            ha="center",
+            va="center",
+            fontsize=9,
+            fontweight="bold",
+            color="black",
+            clip_on=False,
+        )
+
+    draw_column_group("Avg. Peer TX Rate (KiB/s)", 2, 4)
+    draw_column_group("Avg. Peer RX Rate (KiB/s)", 5, 7)
+
+    title = "Average MeshPay Application Goodput Before, During, and After Packet-Loss Attack"
+    rates = sorted({int(float(row["payment_rate"])) for row in rows if row.get("payment_rate") not in (None, "")})
+    if len(rates) == 1:
+        title += f"\n{rates[0]} TPS"
+    fig.suptitle(title, fontsize=13, fontweight="bold", y=0.98)
+
+    _save(fig, output_dir, "bandwidth_phase_table")
+
+
+def fig_goodput_50_loss_table(runs: List[Dict], output_dir: Path) -> None:
+    rows = [row for run in runs for row in [_bandwidth_phase_row(run)] if row is not None]
+    rows = [row for row in rows if abs(float(row.get("packet_loss", 0.0)) - 0.5) < 1e-9]
+    rows = sorted(rows, key=lambda r: (float(r.get("payment_rate", 0)), str(r.get("routing", ""))))
+
+    if not rows:
+        print("  Skipped: no 50% packet-loss attack rows found.")
+        return
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    csv_path = output_dir / "goodput_50_loss_table.csv"
+    csv_fields = [
+        "routing",
+        "payment_rate",
+        "packet_loss",
+        "tx_before_kib_s",
+        "tx_during_kib_s",
+        "tx_after_kib_s",
+        "rx_before_kib_s",
+        "rx_during_kib_s",
+        "rx_after_kib_s",
+        "before_duration_s",
+        "during_duration_s",
+        "after_duration_s",
+        "payload_injected_before",
+        "payload_injected_during",
+        "payload_injected_after",
+        "payload_delivered_before",
+        "payload_delivered_during",
+        "payload_delivered_after",
+    ]
+    with csv_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=csv_fields)
+        writer.writeheader()
+        writer.writerows({field: row.get(field) for field in csv_fields} for row in rows)
+    print(f"  Saved: {csv_path}")
+
+    md_path = output_dir / "goodput_50_loss_table.md"
+    md_lines = [
+        "Application goodput at 50% packet-loss attack. TX uses `payload_injected` bytes and RX uses delivered `payment_payload_delivered` bytes.",
+        "",
+        "| Routing | TX Before | TX During (% Delta) | TX After (% Delta) | RX Before | RX During (% Delta) | RX After (% Delta) | Durations B/D/A (s) |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+
+    display_rows = []
+    for row in rows:
+        tx_before = row.get("tx_before_kib_s")
+        rx_before = row.get("rx_before_kib_s")
+        routing_label = ROUTING_LABELS.get(str(row["routing"]), row["routing"])
+        tx_during = _format_delta(row.get("tx_during_kib_s"), tx_before)
+        tx_after = _format_delta(row.get("tx_after_kib_s"), tx_before)
+        rx_during = _format_delta(row.get("rx_during_kib_s"), rx_before)
+        rx_after = _format_delta(row.get("rx_after_kib_s"), rx_before)
+        md_lines.append(
+            "| "
+            f"{routing_label} | "
+            f"{_format_delta(tx_before, None)} | "
+            f"{tx_during} | "
+            f"{tx_after} | "
+            f"{_format_delta(rx_before, None)} | "
+            f"{rx_during} | "
+            f"{rx_after} | "
+            f"{row.get('before_duration_s', 0):.1f}/{row.get('during_duration_s', 0):.1f}/{row.get('after_duration_s', 0):.1f} |"
+        )
+        display_rows.append([
+            routing_label,
+            _format_delta(tx_before, None),
+            tx_during,
+            tx_after,
+            _format_delta(rx_before, None),
+            rx_during,
+            rx_after,
+        ])
+
+    md_path.write_text("\n".join(md_lines) + "\n", encoding="utf-8")
+    print(f"  Saved: {md_path}")
+
+    phase_header = [
+        "Routing",
+        "Before",
+        "During (% Delta)",
+        "After (% Delta)",
+        "Before",
+        "During (% Delta)",
+        "After (% Delta)",
+    ]
+    table_rows = [phase_header, *display_rows]
+
+    fig_height = max(2.2, 0.42 * len(display_rows) + 1.9)
+    fig, ax = plt.subplots(figsize=(11.5, fig_height))
+    ax.axis("off")
+    table = ax.table(
+        cellText=table_rows,
+        loc="center",
+        cellLoc="right",
+        colLoc="center",
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(9)
+    table.scale(1.0, 1.35)
+
+    for (row_idx, col_idx), cell in table.get_celld().items():
+        cell.set_edgecolor("#BDBDBD")
+        cell.set_linewidth(0.6)
+        if row_idx == 0:
+            cell.set_facecolor("#E0E0E0")
+            cell.set_text_props(weight="bold", color="black", ha="center")
+        elif row_idx % 2 == 0:
+            cell.set_facecolor("#F5F5F5")
+        if row_idx >= 1 and col_idx == 0:
+            cell.set_text_props(ha="left")
+
+    fig.canvas.draw()
+
+    def draw_column_group(label: str, first_col: int, last_col: int) -> None:
+        first = table[(0, first_col)]
+        last = table[(0, last_col)]
+        x = first.get_x()
+        y = first.get_y() + first.get_height()
+        width = last.get_x() + last.get_width() - x
+        height = first.get_height() * 0.88
+        rect = Rectangle(
+            (x, y),
+            width,
+            height,
+            transform=ax.transAxes,
+            facecolor="#E0E0E0",
+            edgecolor="#BDBDBD",
+            linewidth=0.6,
+            clip_on=False,
+        )
+        ax.add_patch(rect)
+        ax.text(
+            x + width / 2.0,
+            y + height / 2.0,
+            label,
+            transform=ax.transAxes,
+            ha="center",
+            va="center",
+            fontsize=9,
+            fontweight="bold",
+            color="black",
+            clip_on=False,
+        )
+
+    draw_column_group("Avg. Peer TX Rate (KiB/s)", 1, 3)
+    draw_column_group("Avg. Peer RX Rate (KiB/s)", 4, 6)
+
+    rates = sorted({int(float(row["payment_rate"])) for row in rows if row.get("payment_rate") not in (None, "")})
+    title = "Average MeshPay Application Goodput Before, During, and After 50% Packet-Loss Attack"
+    if len(rates) == 1:
+        title += f"\n{rates[0]} TPS"
+    fig.suptitle(title, fontsize=13, fontweight="bold", y=0.98)
+
+    _save(fig, output_dir, "goodput_50_loss_table")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -665,32 +889,20 @@ def main() -> int:
     print("Figure 2: Acceptance rate vs. packet loss")
     fig_acceptance_rate_vs_loss(runs, output_dir)
 
-    print("Figure 3: Quorum latency vs. packet loss")
-    fig_quorum_latency_vs_loss(runs, output_dir)
-
-    print("Figure 4: Confirmed TPS vs. payment rate")
-    fig_confirmed_tps_vs_rate(runs, output_dir)
-
-    print("Figure 5: Confirmation rate heatmap")
+    print("Figure 3: Confirmation rate heatmap")
     fig_heatmap_confirmation_rate(runs, output_dir)
 
-    print("Figure 6: Latency vs. payment rate")
-    fig_latency_vs_rate(runs, output_dir)
-
-    print("Figure 7: Network efficiency")
-    fig_network_efficiency(runs, output_dir)
-
-    print("Figure 8: Confirmation / Acceptance ratio (overconfirmation anomaly)")
-    fig_confirmation_vs_acceptance(runs, output_dir)
-
-    print("Figure 9: P95 vs P50 tail-latency scatter")
-    fig_p95_vs_p50_latency(runs, output_dir)
-
-    print("Figure 10: Quorum Latency P50/P95 vs. Attack Intensity")
-    fig_latency_p50_p95_vs_loss(runs, output_dir)
-
-    print("Figure 11: Network Throughput vs. Packet Loss")
+    print("Figure 4: Network Throughput vs. Packet Loss")
     fig_network_throughput_vs_loss(runs, output_dir)
+    
+    print("Figure 5: Quorum latency vs. rate")
+    fig_quorum_latency_vs_loss(runs, output_dir)
+
+    print("Figure 6: Application goodput before/during/after attack")
+    fig_bandwidth_phase_table(runs, output_dir)
+
+    print("Figure 7: Application goodput at 50% packet loss")
+    fig_goodput_50_loss_table(runs, output_dir)
 
     print("\nAll figures generated successfully.")
     return 0

@@ -12,16 +12,15 @@ COMMENT = "meshpay-jamming"
 
 
 def parse_target_count(value: str | int, total_nodes: int) -> int:
-    max_targets = max(0, total_nodes // 3)
-
-    if str(value).strip().lower() == "auto":
-        return max_targets
+    value_text = str(value).strip().lower()
+    if value_text in {"auto", "all"}:
+        return max(0, total_nodes)
 
     count = int(value)
     if count < 0:
         raise ValueError("attack target count must be >= 0")
 
-    return min(count, max_targets)
+    return min(count, max(0, total_nodes))
 
 
 def select_targets(nodes: Sequence, seed: int, target_count: str | int = "auto") -> list:

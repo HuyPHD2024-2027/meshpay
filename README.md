@@ -441,11 +441,25 @@ Latency metrics:
 
 ```text
 time_to_quorum_ms
-    payment_created -> confirmation_created
+    all payment_created orders; confirmed payments end at confirmation_created,
+    unconfirmed payments are censored at benchmark end
 
 time_to_acceptance_ms
-    payment_created -> payment_accepted
+    all payment_created orders; accepted payments end at payment_accepted,
+    unaccepted payments are censored at benchmark end
+
+payments_unconfirmed
+payments_unaccepted
+quorum_latency_completed_count
+quorum_latency_censored_count
+acceptance_latency_completed_count
+acceptance_latency_censored_count
 ```
+
+Latency is now an all-created-payment metric. Under packet loss, failed or
+unconfirmed payments remain in the latency distribution until the benchmark
+observation window ends, so latency must still be interpreted together with
+confirmation and acceptance rates.
 
 Reports are written to:
 

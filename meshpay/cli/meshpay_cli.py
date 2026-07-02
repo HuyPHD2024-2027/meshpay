@@ -345,12 +345,6 @@ class MeshPayRuntime:
             proc = node.popen(cmd, shell=True)
             self.processes.append((node, proc))
 
-            info(f"*** {node.name}: {self.routing} daemon started\n")
-            info(f"***     store={store}\n")
-            info(f"***     log={log_file}\n")
-            info(f"***     control-socket={self.control_socket_for(node.name)}\n")
-            info(f"***     discovery={self.medium} iface={wireless_iface} peers={len(peer_table) - 1}\n")
-
     def stop_dtn_routers(self) -> None:
         info("*** Stopping MeshPay DTN daemons\n")
 
@@ -1279,7 +1273,9 @@ class MeshPayCLI(CLI):
         info(f"\n===== MeshPay metrics: {self.runtime.payment_log} =====\n")
         info(f"payments_created:              {summary['payments_created']}\n")
         info(f"payments_confirmed:            {summary['payments_confirmed']}\n")
+        info(f"payments_unconfirmed:          {summary['payments_unconfirmed']}\n")
         info(f"payments_accepted:             {summary['payments_accepted']}\n")
+        info(f"payments_unaccepted:           {summary['payments_unaccepted']}\n")
         info(
             f"payment_confirmation_rate_pct: {summary['payment_confirmation_rate_percent']:.2f}\n"
         )
@@ -1288,20 +1284,20 @@ class MeshPayCLI(CLI):
         )
 
         if quorum["avg"] is None:
-            info("time_to_quorum_ms:             None\n")
+            info("time_to_quorum_ms: None\n")
         else:
-            info(f"avg_time_to_quorum_ms:         {quorum['avg']:.4f}\n")
-            info(f"p50_time_to_quorum_ms:         {quorum['p50']:.4f}\n")
-            info(f"p95_time_to_quorum_ms:         {quorum['p95']:.4f}\n")
-            info(f"min_time_to_quorum_ms:         {quorum['min']:.4f}\n")
-            info(f"max_time_to_quorum_ms:         {quorum['max']:.4f}\n")
+            info(f"avg_time_to_quorum_ms: {quorum['avg']:.4f}\n")
+            info(f"p50_time_to_quorum_ms: {quorum['p50']:.4f}\n")
+            info(f"p95_time_to_quorum_ms: {quorum['p95']:.4f}\n")
+            info(f"min_time_to_quorum_ms: {quorum['min']:.4f}\n")
+            info(f"max_time_to_quorum_ms: {quorum['max']:.4f}\n")
 
         if accepted["avg"] is None:
-            info("time_to_acceptance_ms:         None\n")
+            info("time_to_acceptance_ms: None\n")
         else:
-            info(f"avg_time_to_acceptance_ms:     {accepted['avg']:.4f}\n")
-            info(f"p50_time_to_acceptance_ms:     {accepted['p50']:.4f}\n")
-            info(f"p95_time_to_acceptance_ms:     {accepted['p95']:.4f}\n")
+            info(f"avg_time_to_acceptance_ms: {accepted['avg']:.4f}\n")
+            info(f"p50_time_to_acceptance_ms: {accepted['p50']:.4f}\n")
+            info(f"p95_time_to_acceptance_ms: {accepted['p95']:.4f}\n")
 
     def do_dtnlog(self, line: str) -> None:
         """Show DTN daemon logs.

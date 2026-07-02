@@ -52,7 +52,26 @@ def safe_div(numerator: float, denominator: float) -> float:
     return numerator / denominator
 
 
-def latency_summary(values_ms: List[float]) -> Dict[str, Optional[float]]:
+def latency_summary(
+    values_ms: List[float],
+    *,
+    completed_count: Optional[int] = None,
+    censored_count: Optional[int] = None,
+    sample_scope: Optional[str] = None,
+) -> Dict[str, Any]:
+    metadata: Dict[str, Any] = {
+        "sample_count": len(values_ms),
+    }
+
+    if completed_count is not None:
+        metadata["completed_count"] = completed_count
+
+    if censored_count is not None:
+        metadata["censored_count"] = censored_count
+
+    if sample_scope is not None:
+        metadata["sample_scope"] = sample_scope
+
     if not values_ms:
         return {
             "min": None,
@@ -63,6 +82,7 @@ def latency_summary(values_ms: List[float]) -> Dict[str, Optional[float]]:
             "p90": None,
             "p95": None,
             "p99": None,
+            **metadata,
         }
 
     return {
@@ -74,6 +94,7 @@ def latency_summary(values_ms: List[float]) -> Dict[str, Optional[float]]:
         "p90": percentile(values_ms, 90),
         "p95": percentile(values_ms, 95),
         "p99": percentile(values_ms, 99),
+        **metadata,
     }
 
 
@@ -182,6 +203,8 @@ def collect_payment_metrics(
     payments_created = len(created_by_order)
     payments_confirmed = len(confirmed_by_order)
     payments_accepted_count = len(accepted_by_order)
+    payments_unconfirmed = max(payments_created - payments_confirmed, 0)
+    payments_unaccepted = max(payments_created - payments_accepted_count, 0)
 
     net_stats_events = [
         e for e in events
@@ -225,6 +248,8 @@ def collect_payment_metrics(
         "payments_created": payments_created,
         "payments_confirmed": payments_confirmed,
         "payments_accepted": payments_accepted_count,
+        "payments_unconfirmed": payments_unconfirmed,
+        "payments_unaccepted": payments_unaccepted,
         "payments_failed_to_submit": len(submit_failed),
         "payments_skipped": len(skipped),
 
@@ -303,8 +328,18 @@ def collect_payment_metrics(
     return {
         "summary": summary,
         "latency_ms": {
-            "time_to_quorum": latency_summary(time_to_quorum_ms),
-            "time_to_acceptance": latency_summary(time_to_acceptance_ms),
+            "time_to_quorum": latency_summary(
+                time_to_quorum_ms,
+                completed_count=payments_confirmed,
+                censored_count=payments_unconfirmed,
+                sample_scope="confirmed_payments",
+            ),
+            "time_to_acceptance": latency_summary(
+                time_to_acceptance_ms,
+                completed_count=payments_accepted_count,
+                censored_count=payments_unaccepted,
+                sample_scope="accepted_payments",
+            ),
         },
         "payload_type_counts": payload_type_counts,
         "paths": {
