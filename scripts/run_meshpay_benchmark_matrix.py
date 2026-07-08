@@ -705,6 +705,14 @@ def summarize_result(
         "attack.tatk": "attack_tatk",
         "attack.tpost": "attack_tpost",
         "attack.load_rate": "attack_load_rate",
+        "hop_count.avg": "avg_hop_count",
+        "hop_count.p50": "p50_hop_count",
+        "hop_count.p90": "p90_hop_count",
+        "hop_count.p95": "p95_hop_count",
+        "hop_count.samples": "hop_count_samples",
+        "bundle_latency_ms.avg": "avg_bundle_latency_ms",
+        "bundle_latency_ms.p50": "p50_bundle_latency_ms",
+        "bundle_latency_ms.p95": "p95_bundle_latency_ms",
     }
 
     for path, name in fields.items():

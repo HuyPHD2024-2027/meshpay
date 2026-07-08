@@ -370,7 +370,7 @@ def parse_args() -> argparse.Namespace:
         "--attack-load-rate",
         type=float,
         default=0.0,
-        help="Synthetic DTN load bundles per second during load attacks. 0 means use payment rate.",
+        help="Targeted MeshPay payment submissions per second during load attacks. 0 means use payment rate.",
     )
 
     return parser.parse_args()

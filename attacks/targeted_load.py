@@ -6,7 +6,7 @@ import random
 import threading
 import time
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from typing import Sequence
 
 from meshpay.offline.virtual_accounts import account_host
@@ -80,7 +80,7 @@ class SyntheticLoadInjector:
         self._stop.set()
 
         if self._thread is not None:
-            self._thread.join(timeout=2.0)
+            self._thread.join(timeout=10.0)
             self._thread = None
 
     def _run(self, duration: float) -> None:
@@ -88,9 +88,17 @@ class SyntheticLoadInjector:
         interval = 1.0 / self.rate
         next_send = time.time()
         worker_count = self.max_workers or min(64, max(4, int(self.rate)))
+        max_pending = max(worker_count * 2, 8)
 
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            pending: set[Future] = set()
             while not self._stop.is_set() and time.time() < deadline:
+                pending = {future for future in pending if not future.done()}
+                if len(pending) >= max_pending:
+                    self._record_backpressure()
+                    wait(pending, timeout=0.05, return_when=FIRST_COMPLETED)
+                    continue
+
                 now = time.time()
                 if now < next_send:
                     time.sleep(min(next_send - now, 0.01))
@@ -102,7 +110,7 @@ class SyntheticLoadInjector:
                 else:
                     sender_account, recipient_account = pair
                     self._attempted += 1
-                    executor.submit(self._submit_payment, sender_account, recipient_account)
+                    pending.add(executor.submit(self._submit_payment, sender_account, recipient_account))
 
                 next_send += interval
                 if next_send < time.time() - 1.0:

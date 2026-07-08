@@ -465,7 +465,9 @@ class MeshPayRuntime:
                         continue
                     if payload.get("app") != "meshpay.offline":
                         continue
-                    self.handle_payment_payload(node, payload)
+                    hops = event.get("hops", [])
+                    latency_ms = event.get("latency_ms")
+                    self.handle_payment_payload(node, payload, hops=hops, bundle_latency_ms=latency_ms)
         except Exception as exc:
             self.record_event({"event": "delivery_handler_error", "error": f"{type(exc).__name__}: {exc!r}"})
 
@@ -784,7 +786,13 @@ class MeshPayRuntime:
 
         return None
 
-    def handle_payment_payload(self, node, payload: dict) -> None:
+    def handle_payment_payload(
+        self,
+        node,
+        payload: dict,
+        hops: list | None = None,
+        bundle_latency_ms: float | None = None,
+    ) -> None:
         try:
             obj = DTNAdapter.from_payload(
                 payload,
@@ -808,18 +816,23 @@ class MeshPayRuntime:
             recipient = obj.transfer_order.recipient
             amount = obj.transfer_order.amount
 
-        self.record_event(
-            {
-                "event": "payment_payload_delivered",
-                "node": node.name,
-                "payload_type": payload.get("type"),
-                "order_id": order_id,
-                "payload_size_bytes": payload_size_bytes,
-                "sender": sender,
-                "recipient": recipient,
-                "amount": amount,
-            }
-        )
+        delivery_event: dict = {
+            "event": "payment_payload_delivered",
+            "node": node.name,
+            "payload_type": payload.get("type"),
+            "order_id": order_id,
+            "payload_size_bytes": payload_size_bytes,
+            "sender": sender,
+            "recipient": recipient,
+            "amount": amount,
+        }
+        if hops is not None:
+            delivery_event["hops"] = hops
+            delivery_event["hop_count"] = len(hops)
+        if bundle_latency_ms is not None:
+            delivery_event["bundle_latency_ms"] = bundle_latency_ms
+
+        self.record_event(delivery_event)
 
         accepted_before = False
 

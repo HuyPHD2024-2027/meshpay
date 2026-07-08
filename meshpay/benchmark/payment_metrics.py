@@ -200,6 +200,21 @@ def collect_payment_metrics(
         for e in rx_events
     )
 
+    # ---------------------------------------------------------------------------
+    # Hop count metrics (available when DTN router reports hops on delivery)
+    # ---------------------------------------------------------------------------
+    hop_counts: List[float] = [
+        float(e["hop_count"])
+        for e in rx_events
+        if isinstance(e.get("hop_count"), (int, float))
+    ]
+
+    bundle_latencies_ms: List[float] = [
+        float(e["bundle_latency_ms"])
+        for e in rx_events
+        if isinstance(e.get("bundle_latency_ms"), (int, float))
+    ]
+
     payments_created = len(created_by_order)
     payments_confirmed = len(confirmed_by_order)
     payments_accepted_count = len(accepted_by_order)
@@ -341,6 +356,24 @@ def collect_payment_metrics(
                 sample_scope="accepted_payments",
             ),
         },
+        "hop_count": {
+            "samples": len(hop_counts),
+            "min": min(hop_counts) if hop_counts else None,
+            "max": max(hop_counts) if hop_counts else None,
+            "avg": (sum(hop_counts) / len(hop_counts)) if hop_counts else None,
+            "p50": percentile(hop_counts, 50),
+            "p90": percentile(hop_counts, 90),
+            "p95": percentile(hop_counts, 95),
+            "note": (
+                "hop_count counts relay nodes traversed by a bundle. "
+                "Available only when MESHPAY_DTN_EVENT_LOG is enabled or "
+                "the IPC delivery socket reports hops."
+            ),
+        },
+        "bundle_latency_ms": latency_summary(
+            bundle_latencies_ms,
+            sample_scope="rx_bundles",
+        ),
         "payload_type_counts": payload_type_counts,
         "paths": {
             "log_dir": str(log_dir),
