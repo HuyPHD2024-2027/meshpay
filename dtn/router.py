@@ -182,8 +182,9 @@ class DTNRouter:
         self.mesh_probe_peers_per_round   = max(6, self.max_parallel_exchanges * 2)
         self.mesh_exchange_peers_per_tick = max(1, self.max_parallel_exchanges)
         self.mesh_peer_ttl                = max(self.discovery_interval * 6.0, 6.0)
-        self.mesh_reachable_peers: Dict[str, Tuple[str, int, float]]         = {}
-        self._mesh_empty_sync:     Dict[Tuple[str, str, int], Tuple[float, int]] = {}
+        self.mesh_reachable_peers:    Dict[str, Tuple[str, int, float]]         = {}
+        self._mesh_empty_sync:        Dict[Tuple[str, str, int], Tuple[float, int]] = {}
+        self._mesh_bypass_symmetry:   Set[str] = set()  # peers that should skip the symmetry guard on next schedule
         self._mesh_probe_cursor    = 0
         self._mesh_exchange_cursor = 0
 
@@ -576,6 +577,13 @@ class DTNRouter:
                     self._backoff[key] = self.empty_sync_cooldown + random.uniform(0.0, 0.5)
             elif not deferred:
                 self._backoff[key] = min(current * 2.0, self.max_backoff)
+
+            # Anchor the attempt timestamp to completion rather than start.
+            # This prevents the backoff window from having already expired by
+            # the time _finish_exchange_attempt runs (which would trigger an
+            # immediate reconnection storm after a packet-loss attack ends).
+            if not deferred:
+                self._last_attempt[key] = time.time()
 
     def _reset_peer_backoff(self, peer_node: str, peer_ip: str, peer_port: int) -> None:
         """Clear backoff immediately (called when new bundles arrive)."""
@@ -1104,13 +1112,17 @@ class DTNRouter:
                 self._send_discovery_request(send_sock, broadcasts + static_ips)
                 next_discovery = now + self.discovery_interval + random.uniform(0.0, self.discovery_interval * 0.25)
 
+            # Check for new bundles BEFORE blocking on recvfrom so the push
+            # fires regardless of whether a UDP packet arrived this iteration.
+            if self.store.new_bundle_event.is_set():
+                self.store.new_bundle_event.clear()
+                self._push_new_bundle_to_peers(self.peers)
+
             try:
                 data, addr = recv_sock.recvfrom(4096)
                 self._handle_discovery_message(json.loads(data.decode("utf-8")), addr, send_sock)
             except socket.timeout:
-                if self.store.new_bundle_event.is_set():
-                    self.store.new_bundle_event.clear()
-                    self._push_new_bundle_to_peers(self.peers)
+                pass
             except Exception:
                 continue
 
@@ -1221,6 +1233,10 @@ class DTNRouter:
         remaining = until - time.time()
         if remaining <= 0.0 or len(self.store.ids()) > bundle_count:
             self._mesh_empty_sync.pop(key, None)
+            # New bundles arrived since the empty-sync was recorded: mark this
+            # peer so _schedule_mesh_exchanges can bypass the symmetry guard
+            # and initiate an exchange even if self.node >= peer_node.
+            self._mesh_bypass_symmetry.add(peer_node)
             return 0.0
         return remaining
 
@@ -1248,7 +1264,15 @@ class DTNRouter:
 
             peer_ip, peer_port, _ = self.mesh_reachable_peers[peer_node]
 
-            if self.node >= peer_node:
+            # Check empty-sync status first — this may set the symmetry bypass
+            # flag if new bundles have arrived since the last empty exchange.
+            empty_remaining = self._mesh_empty_sync_remaining(peer_node, peer_ip, peer_port)
+
+            bypass_symmetry = peer_node in self._mesh_bypass_symmetry
+            if bypass_symmetry:
+                self._mesh_bypass_symmetry.discard(peer_node)
+
+            if self.node >= peer_node and not bypass_symmetry:
                 self.record_event({"event": "mesh_exchange_skipped_symmetry", "peer": peer_node, "peer_ip": peer_ip, "peer_port": peer_port})
                 continue
 
@@ -1256,11 +1280,11 @@ class DTNRouter:
                 self.record_event({"event": "mesh_exchange_skipped_backoff", "peer": peer_node, "peer_ip": peer_ip, "peer_port": peer_port})
                 continue
 
-            if self._mesh_empty_sync_remaining(peer_node, peer_ip, peer_port) > 0.0:
+            if empty_remaining > 0.0:
                 self.record_event({"event": "mesh_exchange_skipped_no_work", "peer": peer_node, "peer_ip": peer_ip, "peer_port": peer_port})
                 continue
 
-            self.record_event({"event": "mesh_exchange_scheduled", "peer": peer_node, "peer_ip": peer_ip, "peer_port": peer_port})
+            self.record_event({"event": "mesh_exchange_scheduled", "peer": peer_node, "peer_ip": peer_ip, "peer_port": peer_port, "bypass_symmetry": bypass_symmetry})
             jitter = random.uniform(0.0, 0.5)
             threading.Timer(jitter, self._start_exchange_thread, args=(peer_node, peer_ip, peer_port, False)).start()
             scheduled += 1
@@ -1333,16 +1357,20 @@ class DTNRouter:
                 self._schedule_mesh_exchanges()
                 next_scan = now + self.discovery_interval + random.uniform(0.0, self.discovery_interval * 0.25)
 
+            # Check for new bundles BEFORE blocking on recvfrom so the push
+            # fires regardless of whether a UDP packet arrived this iteration.
+            if self.store.new_bundle_event.is_set():
+                self.store.new_bundle_event.clear()
+                # Reset backoff for ALL reachable peers, not just scheduled ones
+                for peer_node, (peer_ip, peer_port, _) in list(self.mesh_reachable_peers.items()):
+                    self._reset_peer_backoff(peer_node, peer_ip, peer_port)
+                self._schedule_mesh_exchanges()
+
             try:
                 data, addr = recv_sock.recvfrom(4096)
                 self._handle_discovery_message(json.loads(data.decode("utf-8")), addr, send_sock)
             except socket.timeout:
-                if self.store.new_bundle_event.is_set():
-                    self.store.new_bundle_event.clear()
-                    # Reset backoff for ALL reachable peers, not just scheduled ones
-                    for peer_node, (peer_ip, peer_port, _) in list(self.mesh_reachable_peers.items()):
-                        self._reset_peer_backoff(peer_node, peer_ip, peer_port)
-                    self._schedule_mesh_exchanges()
+                pass
             except Exception:
                 continue
 

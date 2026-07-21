@@ -120,8 +120,8 @@ def rolling_average(data: np.ndarray, window: int) -> np.ndarray:
         result[i] = np.mean(data[start:end])
     return result
 
-def process_run(log_path: Path, config: Dict[str, Any], window_size: int) -> Dict[str, Any]:
-    """Parse payment.log and compute throughput time-series."""
+def process_run(log_path: Path, config: Dict[str, Any], window_size: int, metric: str = "confirmation") -> Dict[str, Any]:
+    """Parse payment.log and network metrics to compute throughput time-series."""
     events = load_jsonl(log_path)
     if not events:
         return {}
@@ -154,24 +154,54 @@ def process_run(log_path: Path, config: Dict[str, Any], window_size: int) -> Dic
         attack_start_s = tpre
         attack_stop_s = tpre + tatk
 
-    # Confirmed times
-    confirmed_times = []
-    for e in events:
-        if e.get("event") == "confirmation_created":
-            t_rel = float(e["time"]) - t0
-            confirmed_times.append(t_rel)
-
     max_t = max(float(e["time"]) - t0 for e in events) if events else 0.0
     duration = int(math.ceil(max_t)) + 1
 
-    # Bin confirmations into 1s intervals
-    counts = np.zeros(duration)
-    for t in confirmed_times:
-        idx = int(math.floor(t))
-        if 0 <= idx < duration:
-            counts[idx] += 1
+    if metric == "confirmation":
+        confirmations_per_sec = np.zeros(duration)
+        for e in events:
+            if e.get("event") == "confirmation_created":
+                t_val = float(e["time"]) - t0
+                idx = int(math.floor(t_val))
+                if 0 <= idx < duration:
+                    confirmations_per_sec[idx] += 1.0
+        smoothed = rolling_average(confirmations_per_sec, window_size)
+    else:
+        # Load network metrics
+        benchmark_json_path = log_path.parent / "benchmark.json"
+        network_metrics = {}
+        if benchmark_json_path.exists():
+            try:
+                with benchmark_json_path.open("r", encoding="utf-8") as f:
+                    benchmark_data = json.load(f)
+                    network_metrics = benchmark_data.get("network_metrics", {})
+            except Exception:
+                pass
 
-    smoothed = rolling_average(counts, window_size)
+        if not network_metrics:
+            # Fallback: try to collect it directly using collect_network_metrics
+            import sys
+            root_dir = str(Path(__file__).resolve().parent.parent)
+            if root_dir not in sys.path:
+                sys.path.append(root_dir)
+            try:
+                from meshpay.benchmark.network_metrics import collect_network_metrics
+                network_metrics = collect_network_metrics(log_path.parent)
+            except Exception as e:
+                print(f"Error collecting network metrics for {log_path.parent}: {e}")
+
+        agg_ts = network_metrics.get("aggregate_time_series", [])
+
+        # Bin network throughput (in KB/s) into 1s intervals
+        throughput_kbps = np.zeros(duration)
+        for item in agg_ts:
+            t_val = item.get("interval_end_s", 0.0)
+            val_kbps = item.get("rx_plus_tx_bytes_per_second", 0.0) / 1024.0
+            idx = int(math.floor(t_val))
+            if 0 <= idx < duration:
+                throughput_kbps[idx] = val_kbps
+
+        smoothed = rolling_average(throughput_kbps, window_size)
 
     return {
         "throughput": smoothed,
@@ -207,8 +237,14 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--title",
-        default="MeshPay Throughput Over Time Under Targeted Load Attack",
-        help="Plot title",
+        default=None,
+        help="Plot title (default depends on metric)",
+    )
+    p.add_argument(
+        "--metric",
+        choices=["confirmation", "network"],
+        default="confirmation",
+        help="Throughput metric to plot (default: confirmation)",
     )
     return p.parse_args()
 
@@ -238,7 +274,7 @@ def main() -> int:
     processed_by_routing = defaultdict(list)
     for routing, run_list in runs_by_routing.items():
         for log_path, config in run_list:
-            res = process_run(log_path, config, args.window_size)
+            res = process_run(log_path, config, args.window_size, metric=args.metric)
             if res:
                 processed_by_routing[routing].append(res)
 
@@ -346,18 +382,23 @@ def main() -> int:
             bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="#FFCDD2", alpha=0.9),
         )
 
-    # Reference target payment rate line
-    if all_payment_rates:
-        avg_payment_rate = np.mean(all_payment_rates)
-        ax.axhline(
-            y=avg_payment_rate, color="#4CAF50", linestyle=":", linewidth=1.5, alpha=0.8,
-            label=f"Baseline Target Rate ({avg_payment_rate:.0f} tx/s)"
-        )
-
     # Label styling
     ax.set_xlabel("Time (s)", fontsize=11, fontweight="bold")
-    ax.set_ylabel("Confirmed Throughput (tx/s)", fontsize=11, fontweight="bold")
-    ax.set_title(args.title, fontsize=12, fontweight="bold", pad=15)
+    if args.metric == "confirmation":
+        ax.set_ylabel("Throughput (confirmed tx/s)", fontsize=11, fontweight="bold")
+    else:
+        ax.set_ylabel("Network Throughput (KB/s)", fontsize=11, fontweight="bold")
+
+    if args.title is None:
+        if args.metric == "confirmation":
+            title = "Confirmed Transaction Throughput Under Targeted Load Attack"
+        else:
+            title = "Network Throughput Over Time Under Targeted Load Attack"
+    else:
+        title = args.title
+
+    ax.set_title(title, fontsize=12, fontweight="bold", pad=15)
+    ax.set_ylim(bottom=0)
     
     # Legend settings
     ax.legend(fontsize=9, edgecolor="#BDBDBD", framealpha=0.9, loc="upper right")

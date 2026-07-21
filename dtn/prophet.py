@@ -15,42 +15,15 @@ BETA = 0.5
 GAMMA = 0.995
 EPSILON = 0.0
 DEFAULT_REPLICATION_BUDGET = 6
-DEFAULT_TRANSFER_REPLICATION_BUDGET = 8
-
-PAYLOAD_PRIORITIES = {
-    "confirmation_order": 0,
-    "signed_transfer_order": 1,
-    "transfer_order": 2,
-}
-
-
-def account_host(account: str | None) -> str | None:
-    if not account:
-        return None
-    return str(account).split("/", 1)[0]
-
-
-def payload_type(bundle: Bundle) -> str:
-    if isinstance(bundle.payload, dict):
-        return str(bundle.payload.get("type", ""))
-    return ""
-
-
-def payload_data(bundle: Bundle) -> dict[str, Any]:
-    if not isinstance(bundle.payload, dict):
-        return {}
-    data = bundle.payload.get("data", {})
-    return data if isinstance(data, dict) else {}
 
 
 class ProphetRouter(DTNRouter):
-    """MeshPay-aware PRoPHET DTN router.
+    """Pure, standard PRoPHET DTN router.
 
-    This lightweight version keeps PRoPHET state in memory only.  It does not
-    read or write .prophet_state files.  The PRoPHET logic is unchanged:
-    predictabilities are learned from direct/transitive contacts, and MeshPay
-    role priors help route payment objects toward authorities, senders, and
-    recipients before the contact graph fully converges.
+    Predictabilities are learned from direct/transitive contacts. Forwarding
+    decisions are purely based on comparing delivery predictabilities to the
+    destination (plus epsilon), with a simple replication budget cap.
+    No MeshPay-specific role priors, payload type awareness, or authority prioritization.
     """
 
     def __init__(
@@ -61,7 +34,6 @@ class ProphetRouter(DTNRouter):
         gamma: float = GAMMA,
         epsilon: float = EPSILON,
         replication_budget: int = DEFAULT_REPLICATION_BUDGET,
-        transfer_replication_budget: int = DEFAULT_TRANSFER_REPLICATION_BUDGET,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -70,7 +42,6 @@ class ProphetRouter(DTNRouter):
         self.gamma = float(gamma)
         self.epsilon = float(epsilon)
         self.replication_budget = max(1, int(replication_budget))
-        self.transfer_replication_budget = max(1, int(transfer_replication_budget))
 
         self._state_lock = threading.RLock()
         self._predictabilities: dict[str, float] = {}
@@ -85,10 +56,6 @@ class ProphetRouter(DTNRouter):
     @staticmethod
     def _clamp(value: float) -> float:
         return max(0.0, min(1.0, value))
-
-    @staticmethod
-    def _is_authority(node: str | None) -> bool:
-        return bool(node and str(node).startswith("auth"))
 
     def _age_predictabilities(self) -> None:
         now = time.time()
@@ -158,7 +125,6 @@ class ProphetRouter(DTNRouter):
             return {
                 "protocol":         "prophet",
                 "predictabilities": dict(self._predictabilities),
-                "role":             "authority" if self._is_authority(self.node) else "client",
             }
 
     def observe_peer_summary(self, peer_node: str, summary: dict) -> None:
@@ -181,86 +147,14 @@ class ProphetRouter(DTNRouter):
             self._update_transitive(peer_node, clean_peer_preds)
 
     # ------------------------------------------------------------------
-    # MeshPay role priors
-    # ------------------------------------------------------------------
-
-    def _route_hints(self, bundle: Bundle) -> dict[str, Any]:
-        if not isinstance(bundle.payload, dict):
-            return {}
-        hints = bundle.payload.get("_meshpay_route", {})
-        return hints if isinstance(hints, dict) else {}
-
-    def _role_prior(self, bundle: Bundle, node: str) -> float:
-        ptype             = payload_type(bundle)
-        data              = payload_data(bundle)
-        hints             = self._route_hints(bundle)
-        authority_targets = set(hints.get("authority_targets", []))
-
-        if bundle.dst == node:
-            return 1.0
-
-        if ptype == "transfer_order":
-            if node in authority_targets or self._is_authority(node):
-                return 0.95
-
-        if ptype == "signed_transfer_order":
-            sender_host = hints.get("sender_host") or account_host(data.get("sender") or data.get("s"))
-            if sender_host == node:
-                return 0.95
-
-        if ptype == "confirmation_order":
-            recipient_host = hints.get("recipient_host") or account_host(data.get("recipient") or data.get("r"))
-            if recipient_host == node:
-                return 0.90
-            if node in authority_targets or self._is_authority(node):
-                return 0.85
-
-        return 0.0
-
-    # ------------------------------------------------------------------
     # Scoring and replication control
     # ------------------------------------------------------------------
-
-    def _score_for_node(
-        self,
-        bundle: Bundle,
-        node: str,
-        predictabilities: dict[str, float],
-    ) -> float:
-        return max(
-            predictabilities.get(bundle.dst, 0.0),
-            self._role_prior(bundle, node),
-        )
-
-    def _remaining_spray(self, bundle: Bundle) -> int:
-        forwarded = len(self._forwarded_to.get(bundle.bundle_id, set()))
-        return max(0, self.replication_budget - forwarded)
 
     def _can_replicate(self, bundle: Bundle, peer_node: str) -> bool:
         if bundle.dst == peer_node:
             return True
-        if self._role_prior(bundle, peer_node) > 0.0:
-            return True
-
-        ptype  = payload_type(bundle)
-        budget = self.replication_budget
-        if ptype == "transfer_order" and self._is_authority(peer_node):
-            budget = self.transfer_replication_budget
-        elif ptype == "confirmation_order":
-            budget *= 4
-        elif ptype == "signed_transfer_order":
-            budget *= 2
-
         peers = self._forwarded_to.setdefault(bundle.bundle_id, set())
-        return peer_node in peers or len(peers) < budget
-
-    def _priority_tuple(self, bundle: Bundle, peer_score: float) -> tuple[int, float, float]:
-        ptype = payload_type(bundle)
-        return (
-            PAYLOAD_PRIORITIES.get(ptype, 3),
-            -peer_score,
-            bundle.created_at,
-        )
+        return peer_node in peers or len(peers) < self.replication_budget
 
     # ------------------------------------------------------------------
     # Bundle selection
@@ -273,7 +167,7 @@ class ProphetRouter(DTNRouter):
         local_snapshot: Optional[List[Bundle]] = None,
     ) -> List[Bundle]:
         known = set(peer_ids)
-        selected: List[tuple[tuple[int, float, float], Bundle, float, float, bool]] = []
+        selected: List[tuple[float, Bundle, float, float, bool]] = []
 
         with self._state_lock:
             self._age_predictabilities()
@@ -293,20 +187,19 @@ class ProphetRouter(DTNRouter):
                     self._forwarded_to.pop(bundle_id, None)
 
             for bundle in candidates:
-                local_score = self._score_for_node(bundle, self.node, self._predictabilities)
-                peer_score  = self._score_for_node(bundle, peer_node, peer_preds)
+                local_score = self._predictabilities.get(bundle.dst, 0.0)
+                peer_score  = peer_preds.get(bundle.dst, 0.0)
                 direct      = bundle.dst == peer_node
-                role_boost  = self._role_prior(bundle, peer_node) > 0.0
 
                 if not self._can_replicate(bundle, peer_node):
                     continue
 
                 is_prophet_forward = peer_score > local_score + self.epsilon
-                in_initial_spray   = self._remaining_spray(bundle) > 0
 
-                if direct or role_boost or is_prophet_forward or in_initial_spray:
+                if direct or is_prophet_forward:
+                    # Sort primarily by created_at (fifo or earliest first)
                     selected.append((
-                        self._priority_tuple(bundle, peer_score),
+                        bundle.created_at,
                         bundle,
                         local_score,
                         peer_score,
@@ -316,22 +209,18 @@ class ProphetRouter(DTNRouter):
             selected = sorted(selected, key=lambda item: item[0])[: self.max_bundles_per_exchange]
             bundles: List[Bundle] = []
 
-            for _priority, bundle, local_score, peer_score, direct in selected:
+            for _created_at, bundle, local_score, peer_score, direct in selected:
                 bundles.append(bundle)
-                role_prior = self._role_prior(bundle, peer_node)
-                if not direct and role_prior == 0.0:
+                if not direct:
                     self._forwarded_to.setdefault(bundle.bundle_id, set()).add(peer_node)
                 self.record_event({
                     "event":                "prophet_forwarded",
                     "peer":                 peer_node,
                     "bundle_id":            bundle.bundle_id,
                     "dst":                  bundle.dst,
-                    "payload_type":         payload_type(bundle),
                     "local_predictability": local_score,
                     "peer_predictability":  peer_score,
                     "direct_delivery":      direct,
-                    "role_prior":           role_prior,
-                    "remaining_spray":      self._remaining_spray(bundle),
                 })
 
         return bundles

@@ -9,7 +9,12 @@ from pathlib import Path
 from typing import Sequence
 
 from attacks.targeted_load import SyntheticLoadInjector
-from attacks.packet_loss import apply_packet_loss, cleanup_packet_loss, select_targets
+from attacks.packet_loss import (
+    apply_packet_loss,
+    cleanup_packet_loss,
+    collect_packet_loss_stats,
+    select_targets,
+)
 
 
 class BenchmarkAttack:
@@ -54,6 +59,9 @@ class BenchmarkAttack:
         self._thread: threading.Thread | None = None
         self._load_injector: SyntheticLoadInjector | None = None
         self._packet_loss_active = False
+        self._packet_loss_installation: dict | None = None
+        self._packet_loss_drop_counters: dict | None = None
+        self._packet_loss_cleanup: dict | None = None
 
     def metadata(self) -> dict:
         return {
@@ -72,6 +80,22 @@ class BenchmarkAttack:
             "targets": list(self.target_names),
             "load_rate": self.load_rate,
             "seed": self.seed,
+            "attack_mode": (
+                "endpoint_iptables_drop"
+                if self.attack_type in {"packetloss", "packetloss-load"}
+                else self.attack_type
+            ),
+            "target_fraction": (
+                len(self.targets) / len(self.all_nodes)
+                if self.all_nodes
+                else 0.0
+            ),
+            "packet_loss_installation": self._packet_loss_installation,
+            "packet_loss_drop_counters": self._packet_loss_drop_counters,
+            "packet_loss_cleanup": self._packet_loss_cleanup,
+            "packet_loss_rules_remaining_after_cleanup": (
+                self._packet_loss_cleanup or {}
+            ).get("remaining_rules"),
         }
 
     def write_metadata(self) -> None:
@@ -79,6 +103,25 @@ class BenchmarkAttack:
         with (self.log_dir / "attack_metadata.json").open("w", encoding="utf-8") as f:
             json.dump(self.metadata(), f, indent=2, sort_keys=True)
             f.write("\n")
+
+    def _cleanup_packet_loss_rules(self) -> None:
+        self._packet_loss_drop_counters = collect_packet_loss_stats(self.targets)
+        rules_before = int(
+            (self._packet_loss_drop_counters.get("totals", {}) if self._packet_loss_drop_counters else {})
+            .get("rules", 0)
+            or 0
+        )
+        cleanup_packet_loss(self.targets)
+        post_cleanup = collect_packet_loss_stats(self.targets)
+        remaining_rules = int(post_cleanup.get("totals", {}).get("rules", 0) or 0)
+        self._packet_loss_cleanup = {
+            "rules_before_cleanup": rules_before,
+            "remaining_rules": remaining_rules,
+            "removed_rules": max(rules_before - remaining_rules, 0),
+            "cleanup_success": remaining_rules == 0,
+            "post_cleanup_counters": post_cleanup,
+        }
+        self._packet_loss_active = False
 
     def start(self, started_at: float) -> None:
         if self.attack_type == "none" or self._thread is not None:
@@ -104,8 +147,7 @@ class BenchmarkAttack:
             self._load_injector = None
 
         if self._packet_loss_active:
-            cleanup_packet_loss(self.targets)
-            self._packet_loss_active = False
+            self._cleanup_packet_loss_rules()
 
         if self._thread is not None:
             self._thread.join(timeout=2.0)
@@ -118,6 +160,7 @@ class BenchmarkAttack:
                     **self.metadata(),
                 }
             )
+            self.write_metadata()
 
     def _run(self) -> None:
         if not self._sleep(self.tpre):
@@ -131,8 +174,14 @@ class BenchmarkAttack:
         )
 
         if self.attack_type in {"packetloss", "packetloss-load"}:
-            apply_packet_loss(self.targets, self.loss_probability)
+            self._packet_loss_installation = apply_packet_loss(self.targets, self.loss_probability)
             self._packet_loss_active = True
+            self.runtime.record_event(
+                {
+                    "event": "packet_loss_rules_installed",
+                    **self.metadata(),
+                }
+            )
 
         if self.attack_type in {"load", "packetloss-load"}:
             sources = [
@@ -156,8 +205,19 @@ class BenchmarkAttack:
             self._load_injector = None
 
         if self._packet_loss_active:
-            cleanup_packet_loss(self.targets)
-            self._packet_loss_active = False
+            self._cleanup_packet_loss_rules()
+            self.runtime.record_event(
+                {
+                    "event": "packet_loss_drop_counters",
+                    **self.metadata(),
+                }
+            )
+            self.runtime.record_event(
+                {
+                    "event": "packet_loss_rules_removed",
+                    **self.metadata(),
+                }
+            )
 
         self.runtime.record_event(
             {
@@ -165,6 +225,7 @@ class BenchmarkAttack:
                 **self.metadata(),
             }
         )
+        self.write_metadata()
 
     def _sleep(self, duration: float) -> bool:
         deadline = time.time() + max(duration, 0.0)

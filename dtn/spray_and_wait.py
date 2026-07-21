@@ -28,20 +28,11 @@ class SprayAndWaitRouter(DTNRouter):
         self._copies: dict[str, int] = {}
         self._pending_peer_copies: dict[tuple[str, str], int] = {}
 
-    def _payload_type(self, bundle: Bundle) -> str:
-        if isinstance(bundle.payload, dict):
-            return str(bundle.payload.get("type", ""))
-        return ""
-
     def _ensure_copies(self, bundle: Bundle) -> int:
         copies = self._copies.get(bundle.bundle_id)
         if copies is None:
             if bundle.src == self.node:
-                base = self.initial_copies
-                if self._payload_type(bundle) == "confirmation_order":
-                    # Confirmation bundles are critical for MeshPay finality.
-                    base = min(base * 2, 14)
-                copies = base
+                copies = self.initial_copies
             else:
                 copies = 1
             self._copies[bundle.bundle_id] = copies

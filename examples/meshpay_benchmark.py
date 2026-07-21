@@ -34,6 +34,7 @@ from mn_wifi.wmediumdConnector import interference
 
 from attacks.controller import BenchmarkAttack
 from meshpay.benchmark.payment_metrics import collect_payment_metrics
+from meshpay.benchmark.network_metrics import collect_network_metrics
 from meshpay.benchmark.report import write_reports
 from meshpay.cli.meshpay_cli import MeshPayRuntime
 from meshpay.offline.nodes.authority import Authority
@@ -80,6 +81,7 @@ class MeshPayBenchmarkConfig:
     no_mobility: bool
 
     plot: bool
+    network_sample_interval: float
 
     attack: str
     attack_loss_probability: float
@@ -128,6 +130,9 @@ class MeshPayBenchmarkConfig:
 
         if self.settle_time < 0:
             raise ValueError("--settle-time must be >= 0")
+
+        if self.network_sample_interval <= 0:
+            raise ValueError("--network-sample-interval must be greater than 0")
 
         if self.max_submit_workers < 1:
             raise ValueError("--max-submit-workers must be >= 1")
@@ -326,6 +331,13 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--network-sample-interval",
+        type=float,
+        default=1.0,
+        help="Sample interval in seconds for Linux interface counter collection.",
+    )
+
+    parser.add_argument(
         "--attack",
         default="none",
         choices=["none", "packetloss", "load", "packetloss-load"],
@@ -417,6 +429,7 @@ def build_config(args: argparse.Namespace) -> MeshPayBenchmarkConfig:
         mobility_start=1.0,
         no_mobility=args.no_mobility,
         plot=args.plot,
+        network_sample_interval=args.network_sample_interval,
         attack=args.attack,
         attack_loss_probability=args.attack_loss_probability,
         attack_tpre=args.attack_tpre,
@@ -703,12 +716,82 @@ class NetworkStatsCollector(threading.Thread):
         self.join(timeout=2.0)
 
 
+class RawNetworkStatsCollector(threading.Thread):
+    def __init__(self, log_dir: Path | str, nodes, interval: float = 1.0, benchmark_started_at: float = 0.0):
+        super().__init__(name="RawNetworkStatsCollector")
+        self.log_dir = Path(log_dir)
+        self.nodes = nodes
+        self.interval = interval
+        self.benchmark_started_at = benchmark_started_at
+        self.stop_event = threading.Event()
+        self.daemon = True
+        self.output_file = self.log_dir / "network_raw.jsonl"
+
+    def _collect_once(self) -> None:
+        from meshpay.mininet_cmd import safe_node_cmd
+        timestamp = time.time()
+        relative_timestamp = timestamp - self.benchmark_started_at
+        
+        records = []
+        for node in self.nodes:
+            iface = node.params.get("wlan", [f"{node.name}-wlan0"])[0]
+            try:
+                cmd = f"cat /sys/class/net/{iface}/statistics/rx_bytes " \
+                      f"/sys/class/net/{iface}/statistics/tx_bytes " \
+                      f"/sys/class/net/{iface}/statistics/rx_packets " \
+                      f"/sys/class/net/{iface}/statistics/tx_packets " \
+                      f"/sys/class/net/{iface}/statistics/rx_dropped " \
+                      f"/sys/class/net/{iface}/statistics/tx_dropped " \
+                      f"/sys/class/net/{iface}/statistics/rx_errors " \
+                      f"/sys/class/net/{iface}/statistics/tx_errors"
+                res = safe_node_cmd(node, cmd)
+                lines = res.strip().splitlines()
+                if len(lines) == 8:
+                    records.append({
+                        "node": node.name,
+                        "iface": iface,
+                        "time": timestamp,
+                        "relative_time_s": relative_timestamp,
+                        "rx_bytes": int(lines[0]),
+                        "tx_bytes": int(lines[1]),
+                        "rx_packets": int(lines[2]),
+                        "tx_packets": int(lines[3]),
+                        "rx_dropped": int(lines[4]),
+                        "tx_dropped": int(lines[5]),
+                        "rx_errors": int(lines[6]),
+                        "tx_errors": int(lines[7]),
+                    })
+            except Exception:
+                pass
+        
+        if records:
+            try:
+                with self.output_file.open("a", encoding="utf-8") as f:
+                    for record in records:
+                        f.write(json.dumps(record) + "\n")
+            except Exception:
+                pass
+
+    def run(self) -> None:
+        self._collect_once()
+        while not self.stop_event.wait(self.interval):
+            self._collect_once()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        try:
+            self._collect_once()
+        except Exception:
+            pass
+        self.join(timeout=2.0)
+
+
 def run_payment_traffic(
     runtime: MeshPayRuntime,
     clients,
     config: MeshPayBenchmarkConfig,
     attack_controller: BenchmarkAttack | None = None,
-) -> tuple[float, float]:
+) -> tuple[float, float, RawNetworkStatsCollector]:
     """Generate payments between virtual accounts based on time and rate."""
 
     rng = random.Random(config.seed)
@@ -751,10 +834,11 @@ def run_payment_traffic(
     traffic_deadline = started_at + traffic_duration
 
     # Start the network stats collector
-    stats_collector = NetworkStatsCollector(
-        runtime=runtime,
+    stats_collector = RawNetworkStatsCollector(
+        log_dir=config.log_dir,
         nodes=list(clients) + list(runtime.authorities),
-        interval=5.0
+        interval=config.network_sample_interval,
+        benchmark_started_at=started_at
     )
     stats_collector.start()
 
@@ -810,6 +894,8 @@ def run_payment_traffic(
     info(f"*** Using ThreadPoolExecutor with {max_workers} workers\n")
 
     target_payments = int(config.payment_rate * traffic_duration)
+
+    traffic_completed = False
 
     try:
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -872,8 +958,10 @@ def run_payment_traffic(
                         next_submit_at = time.time()
 
                 executor.submit(worker_task, sender_account, recipient_account)
+        traffic_completed = True
     finally:
-        stats_collector.stop()
+        if not traffic_completed:
+            stats_collector.stop()
 
     submission_finished_at = time.time()
 
@@ -890,12 +978,14 @@ def run_payment_traffic(
 
     ended_at = time.time()
 
-    return started_at, ended_at
+    return started_at, ended_at, stats_collector
 
 def print_summary(report: dict) -> None:
-    summary = report["summary"]
-    quorum = report["latency_ms"]["time_to_quorum"]
-    accepted = report["latency_ms"]["time_to_acceptance"]
+    pm = report["payment_metrics"]
+    nm = report.get("network_metrics", {})
+    summary = pm["summary"]
+    quorum = pm["latency_ms"]["time_to_quorum"]
+    accepted = pm["latency_ms"]["time_to_acceptance"]
 
     info("\n*** MeshPay payment benchmark summary\n")
     info(f"payments_created:                  {summary['payments_created']}\n")
@@ -909,13 +999,14 @@ def print_summary(report: dict) -> None:
     info(f"confirmed_tps:                     {summary['confirmed_tps']:.4f}\n")
     info(f"accepted_tps:                      {summary['accepted_tps']:.4f}\n")
 
-    info(f"tx_payloads_per_second:            {summary['tx_payloads_per_second']:.4f}\n")
-    info(f"rx_payloads_per_second:            {summary['rx_payloads_per_second']:.4f}\n")
-    info(f"tx_plus_rx_payloads_per_second:    {summary['tx_plus_rx_payloads_per_second']:.4f}\n")
-
-    info(f"tx_bytes_per_second:               {summary['tx_bytes_per_second']:.4f}\n")
-    info(f"rx_bytes_per_second:               {summary['rx_bytes_per_second']:.4f}\n")
-    info(f"tx_plus_rx_bytes_per_second:       {summary['tx_plus_rx_bytes_per_second']:.4f}\n")
+    if nm and "summary" in nm:
+        nm_sum = nm["summary"]
+        info(f"tx_packets_per_second:             {nm_sum.get('tx_packets_rate', 0.0):.4f}\n")
+        info(f"rx_packets_per_second:             {nm_sum.get('rx_packets_rate', 0.0):.4f}\n")
+        info(f"tx_plus_rx_packets_per_second:     {nm_sum.get('tx_plus_rx_packets_rate', 0.0):.4f}\n")
+        info(f"tx_bytes_per_second:               {nm_sum.get('tx_bytes_rate', 0.0):.4f}\n")
+        info(f"rx_bytes_per_second:               {nm_sum.get('rx_bytes_rate', 0.0):.4f}\n")
+        info(f"tx_plus_rx_bytes_per_second:       {nm_sum.get('tx_plus_rx_bytes_rate', 0.0):.4f}\n")
 
     if quorum["avg"] is not None:
         info(f"avg_time_to_quorum_ms: {quorum['avg']:.4f}\n")
@@ -1046,6 +1137,8 @@ def topology(config: MeshPayBenchmarkConfig) -> None:
 
     started_at = time.time()
     ended_at = started_at
+    traffic_ended_at = started_at
+    stats_collector = None
 
     previous_env = _set_lightweight_dtn_metric_env()
 
@@ -1056,36 +1149,56 @@ def topology(config: MeshPayBenchmarkConfig) -> None:
             info(f"*** Warm-up: waiting {config.warmup:.2f}s\n")
             time.sleep(config.warmup)
 
-        started_at, traffic_ended_at = run_payment_traffic(
+        started_at, traffic_ended_at, stats_collector = run_payment_traffic(
             runtime=runtime,
             clients=clients,
             config=config,
             attack_controller=attack_controller,
         )
 
+        settle_started_at = time.time()
         if config.settle_time > 0:
             info(f"*** DTN settle/drain: waiting {config.settle_time:.2f}s after traffic stops\n")
             time.sleep(config.settle_time)
 
         ended_at = time.time()
 
+        if stats_collector is not None:
+            stats_collector.stop()
+            stats_collector = None
+
         # Runtime records payment events in memory to avoid payment.log writes
         # on the hot path.  Flush once before the existing metrics collector
         # reads payment.log.
         runtime.flush_payment_log()
 
-        report = collect_payment_metrics(
+        payment_metrics = collect_payment_metrics(
             log_dir=config.log_dir,
             started_at=started_at,
             ended_at=ended_at,
         )
 
-        report["config"] = config.to_dict()
-        report["timing"] = {
-            "started_at": started_at,
-            "traffic_ended_at": traffic_ended_at,
-            "ended_at": ended_at,
-            "settle_time_s": config.settle_time,
+        network_metrics = collect_network_metrics(
+            log_dir=config.log_dir,
+            started_at=started_at,
+            ended_at=ended_at,
+        )
+
+        report = {
+            "payment_metrics": payment_metrics,
+            "network_metrics": network_metrics,
+            "config": config.to_dict(),
+            "timing": {
+                "started_at": started_at,
+                "traffic_started_at": started_at,
+                "traffic_ended_at": traffic_ended_at,
+                "traffic_duration_s": max(traffic_ended_at - started_at, 0.0),
+                "settle_started_at": settle_started_at,
+                "settle_ended_at": ended_at,
+                "ended_at": ended_at,
+                "settle_time_s": config.settle_time,
+                "network_raw_covers_settle": True,
+            }
         }
 
         if attack_controller is not None:
@@ -1100,6 +1213,9 @@ def topology(config: MeshPayBenchmarkConfig) -> None:
 
     finally:
         _restore_env(previous_env)
+
+        if stats_collector is not None:
+            stats_collector.stop()
 
         if attack_controller is not None:
             attack_controller.cleanup()
