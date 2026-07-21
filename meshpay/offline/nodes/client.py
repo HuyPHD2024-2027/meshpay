@@ -1,0 +1,264 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import threading
+import time
+from typing import Dict, List, Optional
+from uuid import uuid4
+
+from mn_wifi.node import Station
+
+from meshpay.offline.virtual_accounts import make_account_id
+from meshpay.offline.crypto import sign_payload, verify_signature
+from meshpay.offline.quorum import quorum_threshold
+from meshpay.offline.wallet import Wallet
+from meshpay.types.common import TransactionStatus
+from meshpay.types.transaction import (
+    ConfirmationOrder,
+    SignedTransferOrder,
+    TransferOrder,
+)
+
+
+class Client(Station):
+    """Offline MeshPay client.
+
+    The client processes one outgoing transfer at a time.
+
+    State:
+        pending_transfer:
+            The current TransferOrder created by this client.
+
+        signed_transfer_orders:
+            Authority signatures collected for the current pending transfer.
+
+        confirmation_orders:
+            ConfirmationOrders accepted or created by this client.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        committee: List[str] | None = None,
+        initial_balance: int = 100,
+        accounts_per_station: int = 0,
+        **params,
+    ) -> None:
+        super().__init__(name, **params)
+
+        self.name = name
+        self.committee = committee or []
+        self._lock = threading.RLock()
+
+        # Legacy physical-station account, useful for interactive testing:
+        #   pay sta1 sta3 10
+        self.accounts: Dict[str, Wallet] = {
+            name: Wallet(owner=name, balance=initial_balance)
+        }
+
+        # Virtual logical accounts, useful for large benchmarks:
+        #   sta1/u00001
+        #   sta1/u00002
+        #   ...
+        for index in range(1, accounts_per_station + 1):
+            account_id = make_account_id(name, index)
+            self.accounts[account_id] = Wallet(
+                owner=account_id,
+                balance=initial_balance,
+            )
+
+        # One pending outgoing transfer per logical account.
+        self.pending_by_account: Dict[str, str] = {}
+
+        # Many pending transfers per physical station.
+        self.pending_transfers: Dict[str, TransferOrder] = {}
+
+        # order_id -> authority_name -> SignedTransferOrder
+        self.signed_transfer_orders: Dict[str, Dict[str, SignedTransferOrder]] = {}
+
+        self.confirmation_orders: Dict[str, ConfirmationOrder] = {}
+
+    def pay(
+        self,
+        recipient: str,
+        amount: int,
+        sender_account: str | None = None,
+    ) -> TransferOrder:
+        """Create one outgoing TransferOrder.
+
+        sender_account:
+            None means use the physical station account, e.g. "sta1".
+            Otherwise use a hosted virtual account, e.g. "sta1/u00042".
+        """
+        with self._lock:
+            sender_account = sender_account or self.name
+
+            if sender_account not in self.accounts:
+                raise ValueError(f"{self.name} does not host account {sender_account}")
+
+            if amount <= 0:
+                raise ValueError("amount must be positive")
+
+            if sender_account in self.pending_by_account:
+                raise RuntimeError(f"account already has a pending transfer: {sender_account}")
+
+            wallet = self.accounts[sender_account]
+
+            if wallet.balance < amount:
+                raise ValueError(f"insufficient balance for {sender_account}")
+
+            sequence = wallet.next_sequence()
+
+            order = TransferOrder(
+                order_id=uuid4(),
+                sender=sender_account,
+                recipient=recipient,
+                amount=amount,
+                sequence_number=sequence,
+                timestamp=time.time(),
+                signature=None,
+            )
+
+            order.signature = sign_payload(sender_account, order.signing_dict())
+
+            order_id = str(order.order_id)
+
+            self.pending_by_account[sender_account] = order_id
+            self.pending_transfers[order_id] = order
+            self.signed_transfer_orders[order_id] = {}
+
+            return order
+
+    def handle_signed_transfer(
+        self,
+        signed: SignedTransferOrder,
+    ) -> Optional[ConfirmationOrder]:
+        """Collect authority signatures and form ConfirmationOrder on quorum."""
+        with self._lock:
+            order = signed.transfer_order
+            order_id = str(order.order_id)
+
+            pending = self.pending_transfers.get(order_id)
+
+            if pending is None:
+                return None
+
+            if order.sender not in self.accounts:
+                return None
+
+            if order.sequence_number != pending.sequence_number:
+                return None
+
+            signatures_for_order = self.signed_transfer_orders.setdefault(order_id, {})
+
+            for authority, signature in signed.authority_signature.items():
+                if not verify_signature(authority, order.signing_dict(), signature):
+                    continue
+
+                signatures_for_order[authority] = signed
+
+            threshold = quorum_threshold(len(self.committee))
+
+            if len(signatures_for_order) < threshold:
+                return None
+
+            signatures = []
+
+            for signed_order in signatures_for_order.values():
+                signatures.extend(signed_order.authority_signature.values())
+
+            confirmation = ConfirmationOrder(
+                order_id=pending.order_id,
+                transfer_order=pending,
+                authority_signatures=signatures,
+                timestamp=time.time(),
+                status=TransactionStatus.CONFIRMED,
+            )
+
+            wallet = self.accounts[pending.sender]
+            wallet.debit(pending.amount)
+
+            self.confirmation_orders[order_id] = confirmation
+
+            self.pending_transfers.pop(order_id, None)
+            self.signed_transfer_orders.pop(order_id, None)
+            self.pending_by_account.pop(pending.sender, None)
+
+            return confirmation
+
+    def handle_confirmation(self, confirmation: ConfirmationOrder) -> bool:
+        """Apply a ConfirmationOrder if this station hosts the recipient account."""
+        with self._lock:
+            order = confirmation.transfer_order
+            order_id = str(order.order_id)
+
+            if order.recipient not in self.accounts:
+                return False
+
+            if order_id in self.confirmation_orders:
+                return False
+
+            threshold = quorum_threshold(len(self.committee))
+
+            if len(confirmation.authority_signatures) < threshold:
+                return False
+
+            wallet = self.accounts[order.recipient]
+            wallet.credit(order.amount)
+
+            self.confirmation_orders[order_id] = confirmation
+
+            return True
+
+    def on_payment_object(self, obj) -> List[object]:
+        """Handle a decoded payment object.
+
+        Returns payment objects that should be injected into DTN.
+        """
+
+        if isinstance(obj, SignedTransferOrder):
+            confirmation = self.handle_signed_transfer(obj)
+            return [confirmation] if confirmation else []
+
+        if isinstance(obj, ConfirmationOrder):
+            self.handle_confirmation(obj)
+            return []
+
+        return []
+
+    @property
+    def balance(self) -> int:
+        """Total balance across all accounts hosted by this physical station."""
+
+        return sum(wallet.balance for wallet in self.accounts.values())
+
+
+    def account_balance(self, account_id: str) -> int:
+        wallet = self.accounts.get(account_id)
+
+        if wallet is None:
+            return 0
+
+        return wallet.balance
+
+
+    def hosted_accounts(self, virtual_only: bool = False) -> List[str]:
+        accounts = list(self.accounts.keys())
+
+        if virtual_only:
+            return [account for account in accounts if "/" in account]
+
+        return accounts
+
+
+    def can_pay_from(self, account_id: str, amount: int) -> bool:
+        wallet = self.accounts.get(account_id)
+
+        if wallet is None:
+            return False
+
+        if account_id in self.pending_by_account:
+            return False
+
+        return wallet.balance >= amount
