@@ -1,44 +1,51 @@
-"""Common types, enums, and type aliases for MeshPay."""
+"""Common MeshPay types used by transaction and state models."""
 
 from __future__ import annotations
 
-from enum import Enum
-from typing import Any, Dict, NewType
 from dataclasses import dataclass
-
-KeyPair = NewType("KeyPair", str)
-AuthorityName = str
-ClientAddress = str
-MessagePayload = Dict[str, Any]
+from enum import Enum
+from typing import NewType
 
 
-class NodeType(Enum):
-    """Type of node in the network."""
-
-    AUTHORITY = "authority"
-    CLIENT = "client"
-    GATEWAY = "gateway"
+AuthorityName = NewType("AuthorityName", str)
 
 
 class TransactionStatus(Enum):
-    """Status of a transaction."""
+    """Basic transaction status values."""
 
     PENDING = "pending"
-    BUFFERED = "buffered"  # Awaiting quorum, will retry
     CONFIRMED = "confirmed"
     REJECTED = "rejected"
-    FINALIZED = "finalized"
+    BUFFERED = "buffered"
+    EXPIRED = "expired"
+    FAILED = "failed"
 
 
-@dataclass
+class NodeType(Enum):
+    """MeshPay node roles."""
+
+    CLIENT = "client"
+    AUTHORITY = "authority"
+    GATEWAY = "gateway"
+    RELAY = "relay"
+
+
+@dataclass(frozen=True)
+class KeyPair:
+    """Placeholder key pair for the first clean implementation.
+
+    Later we can replace this with real public/private key handling.
+    """
+
+    private_key: str
+    public_key: str = ""
+
+
+@dataclass(frozen=True)
 class Address:
-    """Network address for a node."""
+    """Network address for a MeshPay node."""
 
     node_id: str
     ip_address: str
     port: int
     node_type: NodeType
-
-    def __str__(self) -> str:
-        """Return string representation of address."""
-        return f"{self.node_type.value}:{self.node_id}@{self.ip_address}:{self.port}"

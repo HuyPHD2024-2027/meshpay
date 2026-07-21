@@ -6,11 +6,11 @@
 import warnings
 import time
 import numpy as np
-import matplotlib.pyplot as plt
 
 from threading import Thread as thread
 from datetime import datetime
 from time import sleep
+
 
 from mininet.log import error
 from mn_wifi.clean import Cleanup as CleanupWifi
@@ -18,6 +18,8 @@ from mn_wifi.clean import Cleanup as CleanupWifi
 
 class PlotEnergy:
     def __init__(self, nodes, title="Battery Consumption", **kwargs):
+        import matplotlib.pyplot as plt  # lazy import to avoid slow pyparsing init
+        self.plt = plt
         warnings.filterwarnings("ignore")
         self.nodes = nodes
         self.running = True
@@ -25,8 +27,8 @@ class PlotEnergy:
         for node in self.nodes:
             node.down = False
 
-        plt.ion()
-        self.fig, self.ax = plt.subplots(figsize=(9, 6))
+        self.plt.ion()
+        self.fig, self.ax = self.plt.subplots(figsize=(9, 6))
 
         self.bars = self.ax.bar(
             range(len(self.nodes)),
@@ -66,6 +68,7 @@ class PlotEnergy:
         return colors
 
     def update(self):
+        plt = self.plt
         if not plt.fignum_exists(self.fig.number):
             self.stop()
             return
@@ -102,7 +105,7 @@ class PlotEnergy:
 
     def stop(self):
         self.running = False
-        plt.close(self.fig)
+        self.plt.close(self.fig)
 
 
 class EnergyMonitor:
@@ -117,6 +120,7 @@ class EnergyMonitor:
     @classmethod
     def pause(cls):
         try:
+            import matplotlib.pyplot as plt
             plt.pause(0.001)
         except:
             pass
@@ -124,6 +128,7 @@ class EnergyMonitor:
     @classmethod
     def close(cls):
         try:
+            import matplotlib.pyplot as plt
             plt.close()
         except:
             pass
