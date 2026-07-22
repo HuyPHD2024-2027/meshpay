@@ -161,6 +161,18 @@ def parse_args() -> argparse.Namespace:
         default=100,
         help="Number of virtual logical accounts hosted by each client station.",
     )
+    parser.add_argument(
+        "--weight-epoch-size",
+        type=int,
+        default=100,
+        help="Finalized confirmations per weighted-voting epoch.",
+    )
+    parser.add_argument(
+        "--max-voting-power-share",
+        type=float,
+        default=0.30,
+        help="Maximum normalized authority voting share.",
+    )
 
     parser.add_argument(
         "--no-dtn-metric-logs",
@@ -194,6 +206,12 @@ def validate_args(args: argparse.Namespace) -> None:
 
     if args.accounts_per_station < 1:
         raise SystemExit("--accounts-per-station must be at least 1.")
+
+    if args.weight_epoch_size < 1:
+        raise SystemExit("--weight-epoch-size must be at least 1.")
+
+    if not 0.0 < args.max_voting_power_share <= 1.0:
+        raise SystemExit("--max-voting-power-share must be in (0, 1].")
     
     if args.initial_balance < 0:
         raise SystemExit("--initial-balance must be >= 0.")
@@ -253,7 +271,7 @@ def build_initial_balances(
 
     return balances
 
-def create_meshpay_nodes(net: Mininet_wifi, args: argparse.Namespace):
+def create_meshpay_nodes(net: Mininet_wifi, args: argparse.Namespace, log_dir: Path):
     clients = []
     authorities = []
 
@@ -290,6 +308,9 @@ def create_meshpay_nodes(net: Mininet_wifi, args: argparse.Namespace):
             committee=authority_names,
             initial_balance=args.initial_balance,
             accounts_per_station=args.accounts_per_station,
+            weight_state_path=log_dir / "weighted_quorum_state.json",
+            weight_epoch_size=args.weight_epoch_size,
+            max_voting_power_share=args.max_voting_power_share,
             **params,
         )
 
@@ -311,6 +332,9 @@ def create_meshpay_nodes(net: Mininet_wifi, args: argparse.Namespace):
             committee=authority_names,
             initial_balances=initial_balances,
             port=8000 + node_index,
+            weight_state_path=log_dir / "weighted_quorum_state.json",
+            weight_epoch_size=args.weight_epoch_size,
+            max_voting_power_share=args.max_voting_power_share,
             **params,
         )
 
@@ -439,7 +463,7 @@ def topology(args: argparse.Namespace) -> None:
     net = Mininet_wifi(link=wmediumd, wmediumd_mode=interference)
 
     info("*** Creating MeshPay clients and authorities\n")
-    clients, authorities = create_meshpay_nodes(net, args)
+    clients, authorities = create_meshpay_nodes(net, args, log_dir)
     nodes = clients + authorities
 
     info("*** Configuring propagation model\n")

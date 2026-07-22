@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
+from pathlib import Path
 from typing import Dict, List, Optional
 from uuid import uuid4
 
@@ -11,7 +12,8 @@ from mn_wifi.node import Station
 
 from meshpay.offline.virtual_accounts import make_account_id
 from meshpay.offline.crypto import sign_payload, verify_signature
-from meshpay.offline.quorum import quorum_threshold
+from meshpay.offline.quorum import has_weighted_quorum, verify_authority_vote
+from meshpay.offline.weighted_quorum import WeightRegistry
 from meshpay.offline.wallet import Wallet
 from meshpay.types.common import TransactionStatus
 from meshpay.types.transaction import (
@@ -43,12 +45,22 @@ class Client(Station):
         committee: List[str] | None = None,
         initial_balance: int = 100,
         accounts_per_station: int = 0,
+        weight_state_path: str | Path = "weighted_quorum_state.json",
+        weight_epoch_size: int = 100,
+        max_voting_power_share: float = 0.30,
         **params,
     ) -> None:
         super().__init__(name, **params)
 
         self.name = name
         self.committee = committee or []
+        self.weight_registry = WeightRegistry(
+            weight_state_path,
+            self.committee,
+            epoch_size=weight_epoch_size,
+            max_power_share=max_voting_power_share,
+        )
+        self.weight_registry.initialize()
         self._lock = threading.RLock()
 
         # Legacy physical-station account, useful for interactive testing:
@@ -152,27 +164,28 @@ class Client(Station):
 
             signatures_for_order = self.signed_transfer_orders.setdefault(order_id, {})
 
-            for authority, signature in signed.authority_signature.items():
-                if not verify_signature(authority, order.signing_dict(), signature):
-                    continue
-
-                signatures_for_order[authority] = signed
-
-            threshold = quorum_threshold(len(self.committee))
-
-            if len(signatures_for_order) < threshold:
+            vote = signed.authority_vote
+            snapshot = self.weight_registry.snapshot_for_epoch(vote.epoch)
+            if snapshot is None or not verify_authority_vote(order, vote, snapshot):
                 return None
+            if signatures_for_order:
+                existing_epoch = next(iter(signatures_for_order.values())).authority_vote.epoch
+                if existing_epoch != vote.epoch:
+                    return None
+            signatures_for_order[vote.authority] = signed
 
-            signatures = []
-
-            for signed_order in signatures_for_order.values():
-                signatures.extend(signed_order.authority_signature.values())
+            votes = [item.authority_vote for item in signatures_for_order.values()]
+            if not has_weighted_quorum(pending, votes, snapshot):
+                return None
 
             confirmation = ConfirmationOrder(
                 order_id=pending.order_id,
                 transfer_order=pending,
-                authority_signatures=signatures,
+                authority_votes=votes,
                 timestamp=time.time(),
+                quorum_epoch=snapshot.epoch,
+                total_weight_units=snapshot.total_weight_units,
+                committee_digest=snapshot.committee_digest,
                 status=TransactionStatus.CONFIRMED,
             )
 
@@ -180,6 +193,10 @@ class Client(Station):
             wallet.debit(pending.amount)
 
             self.confirmation_orders[order_id] = confirmation
+            self.weight_registry.record_finalization(
+                order_id,
+                [str(vote.authority) for vote in votes],
+            )
 
             self.pending_transfers.pop(order_id, None)
             self.signed_transfer_orders.pop(order_id, None)
@@ -199,9 +216,21 @@ class Client(Station):
             if order_id in self.confirmation_orders:
                 return False
 
-            threshold = quorum_threshold(len(self.committee))
-
-            if len(confirmation.authority_signatures) < threshold:
+            snapshot = self.weight_registry.snapshot_for_epoch(confirmation.quorum_epoch)
+            if snapshot is None:
+                return False
+            if (
+                confirmation.total_weight_units != snapshot.total_weight_units
+                or confirmation.committee_digest != snapshot.committee_digest
+                or not confirmation.authority_votes
+            ):
+                return False
+            if any(
+                not verify_authority_vote(order, vote, snapshot)
+                for vote in confirmation.authority_votes
+            ):
+                return False
+            if not has_weighted_quorum(order, confirmation.authority_votes, snapshot):
                 return False
 
             wallet = self.accounts[order.recipient]

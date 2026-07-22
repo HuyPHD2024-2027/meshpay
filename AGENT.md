@@ -152,7 +152,10 @@ payment_created
                 → payment_accepted
 ```
 
-Quorum threshold: `⌊4/3⌋ + 1 = 2` signatures from 4 authorities.
+Weighted quorum: each certificate carries signed epoch voting units and must exceed two-thirds
+of the epoch total. With four equal authorities, this requires three votes. The run-scoped
+`weighted_quorum_state.json` applies signer rewards every 100 finalizations and caps one
+authority at 30% voting power by default.
 
 Events are written to `payment.log` as JSONL, one event per line, with a `time` field
 (Unix timestamp) and `order_id` field for per-payment tracing.

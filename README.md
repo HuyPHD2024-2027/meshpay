@@ -28,7 +28,7 @@ MeshPay studies offline digital payment execution in disrupted or infrastructure
   * `TransferOrder`
   * `SignedTransferOrder`
   * `ConfirmationOrder`
-* Authority committee with quorum-based confirmation.
+* Performance-weighted authority committee with strict `>2/3` quorum confirmation.
 * Client and authority nodes implemented as Mininet-WiFi `Station` subclasses.
 * Support for physical station accounts and virtual logical accounts.
 * Direct `BundleStore` injection for high-volume benchmarks.
@@ -264,8 +264,8 @@ A MeshPay payment follows this flow:
 1. Sender creates TransferOrder.
 2. TransferOrder is injected into DTN and sent to all authorities.
 3. Authorities validate and sign the TransferOrder.
-4. Each authority returns a SignedTransferOrder to the sender.
-5. Sender collects quorum signatures.
+4. Each authority returns a SignedTransferOrder containing a signed weight-epoch vote.
+5. Sender collects votes representing strictly more than two-thirds of the epoch's voting power.
 6. Sender creates ConfirmationOrder.
 7. ConfirmationOrder is sent to the recipient and authorities.
 8. Recipient accepts the payment after receiving a valid ConfirmationOrder.
@@ -589,9 +589,20 @@ Known limitations:
 * The implementation is intended for simulation and experimental evaluation.
 * No production blockchain settlement layer is currently integrated.
 * No real mobile device deployment is included.
-* Confirmation orders should use authority-identified signatures for stronger verification in future versions.
 * Epidemic Routing can create many duplicate bundle copies under high load.
 * Large experiments should use virtual accounts instead of increasing physical Mininet-WiFi station count.
+
+### Weighted Voting
+
+Each run creates `weighted_quorum_state.json` in its log directory. Every authority starts
+with equal power; after every 100 unique confirmations, certificate signers receive one
+performance credit and the next immutable weight epoch is calculated. Individual power is
+capped at 30% by default. Certificates carry their epoch, committee digest, and signed voting
+units so delayed recipients and authorities can validate historical quorum decisions.
+
+Use `--weight-epoch-size` and `--max-voting-power-share` in the interactive demo and benchmark
+entry points to tune the emulation. This is a capped performance heuristic, not a formal
+stake-based BFT security model.
 
 ---
 

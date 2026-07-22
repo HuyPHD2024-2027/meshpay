@@ -79,6 +79,8 @@ class AuthorityState:
     authority_signature: Optional[str] = None
     last_sync_time: float = 0.0
     stake: int = 0
+    tx_count: int = 0
+    current_weight: int = 0
     balance: int = 0
     neighbors: Dict[str, "Address"] = field(default_factory=dict)
     seen_order_ids: Set[str] = field(default_factory=set)
