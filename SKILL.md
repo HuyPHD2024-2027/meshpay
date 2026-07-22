@@ -50,16 +50,20 @@ There is no P2P connection between client and authority — all messages go thro
 Step 1  — Sender creates TransferOrder (signed with sender's key)
 Step 2  — TransferOrder injected into DTN, addressed to ALL authorities
 Step 3  — Each authority validates sequence number, signs, returns SignedTransferOrder to sender
-Step 4  — Sender collects ≥ ⌊f+1⌋ signatures  (with 4 authorities, f=1, quorum=2)
+Step 4  — Sender collects signed authority votes representing strictly more than two-thirds
+          of the immutable weighted epoch (with 4 equal authorities, quorum=3)
 Step 5  — Sender creates ConfirmationOrder, injects into DTN addressed to recipient + authorities
 Step 6  — Recipient validates ConfirmationOrder, updates balance → payment_accepted
 Step 7  — Authorities update their off-chain account state
 ```
 
 ### Quorum
-- **f**: maximum number of Byzantine (faulty) authorities tolerated
-- With 4 authorities: f = 1, quorum = ⌊4/3⌋ + 1 = **2 signatures**
-- Implemented in `meshpay/offline/quorum.py`
+- Each benchmark/demo run stores epoch snapshots in `weighted_quorum_state.json`.
+- Authorities sign their epoch, voting units, total units, and committee digest with every vote.
+- A confirmation requires strictly more than two-thirds of that epoch's voting units. The
+  default 30% per-authority cap means the normal four-authority configuration needs three votes.
+- Signer performance credits are applied every 100 finalized certificates; this is an emulation
+  heuristic and does not establish a formal stake-based BFT fault bound.
 
 ### Virtual accounts
 Physical Mininet-WiFi stations (sta1 … sta6) each host N virtual accounts (sta1/u00001, etc.).

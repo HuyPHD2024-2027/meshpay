@@ -91,6 +91,8 @@ class MeshPayBenchmarkConfig:
     attack_target_count: str
     attack_load_rate: float
     keep_debug_logs: bool
+    weight_epoch_size: int
+    max_voting_power_share: float
 
     def to_dict(self) -> Dict[str, Any]:
         data = asdict(self)
@@ -136,6 +138,12 @@ class MeshPayBenchmarkConfig:
 
         if self.max_submit_workers < 1:
             raise ValueError("--max-submit-workers must be >= 1")
+
+        if self.weight_epoch_size < 1:
+            raise ValueError("--weight-epoch-size must be at least 1")
+
+        if not 0.0 < self.max_voting_power_share <= 1.0:
+            raise ValueError("--max-voting-power-share must be in (0, 1]")
 
         if self.node_range <= 0:
             raise ValueError("--node-range must be greater than 0")
@@ -384,6 +392,18 @@ def parse_args() -> argparse.Namespace:
         default=0.0,
         help="Targeted MeshPay payment submissions per second during load attacks. 0 means use payment rate.",
     )
+    parser.add_argument(
+        "--weight-epoch-size",
+        type=int,
+        default=100,
+        help="Finalized confirmations per weighted-voting epoch.",
+    )
+    parser.add_argument(
+        "--max-voting-power-share",
+        type=float,
+        default=0.30,
+        help="Maximum normalized authority voting share.",
+    )
 
     return parser.parse_args()
 
@@ -438,6 +458,8 @@ def build_config(args: argparse.Namespace) -> MeshPayBenchmarkConfig:
         attack_target_count=args.attack_target_count,
         attack_load_rate=args.attack_load_rate,
         keep_debug_logs=args.keep_debug_logs,
+        weight_epoch_size=args.weight_epoch_size,
+        max_voting_power_share=args.max_voting_power_share,
     )
 
     config.validate()
@@ -551,6 +573,9 @@ def create_meshpay_nodes(net: Mininet_wifi, config: MeshPayBenchmarkConfig):
             committee=authority_names,
             initial_balance=config.initial_balance,
             accounts_per_station=config.accounts_per_station,
+            weight_state_path=config.log_dir / "weighted_quorum_state.json",
+            weight_epoch_size=config.weight_epoch_size,
+            max_voting_power_share=config.max_voting_power_share,
             **params,
         )
 
@@ -567,6 +592,9 @@ def create_meshpay_nodes(net: Mininet_wifi, config: MeshPayBenchmarkConfig):
             committee=authority_names,
             initial_balances=initial_balances,
             port=8000 + index,
+            weight_state_path=config.log_dir / "weighted_quorum_state.json",
+            weight_epoch_size=config.weight_epoch_size,
+            max_voting_power_share=config.max_voting_power_share,
             **params,
         )
 
@@ -1199,6 +1227,16 @@ def topology(config: MeshPayBenchmarkConfig) -> None:
                 "settle_time_s": config.settle_time,
                 "network_raw_covers_settle": True,
             }
+        }
+
+        final_snapshot = clients[0].weight_registry.current_snapshot()
+        report["weighted_quorum"] = {
+            "epoch": final_snapshot.epoch,
+            "committee_digest": final_snapshot.committee_digest,
+            "weights": final_snapshot.weights,
+            "total_weight_units": final_snapshot.total_weight_units,
+            "epoch_size": config.weight_epoch_size,
+            "max_voting_power_share": config.max_voting_power_share,
         }
 
         if attack_controller is not None:

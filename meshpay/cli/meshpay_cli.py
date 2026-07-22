@@ -920,7 +920,12 @@ class MeshPayRuntime:
                     "sender_host": account_host(order.sender),
                     "recipient_host": recipient_host,
                     "order_id": str(order.order_id),
-                    "signatures": len(obj.authority_signatures),
+                    "signer_count": len(obj.authority_votes),
+                    "collected_weight_units": sum(
+                        vote.weight_units for vote in obj.authority_votes
+                    ),
+                    "total_weight_units": obj.total_weight_units,
+                    "quorum_epoch": obj.quorum_epoch,
                 }
             )
 

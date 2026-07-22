@@ -4,17 +4,21 @@ from __future__ import annotations
 
 import threading
 import time
+from pathlib import Path
 from typing import Dict, List, Optional
 
 from mn_wifi.node import Station
 
 from meshpay.offline.crypto import sign_payload, verify_signature
+from meshpay.offline.quorum import authority_vote_signing_dict, has_weighted_quorum, verify_authority_vote
+from meshpay.offline.weighted_quorum import WeightRegistry
 from meshpay.types.common import Address, NodeType, TransactionStatus
 from meshpay.types.state import AccountOffchainState, AuthorityState
 from meshpay.types.transaction import (
     ConfirmationOrder,
     SignedTransferOrder,
     TransferOrder,
+    AuthorityVote,
 )
 
 
@@ -34,12 +38,22 @@ class Authority(Station):
         initial_balances: Dict[str, int] | None = None,
         ip: str = "10.0.0.1/24",
         port: int = 8000,
+        weight_state_path: str | Path = "weighted_quorum_state.json",
+        weight_epoch_size: int = 100,
+        max_voting_power_share: float = 0.30,
         **params,
     ) -> None:
         super().__init__(name, ip=ip, **params)
 
         self.name = name
         self.committee = committee or []
+        self.weight_registry = WeightRegistry(
+            weight_state_path,
+            self.committee,
+            epoch_size=weight_epoch_size,
+            max_power_share=max_voting_power_share,
+        )
+        snapshot = self.weight_registry.initialize()
         self._lock = threading.RLock()
 
         self.address = Address(
@@ -58,6 +72,8 @@ class Authority(Station):
             authority_signature=f"authority:{name}",
             last_sync_time=time.time(),
             stake=0,
+            tx_count=0,
+            current_weight=snapshot.weight_for(name),
         )
 
         for account_address, balance in (initial_balances or {}).items():
@@ -95,12 +111,31 @@ class Authority(Station):
 
                 return None
 
-            signature = sign_payload(self.name, order.signing_dict())
+            self._refresh_weight_state()
+            snapshot = self.weight_registry.current_snapshot()
+            signature = sign_payload(
+                self.name,
+                authority_vote_signing_dict(
+                    order,
+                    self.name,
+                    snapshot.epoch,
+                    snapshot.weight_for(self.name),
+                    snapshot.total_weight_units,
+                    snapshot.committee_digest,
+                ),
+            )
 
             signed = SignedTransferOrder(
                 order_id=order.order_id,
                 transfer_order=order,
-                authority_signature={self.name: signature},
+                authority_vote=AuthorityVote(
+                    authority=self.name,
+                    signature=signature,
+                    epoch=snapshot.epoch,
+                    weight_units=snapshot.weight_for(self.name),
+                    total_weight_units=snapshot.total_weight_units,
+                    committee_digest=snapshot.committee_digest,
+                ),
                 timestamp=time.time(),
             )
 
@@ -133,6 +168,7 @@ class Authority(Station):
             recipient_account.credit(order.amount)
 
             confirmation.status = TransactionStatus.CONFIRMED
+            self._refresh_weight_state()
 
             return True
 
@@ -213,7 +249,24 @@ class Authority(Station):
         if order.sequence_number <= sender_account.sequence_number:
             return False
 
-        if not confirmation.authority_signatures:
+        snapshot = self.weight_registry.snapshot_for_epoch(confirmation.quorum_epoch)
+        if snapshot is None:
             return False
 
-        return True
+        if (
+            confirmation.total_weight_units != snapshot.total_weight_units
+            or confirmation.committee_digest != snapshot.committee_digest
+            or not confirmation.authority_votes
+        ):
+            return False
+
+        for vote in confirmation.authority_votes:
+            if not verify_authority_vote(order, vote, snapshot):
+                return False
+
+        return has_weighted_quorum(order, confirmation.authority_votes, snapshot)
+
+    def _refresh_weight_state(self) -> None:
+        tx_count, weight = self.weight_registry.authority_stats(self.name)
+        self.state.tx_count = tx_count
+        self.state.current_weight = weight

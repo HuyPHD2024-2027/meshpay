@@ -12,7 +12,7 @@ from .common import AuthorityName, TransactionStatus
 
 
 PAYMENT_APP = "meshpay.offline"
-COMPACT_PAYLOAD_VERSION = 2
+COMPACT_PAYLOAD_VERSION = 3
 OrderLookup = Callable[[str], Optional["TransferOrder"]]
 
 
@@ -172,13 +172,75 @@ class TransferOrder:
         return cls.from_dict(data)
 
 
+@dataclass(frozen=True)
+class AuthorityVote:
+    """One authority's signed vote against an immutable weight snapshot."""
+
+    authority: AuthorityName
+    signature: str
+    epoch: int
+    weight_units: int
+    total_weight_units: int
+    committee_digest: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "authority", AuthorityName(str(self.authority)))
+        object.__setattr__(self, "epoch", int(self.epoch))
+        object.__setattr__(self, "weight_units", int(self.weight_units))
+        object.__setattr__(self, "total_weight_units", int(self.total_weight_units))
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "authority": str(self.authority),
+            "signature": self.signature,
+            "epoch": self.epoch,
+            "weight_units": self.weight_units,
+            "total_weight_units": self.total_weight_units,
+            "committee_digest": self.committee_digest,
+        }
+
+    def to_compact_dict(self) -> Dict[str, Any]:
+        return {
+            "a": str(self.authority),
+            "g": self.signature,
+            "e": self.epoch,
+            "w": self.weight_units,
+            "n": self.total_weight_units,
+            "c": self.committee_digest,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "AuthorityVote":
+        if "authority" not in data:
+            return cls.from_compact_dict(data)
+        return cls(
+            authority=AuthorityName(str(data["authority"])),
+            signature=str(data["signature"]),
+            epoch=int(data["epoch"]),
+            weight_units=int(data["weight_units"]),
+            total_weight_units=int(data["total_weight_units"]),
+            committee_digest=str(data["committee_digest"]),
+        )
+
+    @classmethod
+    def from_compact_dict(cls, data: Dict[str, Any]) -> "AuthorityVote":
+        return cls(
+            authority=AuthorityName(str(data["a"])),
+            signature=str(data["g"]),
+            epoch=int(data["e"]),
+            weight_units=int(data["w"]),
+            total_weight_units=int(data["n"]),
+            committee_digest=str(data["c"]),
+        )
+
+
 @dataclass
 class SignedTransferOrder:
-    """Authority-signed transfer order."""
+    """Authority-signed transfer order with its immutable weighted vote."""
 
     order_id: UUID
     transfer_order: TransferOrder
-    authority_signature: Dict[AuthorityName, str]
+    authority_vote: AuthorityVote
     timestamp: float
 
     def __post_init__(self) -> None:
@@ -193,28 +255,22 @@ class SignedTransferOrder:
         if isinstance(self.transfer_order, dict):
             self.transfer_order = TransferOrder.from_dict(self.transfer_order)
 
-        self.authority_signature = dict(self.authority_signature)
+        if isinstance(self.authority_vote, dict):
+            self.authority_vote = AuthorityVote.from_dict(self.authority_vote)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "order_id": str(self.order_id),
             "transfer_order": self.transfer_order.to_dict(),
-            "authority_signature": dict(self.authority_signature),
+            "authority_vote": self.authority_vote.to_dict(),
             "timestamp": self.timestamp,
         }
 
     def to_compact_dict(self) -> Dict[str, Any]:
-        if len(self.authority_signature) == 1:
-            authority, signature = next(iter(self.authority_signature.items()))
-            return {
-                "i": self.order_id.hex,
-                "a": authority,
-                "g": signature,
-            }
-
         return {
             "i": self.order_id.hex,
-            "m": dict(self.authority_signature),
+            "v": self.authority_vote.to_compact_dict(),
+            "t": self.timestamp,
         }
 
     @classmethod
@@ -222,7 +278,7 @@ class SignedTransferOrder:
         return cls(
             order_id=UUID(str(data["order_id"])),
             transfer_order=TransferOrder.from_dict(data["transfer_order"]),
-            authority_signature=dict(data["authority_signature"]),
+            authority_vote=AuthorityVote.from_dict(data["authority_vote"]),
             timestamp=float(data["timestamp"]),
         )
 
@@ -238,15 +294,10 @@ class SignedTransferOrder:
         if transfer_order is None:
             raise ValueError(f"missing transfer order for compact signed payload: {order_id}")
 
-        if "m" in data:
-            authority_signature = dict(data["m"])
-        else:
-            authority_signature = {data["a"]: data["g"]}
-
         return cls(
             order_id=UUID(order_id),
             transfer_order=transfer_order,
-            authority_signature=authority_signature,
+            authority_vote=AuthorityVote.from_compact_dict(data["v"]),
             timestamp=float(data.get("t", 0.0)),
         )
 
@@ -276,6 +327,8 @@ class SignedTransferOrder:
     ) -> "SignedTransferOrder":
         data = _payload_data(payload, "signed_transfer_order")
 
+        if "i" in data and payload.get("v") != COMPACT_PAYLOAD_VERSION:
+            raise ValueError("unsupported signed-transfer payload version")
         if payload.get("v") == COMPACT_PAYLOAD_VERSION or "i" in data:
             return cls.from_compact_dict(data, order_lookup=order_lookup)
 
@@ -288,8 +341,11 @@ class ConfirmationOrder:
 
     order_id: UUID
     transfer_order: TransferOrder
-    authority_signatures: List[str]
+    authority_votes: List[AuthorityVote]
     timestamp: float
+    quorum_epoch: int
+    total_weight_units: int
+    committee_digest: str
     status: TransactionStatus = TransactionStatus.PENDING
 
     def __post_init__(self) -> None:
@@ -305,14 +361,22 @@ class ConfirmationOrder:
             self.timestamp = time.time()
 
         self.status = _status_from_value(self.status)
-        self.authority_signatures = list(self.authority_signatures)
+        self.authority_votes = [
+            AuthorityVote.from_dict(vote) if isinstance(vote, dict) else vote
+            for vote in self.authority_votes
+        ]
+        self.quorum_epoch = int(self.quorum_epoch)
+        self.total_weight_units = int(self.total_weight_units)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "order_id": str(self.order_id),
             "transfer_order": self.transfer_order.to_dict(),
-            "authority_signatures": list(self.authority_signatures),
+            "authority_votes": [vote.to_dict() for vote in self.authority_votes],
             "timestamp": self.timestamp,
+            "quorum_epoch": self.quorum_epoch,
+            "total_weight_units": self.total_weight_units,
+            "committee_digest": self.committee_digest,
             "status": self.status.value if isinstance(self.status, Enum) else self.status,
         }
 
@@ -324,7 +388,13 @@ class ConfirmationOrder:
             "r": order.recipient,
             "a": order.amount,
             "q": order.sequence_number,
-            "x": list(self.authority_signatures),
+            "g": order.signature,
+            "ot": order.timestamp,
+            "x": [vote.to_compact_dict() for vote in self.authority_votes],
+            "h": self.quorum_epoch,
+            "n": self.total_weight_units,
+            "c": self.committee_digest,
+            "t": self.timestamp,
         }
 
         if order.epoch != 0:
@@ -340,8 +410,11 @@ class ConfirmationOrder:
         return cls(
             order_id=UUID(str(data["order_id"])),
             transfer_order=TransferOrder.from_dict(data["transfer_order"]),
-            authority_signatures=list(data.get("authority_signatures", [])),
+            authority_votes=[AuthorityVote.from_dict(vote) for vote in data.get("authority_votes", [])],
             timestamp=float(data["timestamp"]),
+            quorum_epoch=int(data["quorum_epoch"]),
+            total_weight_units=int(data["total_weight_units"]),
+            committee_digest=str(data["committee_digest"]),
             status=_status_from_value(data.get("status", TransactionStatus.PENDING)),
         )
 
@@ -369,8 +442,11 @@ class ConfirmationOrder:
         return cls(
             order_id=UUID(order_id),
             transfer_order=transfer_order,
-            authority_signatures=list(data.get("x", [])),
+            authority_votes=[AuthorityVote.from_compact_dict(vote) for vote in data.get("x", [])],
             timestamp=float(data.get("t", 0.0)),
+            quorum_epoch=int(data["h"]),
+            total_weight_units=int(data["n"]),
+            committee_digest=str(data["c"]),
             status=_status_from_value(data.get("z", TransactionStatus.CONFIRMED)),
         )
 
@@ -400,6 +476,8 @@ class ConfirmationOrder:
     ) -> "ConfirmationOrder":
         data = _payload_data(payload, "confirmation_order")
 
+        if "i" in data and payload.get("v") != COMPACT_PAYLOAD_VERSION:
+            raise ValueError("unsupported confirmation payload version")
         if payload.get("v") == COMPACT_PAYLOAD_VERSION or "i" in data:
             return cls.from_compact_dict(data, order_lookup=order_lookup)
 
