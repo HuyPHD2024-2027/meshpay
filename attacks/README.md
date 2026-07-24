@@ -4,6 +4,49 @@ All commands run from the **repo root**. Requires `sudo` (Mininet-WiFi).
 
 ---
 
+## Authority isolation — weighted quorum evaluation
+
+This attack selects its authority set from the live pre-attack weight snapshot
+and changes communication only. The deterministic primary mechanism is `cut`;
+`loss` and static-topology `range` are sensitivity mechanisms.
+
+Calibrate the offered load:
+
+```bash
+sudo python3 scripts/run_meshpay_benchmark_matrix.py \
+  --execute --clients 6 --authorities 4 --ranges 1000 --no-mobility \
+  --routing epidemic,spray-and-wait,prophet --payment-rate 1,2,5,10 \
+  --seed 20,21,22 --attack none \
+  --output-root logs/benchmarks/authority_isolation_calibration
+
+python3 scripts/select_authority_isolation_rate.py \
+  logs/benchmarks/authority_isolation_calibration/summary.json
+```
+
+Then substitute the selected rate for `RATE` in the core matrix:
+
+```bash
+sudo python3 scripts/run_meshpay_benchmark_matrix.py \
+  --execute --clients 6 --authorities 4 --ranges 1000 --no-mobility \
+  --routing epidemic,spray-and-wait,prophet --payment-rate RATE \
+  --seed 20,21,22,23,24 --warmup 5 --settle-time 60 \
+  --attack authority-isolation --attack-tpre 30 --attack-tatk 60 --attack-tpost 60 \
+  --isolation-mode cut --isolation-reachable-power 1.00,0.75,0.60,0.30 \
+  --output-root logs/benchmarks/authority_isolation_core
+```
+
+Run a separate `--attack none` matrix for the true baseline. Use exact client
+targets such as `--isolation-targets sta1,sta2` for the relay-removal control;
+reachable authority power remains 1.0. `range` requires `--no-mobility`.
+
+```bash
+python3 scripts/plot_authority_isolation.py \
+  logs/benchmarks/authority_isolation_core/summary.json \
+  -o figures/authority_isolation
+```
+
+---
+
 ## Common parameters
 
 | Parameter | Value | Notes |
