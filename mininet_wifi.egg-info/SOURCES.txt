@@ -21,6 +21,7 @@ meshpay/offline/dtn_adapter.py
 meshpay/offline/quorum.py
 meshpay/offline/virtual_accounts.py
 meshpay/offline/wallet.py
+meshpay/offline/weighted_quorum.py
 meshpay/offline/nodes/__init__.py
 meshpay/offline/nodes/authority.py
 meshpay/offline/nodes/client.py
@@ -197,6 +198,10 @@ mn_wifi/wwan/link.py
 mn_wifi/wwan/module.py
 mn_wifi/wwan/net.py
 mn_wifi/wwan/node.py
+tests/test_authority_isolation.py
+tests/test_authority_isolation_matrix.py
+tests/test_authority_isolation_metrics.py
+tests/test_authority_isolation_plot.py
 util/doxify.py
 util/m
 util/versioncheck.py

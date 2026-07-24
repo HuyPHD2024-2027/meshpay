@@ -90,6 +90,10 @@ class MeshPayBenchmarkConfig:
     attack_tpost: float
     attack_target_count: str
     attack_load_rate: float
+    isolation_mode: str
+    isolation_reachable_power: float
+    isolation_loss_probability: float
+    isolation_targets: tuple[str, ...] | None
     keep_debug_logs: bool
     weight_epoch_size: int
     max_voting_power_share: float
@@ -163,8 +167,8 @@ class MeshPayBenchmarkConfig:
         if self.mobility_start < 0:
             raise ValueError("--mobility-start must be >= 0")
 
-        if self.attack not in {"none", "packetloss", "load", "packetloss-load"}:
-            raise ValueError("--attack must be one of: none, packetloss, load, packetloss-load")
+        if self.attack not in {"none", "packetloss", "load", "packetloss-load", "authority-isolation"}:
+            raise ValueError("--attack must be one of: none, packetloss, load, packetloss-load, authority-isolation")
 
         if not 0.0 <= self.attack_loss_probability <= 1.0:
             raise ValueError("--attack-loss-probability must be between 0.0 and 1.0")
@@ -190,6 +194,15 @@ class MeshPayBenchmarkConfig:
 
         if self.attack_load_rate < 0:
             raise ValueError("--attack-load-rate must be >= 0")
+
+        if self.isolation_mode not in {"cut", "loss", "range"}:
+            raise ValueError("--isolation-mode must be one of: cut, loss, range")
+        if not 0.0 <= self.isolation_reachable_power <= 1.0:
+            raise ValueError("--isolation-reachable-power must be between 0.0 and 1.0")
+        if not 0.0 <= self.isolation_loss_probability <= 1.0:
+            raise ValueError("--isolation-loss-probability must be between 0.0 and 1.0")
+        if self.attack == "authority-isolation" and self.isolation_mode == "range" and not self.no_mobility:
+            raise ValueError("--isolation-mode range requires --no-mobility")
 
         attack_target_count = str(self.attack_target_count).strip().lower()
         if attack_target_count not in {"auto", "all"}:
@@ -348,7 +361,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--attack",
         default="none",
-        choices=["none", "packetloss", "load", "packetloss-load"],
+        choices=["none", "packetloss", "load", "packetloss-load", "authority-isolation"],
         help="Attack mode to run during the benchmark.",
     )
 
@@ -391,6 +404,22 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.0,
         help="Targeted MeshPay payment submissions per second during load attacks. 0 means use payment rate.",
+    )
+    parser.add_argument(
+        "--isolation-mode", choices=["cut", "loss", "range"], default="cut",
+        help="Authority-isolation network mechanism.",
+    )
+    parser.add_argument(
+        "--isolation-reachable-power", type=float, default=1.0,
+        help="Requested reachable authority voting-power fraction.",
+    )
+    parser.add_argument(
+        "--isolation-loss-probability", type=float, default=0.75,
+        help="Loss probability for authority-isolation loss mode.",
+    )
+    parser.add_argument(
+        "--isolation-targets", default=None,
+        help="Optional comma-separated authority or relay node names to isolate exactly.",
     )
     parser.add_argument(
         "--weight-epoch-size",
@@ -457,6 +486,13 @@ def build_config(args: argparse.Namespace) -> MeshPayBenchmarkConfig:
         attack_tpost=args.attack_tpost,
         attack_target_count=args.attack_target_count,
         attack_load_rate=args.attack_load_rate,
+        isolation_mode=args.isolation_mode,
+        isolation_reachable_power=args.isolation_reachable_power,
+        isolation_loss_probability=args.isolation_loss_probability,
+        isolation_targets=(
+            tuple(name.strip() for name in args.isolation_targets.split(",") if name.strip())
+            if args.isolation_targets is not None else None
+        ),
         keep_debug_logs=args.keep_debug_logs,
         weight_epoch_size=args.weight_epoch_size,
         max_voting_power_share=args.max_voting_power_share,
@@ -1152,6 +1188,13 @@ def topology(config: MeshPayBenchmarkConfig) -> None:
             target_count=config.attack_target_count,
             load_rate=attack_load_rate,
             seed=config.seed,
+            authority_nodes=authorities,
+            isolation_mode=config.isolation_mode,
+            isolation_reachable_power=config.isolation_reachable_power,
+            isolation_loss_probability=config.isolation_loss_probability,
+            isolation_targets=config.isolation_targets,
+            weight_registry=clients[0].weight_registry,
+            mobility_disabled=config.no_mobility,
         )
     elif attack_is_noop:
         runtime.record_event(
@@ -1194,6 +1237,9 @@ def topology(config: MeshPayBenchmarkConfig) -> None:
         if stats_collector is not None:
             stats_collector.stop()
             stats_collector = None
+
+        if attack_controller is not None:
+            attack_controller.wait(timeout=5.0)
 
         # Runtime records payment events in memory to avoid payment.log writes
         # on the hot path.  Flush once before the existing metrics collector

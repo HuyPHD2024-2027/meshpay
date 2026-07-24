@@ -8,11 +8,12 @@ import itertools
 import json
 import math
 import os
+import random
 import shlex
 import subprocess
 import sys
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -60,12 +61,20 @@ class RunSpec:
     attack_tpost: float
     attack_target_count: str
     attack_load_rate: float
+    isolation_mode: str
+    isolation_reachable_power: float
+    isolation_loss_probability: float
+    isolation_targets: str | None
     keep_debug_logs: bool
     run_index: int
     plot: bool
 
     @property
     def run_id(self) -> str:
+        isolation = (
+            f"_iso{fmt(self.isolation_reachable_power)}_{self.isolation_mode}"
+            if self.attack == "authority-isolation" else ""
+        )
         return (
             f"{self.run_index:03d}_"
             f"c{self.clients}_"
@@ -75,7 +84,8 @@ class RunSpec:
             f"m{self.medium}_"
             f"rt{routing_label(self.routing)}_"
             f"att{attack_label(self.attack)}_"
-            f"loss{fmt(self.attack_loss_probability)}"
+            f"loss{fmt(self.attack_loss_probability)}_"
+            f"seed{self.seed}{isolation}"
         )
 
 
@@ -85,6 +95,7 @@ def attack_label(attack: str) -> str:
         "packetloss": "PL",
         "load": "Load",
         "packetloss-load": "PLLoad",
+        "authority-isolation": "AuthIso",
     }.get(attack, attack)
 
 
@@ -184,6 +195,14 @@ def parse_routing_list(value: str) -> list[str]:
 
     if not result:
         raise argparse.ArgumentTypeError("--routing cannot be empty")
+    return result
+
+
+def parse_isolation_modes(value: str) -> list[str]:
+    allowed = {"cut", "loss", "range"}
+    result = [item.strip() for item in value.split(",") if item.strip()]
+    if not result or any(item not in allowed for item in result):
+        raise argparse.ArgumentTypeError(f"--isolation-mode values must be one of {sorted(allowed)}")
     return result
 
 
@@ -290,7 +309,7 @@ def parse_args() -> argparse.Namespace:
         default="epidemic",
         help="Comma-separated routing protocols: epidemic,spray-and-wait,prophet.",
     )
-    parser.add_argument("--seed", type=int, default=20)
+    parser.add_argument("--seed", default="20", help="Comma-separated random seeds.")
     parser.add_argument("--area-width", type=float, default=200.0)
     parser.add_argument("--area-height", type=float, default=200.0)
     parser.add_argument("--mobility-start", type=float, default=1.0)
@@ -300,7 +319,7 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument(
         "--attack",
-        choices=["none", "packetloss", "load", "packetloss-load"],
+        choices=["none", "packetloss", "load", "packetloss-load", "authority-isolation"],
         default="none",
     )
     parser.add_argument(
@@ -313,6 +332,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--attack-tpost", type=float, default=60.0)
     parser.add_argument("--attack-target-count", default="auto")
     parser.add_argument("--attack-load-rate", type=float, default=0.0)
+    parser.add_argument("--isolation-mode", default="cut", help="Comma-separated isolation modes.")
+    parser.add_argument(
+        "--isolation-reachable-power", default="1.0",
+        help="Comma-separated requested reachable voting-power fractions.",
+    )
+    parser.add_argument("--isolation-loss-probability", type=float, default=0.75)
+    parser.add_argument("--isolation-targets", default=None)
+    parser.add_argument(
+        "--no-randomize-order", action="store_true",
+        help="Keep product order instead of deterministic per-seed randomization for isolation runs.",
+    )
     parser.add_argument(
         "--keep-debug-logs",
         action="store_true",
@@ -328,6 +358,10 @@ def parse_args() -> argparse.Namespace:
         "--attack-tpost",
         "--attack-target-count",
         "--attack-load-rate",
+        "--isolation-mode",
+        "--isolation-reachable-power",
+        "--isolation-loss-probability",
+        "--isolation-targets",
     }
     attack_options_used = any(
         arg == flag or arg.startswith(f"{flag}=")
@@ -338,7 +372,7 @@ def parse_args() -> argparse.Namespace:
     if args.attack == "none" and attack_options_used:
         parser.error(
             "attack parameters were provided, but --attack is none; "
-            "pass --attack packetloss, --attack load, or --attack packetloss-load"
+            "pass an enabled --attack mode"
         )
 
     args.clients = parse_int_list(args.clients, "--clients")
@@ -351,11 +385,16 @@ def parse_args() -> argparse.Namespace:
         )
     args.speeds = parse_speeds(args.speeds)
     args.payment_rate = parse_float_list(args.payment_rate, "--payment-rate")
+    args.seed = parse_int_list(args.seed, "--seed")
     try:
         args.routing = parse_routing_list(args.routing)
         args.attack_loss_probability = parse_probability_list(
             args.attack_loss_probability,
             "--attack-loss-probability",
+        )
+        args.isolation_mode = parse_isolation_modes(args.isolation_mode)
+        args.isolation_reachable_power = parse_probability_list(
+            args.isolation_reachable_power, "--isolation-reachable-power",
         )
     except argparse.ArgumentTypeError as exc:
         parser.error(str(exc))
@@ -398,6 +437,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--duration must be at least attack tpre + tatk + tpost")
     if args.attack_load_rate < 0:
         parser.error("--attack-load-rate must be >= 0")
+    if not 0.0 <= args.isolation_loss_probability <= 1.0:
+        parser.error("--isolation-loss-probability must be between 0.0 and 1.0")
+    if args.attack == "authority-isolation" and "range" in args.isolation_mode and not args.no_mobility:
+        parser.error("--isolation-mode range requires --no-mobility")
     if args.attack_target_count != "auto":
         try:
             target_count = int(args.attack_target_count)
@@ -457,7 +500,10 @@ def build_specs(args: argparse.Namespace) -> list[RunSpec]:
         args.speeds,
         args.payment_rate,
         args.routing,
-        args.attack_loss_probability,
+        args.attack_loss_probability if args.attack in {"packetloss", "packetloss-load"} else [0.0],
+        args.seed,
+        args.isolation_mode if args.attack == "authority-isolation" else ["cut"],
+        args.isolation_reachable_power if args.attack == "authority-isolation" else [1.0],
     )
 
     for (
@@ -469,6 +515,9 @@ def build_specs(args: argparse.Namespace) -> list[RunSpec]:
         payment_rate,
         routing,
         attack_loss_probability,
+        seed,
+        isolation_mode,
+        isolation_reachable_power,
     ) in matrix:
         duration = (
             compute_auto_duration(
@@ -511,7 +560,7 @@ def build_specs(args: argparse.Namespace) -> list[RunSpec]:
                 initial_balance=args.initial_balance,
                 medium=args.medium,
                 routing=routing,
-                seed=args.seed,
+                seed=seed,
                 area_width=args.area_width,
                 area_height=args.area_height,
                 mobility_start=args.mobility_start,
@@ -524,13 +573,24 @@ def build_specs(args: argparse.Namespace) -> list[RunSpec]:
                 attack_tpost=args.attack_tpost,
                 attack_target_count=args.attack_target_count,
                 attack_load_rate=args.attack_load_rate,
+                isolation_mode=isolation_mode,
+                isolation_reachable_power=isolation_reachable_power,
+                isolation_loss_probability=args.isolation_loss_probability,
+                isolation_targets=args.isolation_targets,
                 keep_debug_logs=args.keep_debug_logs,
                 run_index=run_index,
             )
         )
         run_index += 1
 
-    return specs
+    if args.attack == "authority-isolation" and not args.no_randomize_order:
+        randomized = []
+        for seed in args.seed:
+            group = [spec for spec in specs if spec.seed == seed]
+            random.Random(seed).shuffle(group)
+            randomized.extend(group)
+        specs = randomized
+    return [replace(spec, run_index=index) for index, spec in enumerate(specs, start=1)]
 
 
 def command_for(spec: RunSpec, run_dir: Path, use_sudo: bool) -> list[str]:
@@ -601,6 +661,14 @@ def command_for(spec: RunSpec, run_dir: Path, use_sudo: bool) -> list[str]:
                 str(spec.attack_load_rate),
             ]
         )
+        if spec.attack == "authority-isolation":
+            command.extend([
+                "--isolation-mode", spec.isolation_mode,
+                "--isolation-reachable-power", str(spec.isolation_reachable_power),
+                "--isolation-loss-probability", str(spec.isolation_loss_probability),
+            ])
+            if spec.isolation_targets:
+                command.extend(["--isolation-targets", spec.isolation_targets])
 
     return command
 
@@ -653,6 +721,7 @@ def summarize_result(
         "network_metrics.summary.tx_bytes_rate": "network_tx_bytes_per_second",
         "network_metrics.summary.rx_bytes_rate": "network_rx_bytes_per_second",
         "payment_metrics.latency_ms.time_to_quorum.avg": "avg_time_to_quorum_ms",
+        "payment_metrics.latency_ms.time_to_quorum.p95": "p95_time_to_quorum_ms",
         "attack.attack": "attack",
         "attack.loss_probability": "attack_loss_probability",
         "attack.selected_target_count": "attack_selected_target_count",
@@ -663,6 +732,21 @@ def summarize_result(
         "attack.load_rate": "attack_load_rate",
         "attack.attack_mode": "attack_mode",
         "attack.target_fraction": "attack_target_fraction",
+        "attack.requested_reachable_power": "requested_reachable_power",
+        "attack.actual_reachable_power": "actual_reachable_power",
+        "attack.strict_quorum_threshold": "strict_quorum_threshold",
+        "attack.signed_distance_from_quorum": "signed_distance_from_quorum",
+        "attack.isolated_authorities": "isolated_authorities",
+        "attack.reachable_authorities": "reachable_authorities",
+        "attack.isolated_authority_count": "isolated_authority_count",
+        "attack.reachable_authority_count": "reachable_authority_count",
+        "attack.isolation_mode": "isolation_mode",
+        "attack.isolation_cleanup.cleanup_success": "isolation_cleanup_success",
+        "attack.attack_validation_success": "attack_validation_success",
+        "payment_metrics.recovery.time_to_first_post_restoration_confirmation_s": "time_to_first_post_restoration_confirmation_s",
+        "payment_metrics.recovery.time_to_recover_90_percent_three_bins_s": "time_to_recover_90_percent_three_bins_s",
+        "payment_metrics.recovery.backlog_at_restoration": "backlog_at_restoration",
+        "payment_metrics.recovery.attack_window_payments_confirmed_by_run_end_percent": "attack_window_eventual_confirmation_percent",
         "attack.packet_loss_installation.install_success": "packet_loss_install_success",
         "attack.packet_loss_installation.installed_rules": "packet_loss_installed_rules",
         "attack.packet_loss_installation.attempted_rules": "packet_loss_attempted_rules",
@@ -688,6 +772,19 @@ def summarize_result(
         row[name] = nested_get(benchmark, path)
 
     row["avg_time_to_quorum_ms"] = row.get("avg_time_to_quorum_ms")
+
+    if spec.attack == "authority-isolation":
+        phase_windows = nested_get(benchmark, "payment_metrics.phase_cohorts.phase_windows") or {}
+        row["run_valid"] = bool(
+            row.get("actual_reachable_power") is not None
+            and row.get("attack_validation_success") is True
+            and row.get("isolation_cleanup_success") is True
+            and all(phase in phase_windows for phase in ("before", "during", "after"))
+            and (run_dir / "authority_reachability.jsonl").exists()
+            and (run_dir / "network_raw.jsonl").exists()
+        )
+    else:
+        row["run_valid"] = exit_code in {None, 0}
 
     return row
 
@@ -740,6 +837,11 @@ def main() -> int:
         output_root.mkdir(parents=True, exist_ok=True)
         env = os.environ.copy()
         env["PYTHONPATH"] = str(ROOT_DIR)
+
+        cleanup_command = (["sudo"] if args.sudo else []) + ["mn", "-c"]
+        cleanup = subprocess.run(cleanup_command, cwd=str(ROOT_DIR), env=env, check=False)
+        if cleanup.returncode != 0:
+            print(f"[{spec.run_id}] warning: Mininet cleanup exited {cleanup.returncode}", file=sys.stderr)
 
         started_at = time.time()
         completed = subprocess.run(command, cwd=str(ROOT_DIR), env=env, check=False)

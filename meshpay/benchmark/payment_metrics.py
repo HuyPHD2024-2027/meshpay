@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import statistics
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -96,6 +97,157 @@ def latency_summary(
         "p99": percentile(values_ms, 99),
         **metadata,
     }
+
+
+def kaplan_meier_time_to_quorum(
+    created_by_order: Dict[str, Dict[str, Any]],
+    confirmed_by_order: Dict[str, Dict[str, Any]],
+    ended_at: float,
+) -> Dict[str, Any]:
+    observations: List[tuple[float, bool]] = []
+    for order_id, created in created_by_order.items():
+        start = float(created.get("time", ended_at))
+        confirmed = confirmed_by_order.get(order_id)
+        stop = float(confirmed.get("time", ended_at)) if confirmed else float(ended_at)
+        observations.append((max(stop - start, 0.0), confirmed is not None))
+    if not observations:
+        return {"observations": 0, "events": 0, "censored": 0, "curve": []}
+
+    at_risk = len(observations)
+    survival = 1.0
+    curve = [{"time_s": 0.0, "survival_probability": 1.0, "at_risk": at_risk,
+              "confirmed": 0, "censored": 0}]
+    for duration in sorted(set(value for value, _event in observations)):
+        confirmed = sum(1 for value, event in observations if value == duration and event)
+        censored = sum(1 for value, event in observations if value == duration and not event)
+        if confirmed and at_risk:
+            survival *= 1.0 - (confirmed / at_risk)
+        curve.append({
+            "time_s": duration, "survival_probability": survival,
+            "at_risk": at_risk, "confirmed": confirmed, "censored": censored,
+        })
+        at_risk -= confirmed + censored
+    return {
+        "observations": len(observations),
+        "events": sum(1 for _value, event in observations if event),
+        "censored": sum(1 for _value, event in observations if not event),
+        "curve": curve,
+        "note": "Survival is the probability that quorum has not yet been reached; run-end observations are right-censored.",
+    }
+
+
+def _time_binned_metrics(
+    events: List[Dict[str, Any]],
+    created_by_order: Dict[str, Dict[str, Any]],
+    confirmed_by_order: Dict[str, Dict[str, Any]],
+    accepted_by_order: Dict[str, Dict[str, Any]],
+    started_at: float,
+    ended_at: float,
+    reachability_samples: List[Dict[str, Any]],
+    bin_size_s: float = 10.0,
+) -> List[Dict[str, Any]]:
+    bins = []
+    count = max(1, int(math.ceil(max(ended_at - started_at, 0.0) / bin_size_s)))
+    created_events = list(created_by_order.values())
+    confirmed_events = list(confirmed_by_order.values())
+    accepted_events = list(accepted_by_order.values())
+    for index in range(count):
+        start = started_at + index * bin_size_s
+        end = min(start + bin_size_s, ended_at)
+        duration = max(end - start, 0.000001)
+        created = [event for event in created_events if start <= float(event.get("time", 0.0)) < end]
+        confirmed = [event for event in confirmed_events if start <= float(event.get("time", 0.0)) < end]
+        accepted = [event for event in accepted_events if start <= float(event.get("time", 0.0)) < end]
+        latencies = []
+        for event in confirmed:
+            original = created_by_order.get(str(event.get("order_id")))
+            if original:
+                latencies.append((float(event["time"]) - float(original["time"])) * 1000.0)
+        created_so_far = sum(1 for event in created_events if float(event.get("time", 0.0)) < end)
+        confirmed_so_far = sum(1 for event in confirmed_events if float(event.get("time", 0.0)) < end)
+        samples = [sample for sample in reachability_samples if start <= float(sample.get("time", 0.0)) < end]
+        latest = samples[-1] if samples else None
+        bins.append({
+            "index": index, "start": start, "end": end,
+            "relative_start_s": start - started_at, "relative_end_s": end - started_at,
+            "created": len(created), "confirmed": len(confirmed), "accepted": len(accepted),
+            "created_tps": len(created) / duration,
+            "confirmed_tps": len(confirmed) / duration,
+            "accepted_tps": len(accepted) / duration,
+            "time_to_quorum_ms_p50": percentile(latencies, 50),
+            "time_to_quorum_ms_p95": percentile(latencies, 95),
+            "outstanding_payments": max(created_so_far - confirmed_so_far, 0),
+            "backlog_size": max(created_so_far - confirmed_so_far, 0),
+            "reachable_authority_count": latest.get("reachable_authority_count") if latest else None,
+            "reachable_voting_power": latest.get("actual_reachable_power") if latest else None,
+            "weight_epoch": latest.get("epoch") if latest else None,
+        })
+    return bins
+
+
+def _recovery_metrics(events: List[Dict[str, Any]], bins: List[Dict[str, Any]]) -> Dict[str, Any]:
+    phases = _attack_phase_windows(events)
+    if not phases:
+        return {}
+    attack_start, attack_stop = phases["during"]
+    confirmations = sorted(float(event["time"]) for event in events
+                           if event.get("event") == "confirmation_created" and "time" in event)
+    first_post = next((value for value in confirmations if value >= attack_stop), None)
+    pre_bins = [row for row in bins if row["start"] >= phases["before"][0] and row["end"] <= attack_start]
+    baseline = statistics.mean([row["confirmed_tps"] for row in pre_bins]) if pre_bins else None
+    recovery_time = None
+    if baseline is not None and baseline > 0:
+        threshold = 0.9 * baseline
+        post_bins = [row for row in bins if row["start"] >= attack_stop]
+        for index in range(max(len(post_bins) - 2, 0)):
+            window = post_bins[index:index + 3]
+            if len(window) == 3 and all(row["confirmed_tps"] >= threshold for row in window):
+                recovery_time = window[0]["start"] - attack_stop
+                break
+    created_at_restoration = sum(1 for event in events if event.get("event") == "payment_created"
+                                 and float(event.get("time", 0.0)) < attack_stop)
+    confirmed_at_restoration = sum(1 for event in events if event.get("event") == "confirmation_created"
+                                   and float(event.get("time", 0.0)) < attack_stop)
+    return {
+        "time_to_first_post_restoration_confirmation_s": (
+            first_post - attack_stop if first_post is not None else None
+        ),
+        "pre_attack_confirmation_tps": baseline,
+        "recovery_threshold_tps": 0.9 * baseline if baseline is not None and baseline > 0 else None,
+        "time_to_recover_90_percent_three_bins_s": recovery_time,
+        "backlog_at_restoration": max(created_at_restoration - confirmed_at_restoration, 0),
+    }
+
+
+def _authority_phase_activity(events: List[Dict[str, Any]]) -> Dict[str, Any]:
+    phases = _attack_phase_windows(events)
+    if not phases:
+        return {}
+    result: Dict[str, Dict[str, Dict[str, float]]] = {}
+    for phase, (start, end) in phases.items():
+        authorities: Dict[str, Dict[str, float]] = {}
+        certificate_count = 0
+        for event in events:
+            timestamp = float(event.get("time", 0.0))
+            if not start <= timestamp < end:
+                continue
+            if event.get("event") == "payment_payload_delivered" and event.get("payload_type") == "transfer_order":
+                authority = str(event.get("node") or "")
+                row = authorities.setdefault(authority, {"transfer_deliveries": 0, "signed_votes": 0, "certificates": 0})
+                row["transfer_deliveries"] += 1
+            elif event.get("event") == "authority_signed_transfer":
+                authority = str(event.get("authority") or event.get("node") or "")
+                row = authorities.setdefault(authority, {"transfer_deliveries": 0, "signed_votes": 0, "certificates": 0})
+                row["signed_votes"] += 1
+            elif event.get("event") == "confirmation_created":
+                certificate_count += 1
+                for authority in event.get("signers", []):
+                    row = authorities.setdefault(str(authority), {"transfer_deliveries": 0, "signed_votes": 0, "certificates": 0})
+                    row["certificates"] += 1
+        for row in authorities.values():
+            row["certificate_share_percent"] = safe_div(row["certificates"], certificate_count) * 100.0
+        result[phase] = dict(sorted(authorities.items()))
+    return result
 
 
 
@@ -592,6 +744,24 @@ def collect_payment_metrics(
         confirmed_by_order=confirmed_by_order,
         accepted_by_order=accepted_by_order,
     )
+    reachability_samples = load_jsonl(log_dir / "authority_reachability.jsonl")
+    time_bins = _time_binned_metrics(
+        events=events,
+        created_by_order=created_by_order,
+        confirmed_by_order=confirmed_by_order,
+        accepted_by_order=accepted_by_order,
+        started_at=started_at,
+        ended_at=ended_at,
+        reachability_samples=reachability_samples,
+    )
+    recovery = _recovery_metrics(events, time_bins)
+    during_cohort = (
+        phase_cohorts.get("cohorts_by_created_phase", {}).get("during", {})
+        if phase_cohorts else {}
+    )
+    recovery["attack_window_payments_confirmed_by_run_end_percent"] = during_cohort.get(
+        "confirmation_rate_by_run_end_percent"
+    )
 
     return {
         "summary": summary,
@@ -630,6 +800,13 @@ def collect_payment_metrics(
         "payload_type_counts": payload_type_counts,
         "phase_cohorts": phase_cohorts,
         "post_attack_funnel": post_attack_funnel,
+        "time_bins_10s": time_bins,
+        "recovery": recovery,
+        "kaplan_meier_time_to_quorum": kaplan_meier_time_to_quorum(
+            created_by_order, confirmed_by_order, ended_at,
+        ),
+        "authority_phase_activity": _authority_phase_activity(events),
+        "authority_reachability_samples": reachability_samples,
         "paths": {
             "log_dir": str(log_dir),
             "payment_log": str(payment_log),

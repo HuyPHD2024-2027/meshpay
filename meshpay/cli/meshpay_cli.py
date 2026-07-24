@@ -921,6 +921,7 @@ class MeshPayRuntime:
                     "recipient_host": recipient_host,
                     "order_id": str(order.order_id),
                     "signer_count": len(obj.authority_votes),
+                    "signers": sorted(str(vote.authority) for vote in obj.authority_votes),
                     "collected_weight_units": sum(
                         vote.weight_units for vote in obj.authority_votes
                     ),
